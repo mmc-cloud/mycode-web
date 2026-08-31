@@ -1,0 +1,1 @@
+"""MyCode Web Demo application."""

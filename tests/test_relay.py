@@ -1,0 +1,127 @@
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.config import ServerSettings
+from app.main import create_app
+from app.services.relay import LLMRelay, RelayAuthenticationError, RelayConfigurationError
+
+
+class FakeResponse:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.status_code = 200
+        self.headers = {"content-type": "text/event-stream"}
+        self.closed = False
+
+    async def aiter_raw(self):
+        yield self.content
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.requests: list[object] = []
+        self.responses: list[FakeResponse] = []
+        self.closed = False
+
+    def build_request(self, method, url, **kwargs):
+        request = (method, url, kwargs)
+        self.requests.append(request)
+        return request
+
+    async def send(self, request, *, stream):
+        assert stream is True
+        response = FakeResponse(f"response-{len(self.responses)}".encode())
+        self.responses.append(response)
+        return response
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_relay_token_validation_and_missing_provider_configuration(tmp_path: Path) -> None:
+    settings = ServerSettings(
+        data_dir=tmp_path,
+        relay_token="internal-token",
+        provider_api_key=None,
+    )
+    relay = LLMRelay(settings)
+    with pytest.raises(RelayAuthenticationError):
+        relay.authenticate("Bearer wrong")
+    relay.authenticate("Bearer internal-token")
+
+    async def missing_provider() -> None:
+        with pytest.raises(RelayConfigurationError):
+            await relay.forward("chat/completions", b"{}", "application/json")
+
+    import asyncio
+
+    asyncio.run(missing_provider())
+
+
+def test_relay_api_rejects_missing_internal_token(tmp_path: Path) -> None:
+    settings = ServerSettings(
+        data_dir=tmp_path,
+        relay_token="internal-token",
+        provider_api_key="provider-secret",
+    )
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/mycode/api/relay/v1/chat/completions", json={"model": "test"}
+        )
+    assert response.status_code == 401
+    assert "provider-secret" not in response.text
+    assert "set-cookie" not in response.headers
+
+
+def test_relay_reuses_lifespan_client_and_closes_it(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        settings = ServerSettings(
+            data_dir=tmp_path,
+            relay_token="internal-token",
+            provider_api_key="provider-secret",
+        )
+        fake_client = FakeClient()
+        factory_calls = 0
+
+        def factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return fake_client
+
+        relay = LLMRelay(settings, client_factory=factory)
+        await relay.start()
+        for _ in range(2):
+            _, _, chunks = await relay.forward(
+                "chat/completions", b"{}", "application/json"
+            )
+            assert [chunk async for chunk in chunks]
+        assert factory_calls == 1
+        assert len(fake_client.requests) == 2
+        assert all(response.closed for response in fake_client.responses)
+        assert fake_client.closed is False
+        await relay.aclose()
+        assert fake_client.closed is True
+
+    import asyncio
+
+    asyncio.run(scenario())
+
+
+def test_app_lifespan_starts_and_stops_relay_client(tmp_path: Path) -> None:
+    app = create_app(
+        ServerSettings(
+            data_dir=tmp_path,
+            relay_token="internal-token",
+            provider_api_key=None,
+        )
+    )
+    relay = app.state.services.relay
+    assert relay._client is None
+    with TestClient(app):
+        assert relay._client is not None
+    assert relay._client is None

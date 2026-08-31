@@ -1,0 +1,83 @@
+:root {
+  color: #172119;
+  background: #eef0e8;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input, textarea { font: inherit; }
+button, .button-label, .button-link {
+  border: 0;
+  border-radius: 8px;
+  background: #24573a;
+  color: white;
+  padding: 0.62rem 0.9rem;
+  cursor: pointer;
+  text-decoration: none;
+}
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+.secondary { background: #dfe5d9; color: #243128; }
+.danger { background: #a33932; }
+.shell {
+  display: grid;
+  grid-template-columns: minmax(340px, 0.82fr) minmax(480px, 1.18fr);
+  gap: 1rem;
+  min-height: 100vh;
+  padding: 1.25rem;
+}
+header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.25rem;
+}
+h1, h2, p { margin-top: 0; }
+h1 { margin-bottom: 0; font-size: 2.2rem; letter-spacing: -0.05em; }
+h2 { margin-bottom: 0; font-size: 1.15rem; }
+.eyebrow { margin-bottom: 0.2rem; color: #6b746c; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.16em; }
+.profile { display: flex; align-items: center; gap: 0.5rem; }
+.profile input { border: 1px solid #c9cec4; border-radius: 8px; padding: 0.62rem; background: white; }
+.status { border-radius: 999px; background: #d8ded5; padding: 0.38rem 0.72rem; font-size: 0.8rem; }
+.status[data-status="running"] { background: #f4d790; }
+.status[data-status="idle"] { background: #b8dfbd; }
+.status[data-status="waiting_permission"] { background: #f0b9a8; }
+.error-banner { grid-column: 1 / -1; margin: 0; border-radius: 8px; background: #a33932; color: white; padding: 0.8rem 1rem; }
+.workspace-panel, .agent-panel { min-height: 0; border: 1px solid #d2d6cc; border-radius: 14px; background: #fafbf7; padding: 1rem; box-shadow: 0 12px 30px rgb(35 52 39 / 8%); }
+.panel-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.9rem; }
+.upload-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
+.button-label input { display: none; }
+.button-link { background: #dfe5d9; color: #243128; }
+.workspace-body { display: grid; grid-template-rows: minmax(180px, 0.7fr) minmax(220px, 1.3fr); gap: 0.8rem; height: calc(100vh - 270px); }
+nav, .preview { overflow: auto; border: 1px solid #e0e3db; border-radius: 9px; background: white; padding: 0.7rem; }
+.file-tree { list-style: none; margin: 0; padding-left: 0.8rem; }
+.file-tree li { margin: 0.16rem 0; }
+.file-tree summary { cursor: pointer; }
+.file-button { width: 100%; padding: 0.28rem 0.4rem; border-radius: 5px; background: transparent; color: #233128; text-align: left; }
+.file-button:hover, .file-button.selected { background: #e7eee4; }
+.file-button small { color: #7b847c; }
+.unsafe-entry { color: #9b3c35; }
+.preview { display: flex; flex-direction: column; padding: 0; }
+.preview-title { display: flex; justify-content: space-between; border-bottom: 1px solid #e0e3db; padding: 0.55rem 0.7rem; font-size: 0.8rem; }
+.preview pre { flex: 1; overflow: auto; margin: 0; padding: 0.8rem; white-space: pre-wrap; word-break: break-word; font-family: "Cascadia Code", Consolas, monospace; font-size: 0.82rem; }
+.agent-panel { display: flex; flex-direction: column; height: calc(100vh - 120px); }
+.terminal { flex: 1; overflow: auto; margin: 0; border-radius: 9px; background: #111713; color: #dce7dc; padding: 1rem; white-space: pre-wrap; word-break: break-word; font-family: "Cascadia Code", Consolas, monospace; font-size: 0.84rem; }
+.permission-card { border: 1px solid #e4b19d; border-radius: 9px; background: #fff1ea; margin-top: 0.75rem; padding: 0.8rem; }
+.permission-card p { margin: 0.4rem 0; }
+.permission-card dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 0.7rem; margin: 0.5rem 0; font-size: 0.8rem; }
+.permission-card dt { font-weight: 700; }
+.permission-card dd { margin: 0; overflow-wrap: anywhere; }
+.permission-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
+.composer { display: grid; grid-template-columns: 1fr auto; gap: 0.6rem; margin-top: 0.75rem; }
+.composer textarea { resize: vertical; border: 1px solid #cdd2c8; border-radius: 9px; padding: 0.7rem; }
+.muted { color: #7b847c; }
+
+@media (max-width: 900px) {
+  .shell { grid-template-columns: 1fr; }
+  .agent-panel { height: 75vh; }
+  .workspace-body { height: 65vh; }
+  header { align-items: flex-start; gap: 1rem; }
+  .profile { flex-wrap: wrap; justify-content: flex-end; }
+}

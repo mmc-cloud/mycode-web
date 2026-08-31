@@ -1,0 +1,1 @@
+"""Web metadata persistence."""

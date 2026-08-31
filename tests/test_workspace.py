@@ -1,0 +1,116 @@
+from io import BytesIO
+from pathlib import Path
+import stat
+import zipfile
+
+import pytest
+
+from app.config import ServerSettings
+from app.services.workspace import WorkspaceError, WorkspaceLimitError, WorkspaceService
+
+
+def service(tmp_path: Path, **limits: int) -> WorkspaceService:
+    return WorkspaceService(
+        ServerSettings(
+            data_dir=tmp_path / "data",
+            relay_token="token",
+            workspace_limit_bytes=limits.get("workspace_limit_bytes", 1024),
+            workspace_file_limit=limits.get("workspace_file_limit", 10),
+            upload_zip_limit_bytes=limits.get("upload_zip_limit_bytes", 1024),
+        )
+    )
+
+
+def test_default_workspace_limits_match_web_demo_contract(tmp_path: Path) -> None:
+    settings = ServerSettings(data_dir=tmp_path, relay_token="token")
+    assert settings.upload_zip_limit_bytes == 150 * 1024 * 1024
+    assert settings.workspace_limit_bytes == 2 * 1024 * 1024 * 1024
+    assert settings.workspace_file_limit == 20_000
+
+
+def zip_bytes(entries: list[tuple[zipfile.ZipInfo | str, bytes]]) -> BytesIO:
+    result = BytesIO()
+    with zipfile.ZipFile(result, "w") as archive:
+        for name, content in entries:
+            archive.writestr(name, content)
+    result.seek(0)
+    return result
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../escape.txt", "/absolute.txt", "C:/windows.txt", "safe/../../escape.txt"],
+)
+def test_zip_rejects_traversal_and_absolute_paths(tmp_path: Path, name: str) -> None:
+    workspace = service(tmp_path)
+    with pytest.raises(WorkspaceError, match="Unsafe workspace path"):
+        workspace.save_upload(
+            "session", "bad.zip", zip_bytes([(name, b"bad")]), archive=True
+        )
+
+
+def test_zip_rejects_symbolic_links(tmp_path: Path) -> None:
+    link = zipfile.ZipInfo("link")
+    link.create_system = 3
+    link.external_attr = (stat.S_IFLNK | 0o777) << 16
+    workspace = service(tmp_path)
+    with pytest.raises(WorkspaceError, match="symbolic links"):
+        workspace.save_upload(
+            "session", "link.zip", zip_bytes([(link, b"../outside")]), archive=True
+        )
+
+
+def test_zip_upload_limit_is_enforced_while_copying(tmp_path: Path) -> None:
+    workspace = service(tmp_path, upload_zip_limit_bytes=10)
+    with pytest.raises(WorkspaceLimitError, match="Upload size"):
+        workspace.save_upload(
+            "session", "large.zip", BytesIO(b"x" * 11), archive=True
+        )
+
+
+def test_workspace_size_limit_is_enforced_during_zip_extraction(tmp_path: Path) -> None:
+    workspace = service(tmp_path, workspace_limit_bytes=10)
+    with pytest.raises(WorkspaceLimitError, match="size limit"):
+        workspace.save_upload(
+            "session",
+            "large.zip",
+            zip_bytes([("large.txt", b"x" * 11)]),
+            archive=True,
+        )
+
+
+def test_workspace_file_limit_is_enforced_during_zip_extraction(tmp_path: Path) -> None:
+    workspace = service(tmp_path, workspace_file_limit=2)
+    with pytest.raises(WorkspaceLimitError, match="file count"):
+        workspace.save_upload(
+            "session",
+            "many.zip",
+            zip_bytes(
+                [("one.txt", b"1"), ("two.txt", b"2"), ("three.txt", b"3")]
+            ),
+            archive=True,
+        )
+
+
+def test_zip_rejects_file_parent_conflicts(tmp_path: Path) -> None:
+    workspace = service(tmp_path)
+    with pytest.raises(WorkspaceError, match="conflicting file paths"):
+        workspace.save_upload(
+            "session",
+            "conflict.zip",
+            zip_bytes([("parent", b"file"), ("parent/child.txt", b"child")]),
+            archive=True,
+        )
+
+
+def test_existing_workspace_symlink_cannot_escape_boundary(tmp_path: Path) -> None:
+    workspace = service(tmp_path)
+    root, _ = workspace.ensure_session_directories("session")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (root / "link").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("This environment cannot create symbolic links.")
+    with pytest.raises(WorkspaceError, match="Symbolic links"):
+        workspace.resolve_file("session", "link/secret.txt", must_exist=False)
