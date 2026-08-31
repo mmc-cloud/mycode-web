@@ -34,6 +34,16 @@ def _env_int(name: str, default: int) -> int:
     return value
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = float(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0.")
+    return value
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -89,6 +99,36 @@ class ServerSettings:
         default_factory=lambda: os.getenv(
             "MYCODE_SANDBOX_IMAGE", "mycode-sandbox:dev"
         )
+    )
+    sandbox_max_active: int = field(
+        default_factory=lambda: _env_int("SANDBOX_MAX_ACTIVE", 2)
+    )
+    sandbox_queue_max: int = field(
+        default_factory=lambda: _env_int("SANDBOX_QUEUE_MAX", 20)
+    )
+    sandbox_memory_limit: str = field(
+        default_factory=lambda: os.getenv("SANDBOX_MEMORY_LIMIT", "640m")
+    )
+    sandbox_memory_swap_limit: str = field(
+        default_factory=lambda: os.getenv("SANDBOX_MEMORY_SWAP_LIMIT", "1g")
+    )
+    sandbox_cpus: float = field(
+        default_factory=lambda: _env_float("SANDBOX_CPUS", 1.0)
+    )
+    sandbox_pids_limit: int = field(
+        default_factory=lambda: _env_int("SANDBOX_PIDS_LIMIT", 256)
+    )
+    sandbox_idle_ttl_seconds: int = field(
+        default_factory=lambda: _env_int("SANDBOX_IDLE_TTL_SECONDS", 7200)
+    )
+    runtime_sweep_interval_seconds: int = field(
+        default_factory=lambda: _env_int("RUNTIME_SWEEP_INTERVAL_SECONDS", 60)
+    )
+    session_retention_seconds: int = field(
+        default_factory=lambda: _env_int("SESSION_RETENTION_SECONDS", 1209600)
+    )
+    session_cleanup_interval_seconds: int = field(
+        default_factory=lambda: _env_int("SESSION_CLEANUP_INTERVAL_SECONDS", 3600)
     )
     docker_command: str = field(
         default_factory=lambda: os.getenv("MYCODE_DOCKER_COMMAND", "docker")

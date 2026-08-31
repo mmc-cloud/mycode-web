@@ -28,6 +28,8 @@ data/sessions/<session_id>/mycode_state/
 
 Sandbox 只挂载这两个目录。真实 Provider Key 只存在于 FastAPI Host；Sandbox 仅得到内部 Relay token、Relay URL、模型名以及 Host 明确配置的 MyCode Runtime 参数。
 
+FastAPI 进程内维护一个最多 2 个存活 Sandbox 的 Runtime Pool。空闲 Sandbox 在没有资源竞争时最多 warm 保活 2 小时；容量已满但存在 idle Sandbox 时，会抢占最久未活动的 idle runtime。只有全部 slot 都在 `running` 或 `waiting_permission` 时，新 turn 才进入有界 FIFO Queue。runtime 被抢占或回收不会删除 Workspace、MyCode state 或 SQLite Session，后续仍通过 `mycode agent --continue` 恢复。
+
 当前 CLI 是面向人的文本协议。Web adapter 原样转发 stdout chunk，只识别 `you> ` 和现有 Permission prompt；Browser 多行消息仅在写入 CLI stdin 前折叠为单行，权限回答仍独立写入 `y\n` 或 `n\n`。
 
 ## 环境要求
@@ -48,6 +50,14 @@ uv sync
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --env-file .env
 ```
 
+当前 Runtime Pool、FIFO Queue 和调度锁都是 FastAPI 进程内状态，因此第一版部署**必须只运行一个 FastAPI worker**。多个 worker 会各自维护独立容量和 Queue，无法保证全局最多 2 个 Sandbox。本版本不引入 Redis 或共享 Queue。
+
+production 推荐启动命令：
+
+```sh
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
 `.env` 至少设置：
 
 ```dotenv
@@ -55,6 +65,23 @@ MYCODE_PROVIDER_API_KEY=真实密钥
 MYCODE_PROVIDER_BASE_URL=https://provider.example.com/v1
 MYCODE_MODEL=模型名
 ```
+
+Sandbox 调度与资源默认值可按需覆盖：
+
+```dotenv
+SANDBOX_MAX_ACTIVE=2
+SANDBOX_QUEUE_MAX=20
+SANDBOX_MEMORY_LIMIT=640m
+SANDBOX_MEMORY_SWAP_LIMIT=1g
+SANDBOX_CPUS=1.0
+SANDBOX_PIDS_LIMIT=256
+SANDBOX_IDLE_TTL_SECONDS=7200
+RUNTIME_SWEEP_INTERVAL_SECONDS=60
+SESSION_RETENTION_SECONDS=1209600
+SESSION_CLEANUP_INTERVAL_SECONDS=3600
+```
+
+`SANDBOX_IDLE_TTL_SECONDS` 只回收进程/容器；`SESSION_RETENTION_SECONDS` 根据 SQLite `last_active_at` 删除真正过期的 Session 目录和元数据。默认分别为 2 小时和 14 天。
 
 不要提交 `.env`。验证 FastAPI：
 
@@ -81,7 +108,8 @@ Linux 服务器可以把核心仓库放在 `../mycode`：
 也可直接执行：
 
 ```powershell
-docker buildx build --build-context mycode=..\mycode-project `
+docker buildx build --load `
+  --build-context mycode=..\mycode-project `
   --file .\docker\Dockerfile.sandbox `
   --tag mycode-sandbox:dev .
 ```
@@ -112,9 +140,9 @@ Server tests 使用临时 SQLite/Workspace 和 fake Sandbox，不访问真实 Pr
 ## 当前限制
 
 - Demo 身份只有随机 HttpOnly Cookie，没有正式账号系统。
-- 没有全局 Queue、Sandbox 自动回收、Workspace 定时清理或生产部署设施。
+- FIFO Queue 只保存在 FastAPI 进程内，服务重启后不会恢复排队项。
 - SSE history 只在进程内；CLI 文本不是结构化跨进程协议。
-- FastAPI 异常退出后不能接管旧 Sandbox。
+- FastAPI 不恢复或接管 crash 前的旧 Sandbox process；startup 会按 `mycode-web.managed=true` label 清理 orphan Sandbox，但保留 Workspace、MyCode state 和 SQLite Session，后续新 Sandbox 通过 `mycode agent --continue` 恢复 Session。
 - Linux 部署需另行验证 bind mount UID/GID 与 Docker bridge 到 Relay 的网络边界。
 
 设计原因见 `docs/adr/0001-web-demo-cli-sandbox-relay.md`，实现和验证记录见 `docs/实施记录.md`。

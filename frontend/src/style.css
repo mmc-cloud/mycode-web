@@ -44,6 +44,7 @@ h2 { margin-bottom: 0; font-size: 1.15rem; }
 .status[data-status="running"] { background: #f4d790; }
 .status[data-status="idle"] { background: #b8dfbd; }
 .status[data-status="waiting_permission"] { background: #f0b9a8; }
+.status[data-status="queued"] { background: #c9d6f0; }
 .error-banner { grid-column: 1 / -1; margin: 0; border-radius: 8px; background: #a33932; color: white; padding: 0.8rem 1rem; }
 .workspace-panel, .agent-panel { min-height: 0; border: 1px solid #d2d6cc; border-radius: 14px; background: #fafbf7; padding: 1rem; box-shadow: 0 12px 30px rgb(35 52 39 / 8%); }
 .panel-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.9rem; }
@@ -71,6 +72,7 @@ nav, .preview { overflow: auto; border: 1px solid #e0e3db; border-radius: 9px; b
 .permission-card dd { margin: 0; overflow-wrap: anywhere; }
 .permission-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
 .composer { display: grid; grid-template-columns: 1fr auto; gap: 0.6rem; margin-top: 0.75rem; }
+.queue-notice { margin: 0.75rem 0 0; color: #445b85; }
 .composer textarea { resize: vertical; border: 1px solid #cdd2c8; border-radius: 9px; padding: 0.7rem; }
 .muted { color: #7b847c; }
 

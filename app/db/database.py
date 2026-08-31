@@ -109,6 +109,30 @@ class WebDatabase:
             ).fetchone()
         return _user_from_row(row)
 
+    def touch_session(self, session_id: str, *, at: str | None = None) -> None:
+        timestamp = at or _utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE web_sessions SET last_active_at = ? WHERE id = ?",
+                (timestamp, session_id),
+            )
+
+    def inactive_session_ids(self, cutoff: str) -> tuple[str, ...]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM web_sessions "
+                "WHERE last_active_at < ? ORDER BY last_active_at, id",
+                (cutoff,),
+            ).fetchall()
+        return tuple(row["id"] for row in rows)
+
+    def delete_session(self, session_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM web_sessions WHERE id = ?", (session_id,)
+            )
+        return cursor.rowcount == 1
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=5)

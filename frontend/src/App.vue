@@ -62,6 +62,10 @@ function connectEvents() {
   eventSource.addEventListener("permission_resolved", () => {
     permission.value = null
   })
+  eventSource.addEventListener("runtime_expired", (event) => {
+    permission.value = null
+    showError(JSON.parse(event.data).message || "Sandbox 已因长时间无活动而停止")
+  })
   eventSource.addEventListener("error", (event) => {
     if (event.data) showError(JSON.parse(event.data).message || "运行时错误")
   })
@@ -118,11 +122,12 @@ async function sendMessage() {
   const content = message.value.trim()
   if (!content) return
   try {
-    await request("/message", {
+    const result = await request("/message", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
     })
+    runtimeStatus.value = result.status
     transcript.value += `\nyou> ${content}\n`
     message.value = ""
   } catch (reason) {
@@ -205,6 +210,9 @@ onBeforeUnmount(() => eventSource?.close())
         </div>
       </div>
       <pre ref="outputElement" class="terminal">{{ transcript || "等待消息…" }}</pre>
+      <p v-if="runtimeStatus === 'queued'" class="queue-notice">
+        当前 Sandbox 已满，正在排队
+      </p>
       <aside v-if="permission" class="permission-card">
         <strong>权限确认</strong>
         <p>{{ permission.summary }}</p>
@@ -222,7 +230,7 @@ onBeforeUnmount(() => eventSource?.close())
       </aside>
       <form class="composer" @submit.prevent="sendMessage">
         <textarea v-model="message" rows="3" placeholder="告诉 MyCode 要完成什么…" @keydown.ctrl.enter="sendMessage" />
-        <button type="submit" :disabled="runtimeStatus === 'running' || runtimeStatus === 'waiting_permission'">发送</button>
+        <button type="submit" :disabled="['queued', 'starting', 'running', 'waiting_permission'].includes(runtimeStatus)">发送</button>
       </form>
     </section>
   </main>

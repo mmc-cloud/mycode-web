@@ -8,6 +8,11 @@ from app.main import create_app
 from app.services.relay import LLMRelay, RelayAuthenticationError, RelayConfigurationError
 
 
+class NoopLauncher:
+    async def launch(self, session_id, workspace, mycode_state):
+        raise AssertionError("Sandbox launch is not expected in relay tests.")
+
+
 class FakeResponse:
     def __init__(self, content: bytes) -> None:
         self.content = content
@@ -69,7 +74,7 @@ def test_relay_api_rejects_missing_internal_token(tmp_path: Path) -> None:
         relay_token="internal-token",
         provider_api_key="provider-secret",
     )
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings, launcher=NoopLauncher())) as client:
         response = client.post(
             "/mycode/api/relay/v1/chat/completions", json={"model": "test"}
         )
@@ -118,7 +123,8 @@ def test_app_lifespan_starts_and_stops_relay_client(tmp_path: Path) -> None:
             data_dir=tmp_path,
             relay_token="internal-token",
             provider_api_key=None,
-        )
+        ),
+        launcher=NoopLauncher(),
     )
     relay = app.state.services.relay
     assert relay._client is None

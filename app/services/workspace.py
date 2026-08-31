@@ -43,6 +43,23 @@ class WorkspaceService:
         mycode_state.mkdir(parents=True, exist_ok=True)
         return workspace, mycode_state
 
+    def delete_session_data(self, session_id: str) -> None:
+        """Delete one session tree without following links outside the root."""
+        if not session_id or any(character in session_id for character in "/\\"):
+            raise WorkspaceError("Invalid session identifier.")
+        root = self.settings.sessions_dir.resolve()
+        target = root / session_id
+        if target.parent != root:
+            raise WorkspaceError("Path escapes session root.")
+        if _is_link(target):
+            if target.is_dir() and not target.is_symlink():
+                target.rmdir()
+            else:
+                target.unlink()
+            return
+        if target.exists():
+            shutil.rmtree(target)
+
     def resolve_file(
         self, session_id: str, relative_path: str, *, must_exist: bool = True
     ) -> Path:

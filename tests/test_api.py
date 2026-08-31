@@ -8,6 +8,15 @@ from app.config import ServerSettings
 from app.main import create_app
 
 
+class NoopLauncher:
+    async def launch(self, session_id, workspace, mycode_state):
+        raise AssertionError("Sandbox launch is not expected in API tests.")
+
+
+def create_test_app(tmp_path: Path):
+    return create_app(configured_settings(tmp_path), launcher=NoopLauncher())
+
+
 def configured_settings(tmp_path: Path) -> ServerSettings:
     return ServerSettings(
         data_dir=tmp_path / "data",
@@ -17,7 +26,7 @@ def configured_settings(tmp_path: Path) -> ServerSettings:
 
 
 def test_cookie_user_is_created_and_restored_with_one_session(tmp_path: Path) -> None:
-    app = create_app(configured_settings(tmp_path))
+    app = create_test_app(tmp_path)
     with TestClient(app) as client:
         first = client.post("/mycode/api/session")
         first_user_id = client.cookies.get("mycode_user")
@@ -39,7 +48,7 @@ def test_cookie_user_is_created_and_restored_with_one_session(tmp_path: Path) ->
 
 
 def test_profile_workspace_tree_content_and_downloads(tmp_path: Path) -> None:
-    app = create_app(configured_settings(tmp_path))
+    app = create_test_app(tmp_path)
     with TestClient(app) as client:
         client.post("/mycode/api/session")
         profile = client.post(
@@ -69,7 +78,7 @@ def test_profile_workspace_tree_content_and_downloads(tmp_path: Path) -> None:
 
 
 def test_file_api_rejects_path_traversal(tmp_path: Path) -> None:
-    app = create_app(configured_settings(tmp_path))
+    app = create_test_app(tmp_path)
     with TestClient(app) as client:
         client.post("/mycode/api/session")
         response = client.get(
@@ -83,7 +92,7 @@ def test_zip_upload_extracts_safe_project(tmp_path: Path) -> None:
     archive_bytes = BytesIO()
     with zipfile.ZipFile(archive_bytes, "w") as archive:
         archive.writestr("project/README.md", "hello")
-    app = create_app(configured_settings(tmp_path))
+    app = create_test_app(tmp_path)
     with TestClient(app) as client:
         client.post("/mycode/api/session")
         response = client.post(

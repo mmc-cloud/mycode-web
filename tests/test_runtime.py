@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -7,6 +8,8 @@ from app.config import ServerSettings
 from app.services.events import EventHub
 from app.services.runtime import (
     DockerSandboxLauncher,
+    MANAGED_SANDBOX_LABEL,
+    RuntimeCapacityError,
     RuntimeConflictError,
     RuntimeManager,
     _normalize_cli_message,
@@ -58,15 +61,51 @@ class FakeProcess:
 
 class FakeLauncher:
     def __init__(self) -> None:
-        self.process = FakeProcess()
+        self.processes: list[FakeProcess] = []
+        self.by_session: dict[str, list[FakeProcess]] = {}
         self.calls = 0
+        self.max_live_seen = 0
+
+    @property
+    def process(self) -> FakeProcess:
+        return self.processes[-1]
 
     async def launch(self, session_id: str, workspace: Path, mycode_state: Path):
         self.calls += 1
-        asyncio.get_running_loop().call_soon(
-            self.process.stdout.queue.put_nowait, b"started\nyou> "
+        process = FakeProcess()
+        self.processes.append(process)
+        self.by_session.setdefault(session_id, []).append(process)
+        self.max_live_seen = max(
+            self.max_live_seen,
+            sum(candidate.returncode is None for candidate in self.processes),
         )
-        return self.process
+        asyncio.get_running_loop().call_soon(
+            process.stdout.queue.put_nowait, b"started\nyou> "
+        )
+        return process
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+async def wait_for_status(
+    manager: RuntimeManager, session_id: str, expected: str
+) -> None:
+    for _ in range(100):
+        if manager.status(session_id) == expected:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(
+        f"{session_id} remained {manager.status(session_id)!r}, expected {expected!r}"
+    )
 
 
 def settings(tmp_path: Path) -> ServerSettings:
@@ -186,6 +225,49 @@ def test_docker_command_mounts_only_session_and_hides_provider_key(tmp_path: Pat
     assert "real-provider-secret" not in rendered
     assert "--user mycode" in rendered
     assert "--cap-drop ALL" in rendered
+    assert f"--label {MANAGED_SANDBOX_LABEL}" in rendered
+    assert "--label mycode-web.session=session" in rendered
+
+
+def test_startup_cleanup_selects_only_managed_containers(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        launcher = DockerSandboxLauncher(settings(tmp_path))
+        launcher._run_docker = AsyncMock(
+            side_effect=[
+                (0, "managed-one\nmanaged-two\n", ""),
+                (0, "", ""),
+            ]
+        )
+
+        selected = await launcher.cleanup_orphans()
+
+        assert selected == ("managed-one", "managed-two")
+        assert launcher._run_docker.await_args_list == [
+            call("ps", "-aq", "--filter", "label=mycode-web.managed=true"),
+            call("rm", "-f", "managed-one", "managed-two"),
+        ]
+        assert "syncthing" not in repr(launcher._run_docker.await_args_list)
+
+    asyncio.run(scenario())
+
+
+def test_startup_cleanup_list_failure_logs_and_touches_nothing(
+    tmp_path: Path, caplog
+) -> None:
+    async def scenario() -> None:
+        launcher = DockerSandboxLauncher(settings(tmp_path))
+        launcher._run_docker = AsyncMock(
+            return_value=(1, "", "Docker daemon unavailable")
+        )
+
+        assert await launcher.cleanup_orphans() == ()
+        launcher._run_docker.assert_awaited_once_with(
+            "ps", "-aq", "--filter", "label=mycode-web.managed=true"
+        )
+
+    caplog.set_level("WARNING")
+    asyncio.run(scenario())
+    assert "Docker daemon unavailable" in caplog.text
 
 
 def test_docker_command_passes_only_configured_optional_mycode_env(
@@ -219,3 +301,209 @@ def test_docker_command_passes_only_configured_optional_mycode_env(
     assert "LLM_RESERVED_OUTPUT_TOKENS=" not in rendered
     assert "MYCODE_PROVIDER_API_KEY" not in rendered
     assert "real-provider-secret" not in rendered
+
+
+def test_docker_command_includes_configured_resource_limits(tmp_path: Path) -> None:
+    config = ServerSettings(
+        data_dir=tmp_path / "data",
+        relay_token="token",
+        sandbox_memory_limit="768m",
+        sandbox_memory_swap_limit="1200m",
+        sandbox_cpus=1.5,
+        sandbox_pids_limit=300,
+    )
+    command = DockerSandboxLauncher(config).command(
+        "session", tmp_path / "workspace", tmp_path / "state"
+    )
+
+    assert command[command.index("--memory") + 1] == "768m"
+    assert command[command.index("--memory-swap") + 1] == "1200m"
+    assert command[command.index("--cpus") + 1] == "1.5"
+    assert command[command.index("--pids-limit") + 1] == "300"
+
+
+def test_two_running_sessions_admit_and_third_queues_fifo(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        events = EventHub()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher
+        )
+
+        assert await manager.send_message("one", "first") == "running"
+        assert await manager.send_message("two", "second") == "running"
+        assert await manager.send_message("three", "third\nline") == "queued"
+        assert await manager.send_message("four", "fourth") == "queued"
+        assert manager.active_count == 2
+        assert manager.queued_count == 2
+
+        await launcher.by_session["one"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "three", "running")
+        assert manager.status("four") == "queued"
+        assert launcher.by_session["three"][0].stdin.writes == [b"third line\n"]
+        three_statuses = [
+            event.data["status"]
+            for event in events.history("three")
+            if event.type == "runtime_status"
+        ]
+        assert three_statuses == ["queued", "starting", "running"]
+
+        await launcher.by_session["two"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "four", "running")
+        assert launcher.by_session["four"][0].stdin.writes == [b"fourth\n"]
+        assert manager.active_count <= config.sandbox_max_active
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_oldest_idle_is_evicted_instead_of_queueing(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = settings(tmp_path)
+        workspace = WorkspaceService(config)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, workspace, EventHub(), launcher=launcher, clock=clock
+        )
+
+        await manager.send_message("old-idle", "first")
+        marker_workspace, marker_state = workspace.ensure_session_directories(
+            "old-idle"
+        )
+        (marker_workspace / "keep.txt").write_text("workspace", encoding="utf-8")
+        (marker_state / "keep.txt").write_text("state", encoding="utf-8")
+        await launcher.by_session["old-idle"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "old-idle", "idle")
+        clock.advance(10)
+        await manager.send_message("busy", "second")
+
+        assert await manager.send_message("new", "third") == "running"
+        assert manager.status("old-idle") == "stopped"
+        assert manager.queued_count == 0
+        assert (marker_workspace / "keep.txt").read_text(encoding="utf-8") == "workspace"
+        assert (marker_state / "keep.txt").read_text(encoding="utf-8") == "state"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_queue_entry_and_queue_capacity_are_rejected(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = ServerSettings(
+            data_dir=tmp_path / "data",
+            relay_token="token",
+            sandbox_max_active=2,
+            sandbox_queue_max=1,
+        )
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.send_message("one", "first")
+        await manager.send_message("two", "second")
+        await manager.send_message("three", "third")
+
+        with pytest.raises(RuntimeConflictError, match="active or queued"):
+            await manager.send_message("three", "duplicate")
+        with pytest.raises(RuntimeCapacityError, match="queue is full"):
+            await manager.send_message("four", "overflow")
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_idle_ttl_only_reclaims_expired_runtime_and_preserves_data(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = ServerSettings(
+            data_dir=tmp_path / "data",
+            relay_token="token",
+            sandbox_idle_ttl_seconds=7200,
+        )
+        workspace = WorkspaceService(config)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, workspace, EventHub(), launcher=launcher, clock=clock
+        )
+        await manager.send_message("session", "task")
+        root, state_root = workspace.ensure_session_directories("session")
+        (root / "keep.txt").write_text("keep", encoding="utf-8")
+        (state_root / "keep.txt").write_text("keep", encoding="utf-8")
+        await launcher.process.stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "session", "idle")
+
+        clock.advance(7199)
+        assert await manager.sweep_expired() == ()
+        assert manager.status("session") == "idle"
+        clock.advance(1)
+        assert await manager.sweep_expired() == ("session",)
+        assert manager.status("session") == "stopped"
+        assert (root / "keep.txt").exists()
+        assert (state_root / "keep.txt").exists()
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_waiting_permission_expires_and_clears_pending_state(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = ServerSettings(
+            data_dir=tmp_path / "data",
+            relay_token="token",
+            sandbox_idle_ttl_seconds=10,
+        )
+        events = EventHub()
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher, clock=clock
+        )
+        await manager.send_message("session", "task")
+        await launcher.process.stdout.feed(
+            "permission> run_command 需要确认\n是否批准？[y/N] ".encode()
+        )
+        await wait_for_status(manager, "session", "waiting_permission")
+        clock.advance(10)
+
+        assert await manager.sweep_expired() == ("session",)
+        assert manager.status("session") == "stopped"
+        assert any(
+            event.type == "permission_resolved" and event.data.get("expired")
+            for event in events.history("session")
+        )
+        with pytest.raises(RuntimeConflictError):
+            await manager.resolve_permission("session", True)
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_admission_never_exceeds_active_limit(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+
+        results = await asyncio.gather(
+            *(manager.send_message(f"session-{index}", "task") for index in range(8))
+        )
+
+        assert results.count("running") == 2
+        assert results.count("queued") == 6
+        assert manager.active_count == 2
+        assert launcher.calls == 2
+        assert launcher.max_live_seen <= config.sandbox_max_active
+        await manager.shutdown()
+        assert manager.active_count == 0
+
+    asyncio.run(scenario())

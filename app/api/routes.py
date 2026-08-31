@@ -16,7 +16,11 @@ from app.models.api import (
 )
 from app.services.events import encode_sse
 from app.services.relay import RelayAuthenticationError, RelayConfigurationError
-from app.services.runtime import RuntimeConflictError, RuntimeUnavailableError
+from app.services.runtime import (
+    RuntimeCapacityError,
+    RuntimeConflictError,
+    RuntimeUnavailableError,
+)
 from app.services.workspace import WorkspaceError, WorkspaceLimitError
 
 
@@ -62,14 +66,16 @@ async def send_message(
     context: WebContext = Depends(current_context),
 ) -> dict[str, str]:
     try:
-        await services(request).runtime.send_message(
+        admission = await services(request).runtime.send_message(
             context.session.id, payload.content
         )
     except RuntimeConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    except RuntimeCapacityError as error:
+        raise HTTPException(status_code=429, detail=str(error)) from error
     except RuntimeUnavailableError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    return {"status": "accepted"}
+    return {"status": admission}
 
 
 @router.get("/events")
