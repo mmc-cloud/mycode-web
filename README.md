@@ -26,11 +26,17 @@ data/sessions/<session_id>/workspace/
 data/sessions/<session_id>/mycode_state/
 ```
 
+HttpOnly Cookie 只标识 Web User；一个 User 可以创建多个彼此隔离的 Session。浏览器通过 `/mycode/?session=<session_id>` 显式选择当前 Session，Workspace、MyCode state、Runtime、Permission、SSE 和 Console history 都按 `session_id` 隔离。首次访问没有 Session 时，Vue 会创建一个；已有 Session 且 URL 未指定时，进入最近活跃的 Session。
+
+进入或切换 Session 后，页面会立即并行恢复 metadata、Workspace、Console history 和 SSE，同时用 `POST /mycode/api/sessions/{session_id}/activate` 在后台 warm Sandbox 与 `mycode agent --continue`。刷新页面或重连 SSE 不停止 Runtime，也不会创建新的 Agent process。
+
 Sandbox 只挂载这两个目录。真实 Provider Key 只存在于 FastAPI Host；Sandbox 仅得到内部 Relay token、Relay URL、模型名以及 Host 明确配置的 MyCode Runtime 参数。
 
 FastAPI 进程内维护一个最多 2 个存活 Sandbox 的 Runtime Pool。空闲 Sandbox 在没有资源竞争时最多 warm 保活 2 小时；容量已满但存在 idle Sandbox 时，会抢占最久未活动的 idle runtime。只有全部 slot 都在 `running` 或 `waiting_permission` 时，新 turn 才进入有界 FIFO Queue。runtime 被抢占或回收不会删除 Workspace、MyCode state 或 SQLite Session，后续仍通过 `mycode agent --continue` 恢复。
 
 当前 CLI 是面向人的文本协议。Web adapter 原样转发 stdout chunk，只识别 `you> ` 和现有 Permission prompt；Browser 多行消息仅在写入 CLI stdin 前折叠为单行，权限回答仍独立写入 `y\n` 或 `n\n`。
+
+Workspace 支持上传、文件树、预览、下载以及安全删除文件/目录。Host 使用 `watchfiles` 观察每个 Session 的真实 Workspace；变化通过该 Session 的 SSE 发出，前端 debounce 后刷新文件树和当前 Preview。Web Agent Console 将用户消息、Assistant/Tool 输出、Permission 和错误保存到 SQLite，每个 Session 最多保留最近 500 条聚合记录。
 
 ## 环境要求
 

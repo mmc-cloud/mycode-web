@@ -136,6 +136,28 @@ class WorkspaceService:
         except UnicodeDecodeError as error:
             raise WorkspaceError("Text preview currently requires UTF-8.") from error
 
+    def delete_path(self, session_id: str, relative_path: str) -> None:
+        """Delete one file or directory without allowing root or symlink escape."""
+        workspace, _ = self.ensure_session_directories(session_id)
+        relative = _safe_relative_path(relative_path)
+        target = workspace.joinpath(*relative.parts)
+        _reject_symlink_chain(target, workspace, allow_leaf=True)
+        _require_within(target, workspace)
+        if target == workspace:
+            raise WorkspaceError("Workspace root cannot be deleted.")
+        if _is_link(target):
+            _unlink_link(target)
+            return
+        if not target.exists():
+            raise FileNotFoundError(relative_path)
+        if target.is_file():
+            target.unlink()
+            return
+        if target.is_dir():
+            _remove_tree_without_following_links(target)
+            return
+        raise WorkspaceError("Unsupported workspace entry type.")
+
     def build_workspace_zip(self, session_id: str) -> Path:
         workspace, _ = self.ensure_session_directories(session_id)
         self.stats(workspace)
@@ -161,15 +183,20 @@ class WorkspaceService:
         total = 0
         for root, directories, files in os.walk(workspace, followlinks=False):
             root_path = Path(root)
+            retained_directories: list[str] = []
             for name in directories:
-                if _is_link(root_path / name):
-                    raise WorkspaceError("Workspace contains a symbolic link.")
-            for name in files:
                 path = root_path / name
                 if _is_link(path):
-                    raise WorkspaceError("Workspace contains a symbolic link.")
+                    count += 1
+                    total += path.lstat().st_size
+                    self._require_limits(count, total)
+                else:
+                    retained_directories.append(name)
+            directories[:] = retained_directories
+            for name in files:
+                path = root_path / name
                 count += 1
-                total += path.stat().st_size
+                total += path.lstat().st_size
                 self._require_limits(count, total)
         return WorkspaceStats(count, total)
 
@@ -263,6 +290,8 @@ def _safe_relative_path(value: str) -> PurePosixPath:
     path = PurePosixPath(normalized)
     if (
         not normalized
+        or normalized in {".", ".."}
+        or not path.parts
         or path.is_absolute()
         or any(part in {"", ".", ".."} for part in path.parts)
         or (path.parts and ":" in path.parts[0])
@@ -287,7 +316,9 @@ def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
     return stat.S_IFMT(mode) == stat.S_IFLNK
 
 
-def _reject_symlink_chain(path: Path, root: Path) -> None:
+def _reject_symlink_chain(
+    path: Path, root: Path, *, allow_leaf: bool = False
+) -> None:
     root = root.resolve()
     current = root
     try:
@@ -296,7 +327,7 @@ def _reject_symlink_chain(path: Path, root: Path) -> None:
         raise WorkspaceError("Path escapes workspace.") from error
     for part in relative.parts:
         current = current / part
-        if _is_link(current):
+        if _is_link(current) and not (allow_leaf and current == path):
             raise WorkspaceError("Symbolic links are not accessible.")
         if current != path and current.exists() and not current.is_dir():
             raise WorkspaceError("A parent path is not a directory.")
@@ -351,3 +382,25 @@ def _is_link(path: Path) -> bool:
         return True
     is_junction = getattr(path, "is_junction", None)
     return bool(is_junction and is_junction())
+
+
+def _unlink_link(path: Path) -> None:
+    """Remove a link/junction itself without touching its target."""
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+    else:
+        path.rmdir()
+
+
+def _remove_tree_without_following_links(directory: Path) -> None:
+    """Recursively remove a real directory while pruning every link leaf."""
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            path = Path(entry.path)
+            if _is_link(path):
+                _unlink_link(path)
+            elif entry.is_dir(follow_symlinks=False):
+                _remove_tree_without_following_links(path)
+            else:
+                path.unlink()
+    directory.rmdir()

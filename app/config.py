@@ -167,7 +167,7 @@ class ServerSettings:
 
     @property
     def database_path(self) -> Path:
-        return self.data_dir / "web.sqlite3"
+        return self.data_dir / "web-v2.sqlite3"
 
     @property
     def sessions_dir(self) -> Path:

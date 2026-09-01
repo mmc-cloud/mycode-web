@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProfileUpdate(BaseModel):
@@ -18,10 +18,31 @@ class UserResponse(BaseModel):
 
 
 class SessionResponse(BaseModel):
-    display_name: str | None
+    id: str
     created_at: str
     last_active_at: str
     runtime_status: str
+    pending_permission: dict[str, object] | None = None
+
+
+class SessionListResponse(BaseModel):
+    display_name: str | None
+    sessions: list[SessionResponse]
+
+
+class ConsoleEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    kind: str
+    content: str
+    data: dict[str, object]
+    created_at: str
+
+
+class ConsoleSnapshotResponse(BaseModel):
+    events: list[ConsoleEventResponse]
+    event_cursor: int
 
 
 class FileTreeEntry(BaseModel):

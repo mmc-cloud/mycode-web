@@ -114,3 +114,60 @@ def test_existing_workspace_symlink_cannot_escape_boundary(tmp_path: Path) -> No
         pytest.skip("This environment cannot create symbolic links.")
     with pytest.raises(WorkspaceError, match="Symbolic links"):
         workspace.resolve_file("session", "link/secret.txt", must_exist=False)
+
+
+def test_delete_file_directory_and_reject_root_traversal_and_unlink_symlink(
+    tmp_path: Path,
+) -> None:
+    workspace = service(tmp_path)
+    root, _ = workspace.ensure_session_directories("session")
+    (root / "file.txt").write_text("file", encoding="utf-8")
+    (root / "folder").mkdir()
+    (root / "folder" / "nested.txt").write_text("nested", encoding="utf-8")
+
+    workspace.delete_path("session", "file.txt")
+    workspace.delete_path("session", "folder")
+    assert not (root / "file.txt").exists()
+    assert not (root / "folder").exists()
+    for unsafe in ("", ".", "..", "../outside"):
+        with pytest.raises(WorkspaceError):
+            workspace.delete_path("session", unsafe)
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    link = root / "link.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("Creating symlinks is not permitted on this host.")
+    workspace.delete_path("session", "link.txt")
+    assert not link.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_stats_tree_and_directory_delete_prune_symlinks(tmp_path: Path) -> None:
+    workspace = service(tmp_path)
+    root, _ = workspace.ensure_session_directories("session")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("keep", encoding="utf-8")
+    folder = root / "folder"
+    folder.mkdir()
+    (folder / "local.txt").write_text("local", encoding="utf-8")
+    try:
+        (folder / "outside-link").symlink_to(outside, target_is_directory=True)
+        (root / "dangling").symlink_to(tmp_path / "missing")
+    except OSError:
+        pytest.skip("Creating symlinks is not permitted on this host.")
+
+    stats = workspace.stats(root)
+    assert stats.file_count == 3
+    assert {entry["name"] for entry in workspace.tree("session")} == {
+        "dangling",
+        "folder",
+    }
+    workspace.delete_path("session", "dangling")
+    workspace.delete_path("session", "folder")
+
+    assert not folder.exists()
+    assert (outside / "secret.txt").read_text(encoding="utf-8") == "keep"

@@ -9,10 +9,12 @@ from app.config import ServerSettings
 from app.db.database import WebDatabase
 from app.services.container import AppServices
 from app.services.events import EventHub
+from app.services.console import ConsoleRecorder
 from app.services.lifecycle import SessionLifecycleService
 from app.services.relay import LLMRelay
 from app.services.runtime import RuntimeManager, SandboxLauncher
 from app.services.workspace import WorkspaceService
+from app.services.watcher import WorkspaceWatchManager
 
 
 logger = logging.getLogger(__name__)
@@ -38,16 +40,20 @@ def create_app(
     database = WebDatabase(effective_settings.database_path)
     database.initialize()
     workspace = WorkspaceService(effective_settings)
-    events = EventHub()
+    console = ConsoleRecorder(database)
+    events = EventHub(console=console)
+    watcher = WorkspaceWatchManager(workspace, events)
     runtime = RuntimeManager(
         effective_settings,
         workspace,
         events,
         launcher=launcher,
         activity_hook=database.touch_session,
+        runtime_start_hook=watcher.ensure,
+        runtime_stop_hook=watcher.stop,
     )
     lifecycle = SessionLifecycleService(
-        effective_settings, database, workspace, runtime
+        effective_settings, database, workspace, runtime, watcher, events
     )
     relay = LLMRelay(effective_settings)
     app_services = AppServices(
@@ -56,6 +62,7 @@ def create_app(
         workspace=workspace,
         events=events,
         runtime=runtime,
+        watcher=watcher,
         lifecycle=lifecycle,
         relay=relay,
     )
@@ -76,6 +83,7 @@ def create_app(
                 task.cancel()
             await asyncio.gather(*background_tasks, return_exceptions=True)
             await runtime.shutdown()
+            await watcher.shutdown()
             await relay.aclose()
 
     application = FastAPI(title="MyCode Web Demo", lifespan=lifespan)

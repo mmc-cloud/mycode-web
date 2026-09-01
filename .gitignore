@@ -5,6 +5,7 @@
 **/*.py[cod]
 **/*.pyc
 **/.pytest_cache/
+.pytest-tmp/
 .coverage
 htmlcov/
 

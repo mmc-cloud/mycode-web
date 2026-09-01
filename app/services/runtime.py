@@ -1,7 +1,7 @@
 import asyncio
 import codecs
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -188,8 +188,8 @@ class DockerSandboxLauncher:
 @dataclass(frozen=True)
 class _QueuedTurn:
     session_id: str
-    original_content: str
-    stdin_content: str
+    original_content: str | None
+    stdin_content: str | None
     enqueued_at: str
 
 
@@ -220,6 +220,8 @@ class RuntimeManager:
         *,
         clock: Callable[[], float] = time.monotonic,
         activity_hook: Callable[[str], None] | None = None,
+        runtime_start_hook: Callable[[str], Awaitable[None]] | None = None,
+        runtime_stop_hook: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.settings = settings
         self.workspace_service = workspace_service
@@ -227,6 +229,8 @@ class RuntimeManager:
         self.launcher = launcher or DockerSandboxLauncher(settings)
         self._clock = clock
         self._activity_hook = activity_hook
+        self._runtime_start_hook = runtime_start_hook
+        self._runtime_stop_hook = runtime_stop_hook
         self._sessions: dict[str, _RuntimeSession] = {}
         self._queue: deque[_QueuedTurn] = deque()
         self._lock = asyncio.Lock()
@@ -237,6 +241,10 @@ class RuntimeManager:
         state = self._sessions.get(session_id)
         return "stopped" if state is None else state.status
 
+    def pending_permission(self, session_id: str) -> dict[str, object] | None:
+        state = self._sessions.get(session_id)
+        return None if state is None else state.adapter.pending_permission
+
     @property
     def active_count(self) -> int:
         return sum(self._is_live(state) for state in self._sessions.values())
@@ -245,33 +253,94 @@ class RuntimeManager:
     def queued_count(self) -> int:
         return len(self._queue)
 
+    async def activate(self, session_id: str) -> str:
+        """Admit a warm runtime and return without waiting for Docker/MyCode."""
+        victim: tuple[str, _RuntimeSession] | None = None
+        start_state: _RuntimeSession | None = None
+        queue_position = 0
+        async with self._lock:
+            if self._closed:
+                raise RuntimeUnavailableError("Runtime manager is shutting down.")
+            state = self._sessions.setdefault(session_id, _RuntimeSession())
+            if state.status in {
+                "starting", "idle", "running", "waiting_permission", "queued"
+            }:
+                return state.status
+            if state.status == "stopping":
+                return "stopped"
+            if self._occupied_slots_locked() < self.settings.sandbox_max_active:
+                self._prepare_start_locked(session_id, state)
+                start_state = state
+            else:
+                idle = self._oldest_idle_locked()
+                if idle is not None:
+                    victim_id, victim_state = idle
+                    victim_state.status = "stopping"
+                    victim_state.stopping = True
+                    self._prepare_start_locked(session_id, state)
+                    victim = (victim_id, victim_state)
+                    start_state = state
+                else:
+                    if len(self._queue) >= self.settings.sandbox_queue_max:
+                        raise RuntimeCapacityError("The Sandbox queue is full.")
+                    state.status = "queued"
+                    state.busy = False
+                    self._touch(session_id, state)
+                    self._queue.append(
+                        _QueuedTurn(
+                            session_id=session_id,
+                            original_content=None,
+                            stdin_content=None,
+                            enqueued_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                    )
+                    queue_position = len(self._queue)
+        if queue_position:
+            await self.events.publish(
+                session_id, "runtime_status", status="queued",
+                queue_position=queue_position,
+            )
+            return "queued"
+        if start_state is None:
+            return self.status(session_id)
+        if victim is None:
+            self._spawn(self._warm_runtime(session_id, start_state))
+        else:
+            self._spawn(
+                self._start_after_eviction(victim, session_id, start_state, None)
+            )
+        return "starting"
+
     async def send_message(self, session_id: str, content: str) -> str:
         stdin_content = _normalize_cli_message(content)
         victim: tuple[str, _RuntimeSession] | None = None
         start_state: _RuntimeSession | None = None
         reuse_state: _RuntimeSession | None = None
+        waiting_start_state: _RuntimeSession | None = None
         queue_position = 0
 
         async with self._lock:
             if self._closed:
                 raise RuntimeUnavailableError("Runtime manager is shutting down.")
             state = self._sessions.setdefault(session_id, _RuntimeSession())
-            if state.status in {
-                "queued", "starting", "running", "waiting_permission", "stopping"
+            if state.status == "starting" and not state.busy:
+                waiting_start_state = state
+            elif state.status in {
+                "queued", "running", "waiting_permission", "stopping"
             } or state.busy:
                 raise RuntimeConflictError(
                     "This Session already has an active or queued Agent turn."
                 )
-            if self._is_live(state) and state.status == "idle":
+            elif self._is_live(state) and state.status == "idle":
                 state.status = "running"
                 state.busy = True
                 state.ready.clear()
                 self._touch(session_id, state)
                 reuse_state = state
-            elif self._occupied_slots_locked() < self.settings.sandbox_max_active:
+            elif waiting_start_state is None and self._occupied_slots_locked() < self.settings.sandbox_max_active:
                 self._prepare_start_locked(session_id, state)
                 start_state = state
-            else:
+            elif waiting_start_state is None:
                 idle = self._oldest_idle_locked()
                 if idle is not None:
                     victim_id, victim_state = idle
@@ -302,6 +371,9 @@ class RuntimeManager:
                 queue_position=queue_position,
             )
             return "queued"
+        if waiting_start_state is not None:
+            await self._send_when_ready(session_id, waiting_start_state, stdin_content)
+            return "running"
         if reuse_state is not None:
             await self.events.publish(session_id, "runtime_status", status="running")
             try:
@@ -314,7 +386,7 @@ class RuntimeManager:
             await self._terminate_state(*victim, reason="capacity_eviction")
         if start_state is None:
             raise RuntimeUnavailableError("Sandbox admission failed.")
-        await self._start_turn(session_id, start_state, stdin_content)
+        await self._start_runtime(session_id, start_state, stdin_content)
         return "running"
 
     async def resolve_permission(self, session_id: str, allow: bool) -> None:
@@ -409,26 +481,30 @@ class RuntimeManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _start_turn(
-        self, session_id: str, state: _RuntimeSession, stdin_content: str
+    async def _start_runtime(
+        self, session_id: str, state: _RuntimeSession, stdin_content: str | None
     ) -> None:
         workspace, mycode_state = self.workspace_service.ensure_session_directories(
             session_id
         )
         await self.events.publish(session_id, "runtime_status", status="starting")
         try:
+            if self._runtime_start_hook is not None:
+                await self._runtime_start_hook(session_id)
             process = await self.launcher.launch(session_id, workspace, mycode_state)
         except Exception as error:
             async with self._lock:
                 state.status = "error"
                 state.busy = False
-                state.ready.clear()
+                state.ready.set()
             await self.events.publish(
                 session_id,
                 "error",
                 message=f"Sandbox failed to start: {type(error).__name__}: {error}",
             )
             await self.events.publish(session_id, "runtime_status", status="error")
+            if self._runtime_stop_hook is not None:
+                await self._runtime_stop_hook(session_id)
             await self._schedule_waiting()
             raise RuntimeUnavailableError("Sandbox failed to start.") from error
         async with self._lock:
@@ -458,11 +534,15 @@ class RuntimeManager:
         async with self._lock:
             if state.status != "starting" or not self._is_live(state):
                 raise RuntimeUnavailableError("MyCode process stopped during startup.")
-            state.status = "running"
-            state.busy = True
-            state.ready.clear()
+            state.status = "idle" if stdin_content is None else "running"
+            state.busy = stdin_content is not None
+            if stdin_content is not None:
+                state.ready.clear()
             self._touch(session_id, state)
-        await self.events.publish(session_id, "runtime_status", status="running")
+        await self.events.publish(session_id, "runtime_status", status=state.status)
+        if stdin_content is None:
+            self._spawn(self._dispatch_from_idle(session_id, state))
+            return
         try:
             await self._write(state, stdin_content + "\n")
         except Exception:
@@ -503,8 +583,9 @@ class RuntimeManager:
                 state.busy = False
                 state.ready.clear()
                 stopped_intentionally = state.stopping
-                state.status = "stopped" if stopped_intentionally else "error"
-            if not stopped_intentionally:
+                clean_exit = return_code == 0
+                state.status = "stopped" if stopped_intentionally or clean_exit else "error"
+            if not stopped_intentionally and not clean_exit:
                 await self.events.publish(
                     session_id,
                     "error",
@@ -513,6 +594,8 @@ class RuntimeManager:
             await self.events.publish(
                 session_id, "runtime_status", status=state.status
             )
+            if self._runtime_stop_hook is not None:
+                await self._runtime_stop_hook(session_id)
             if not stopped_intentionally:
                 await self._schedule_waiting()
         except asyncio.CancelledError:
@@ -575,7 +658,7 @@ class RuntimeManager:
             self._prepare_start_locked(item.session_id, target)
         await self._terminate_state(session_id, state, reason="queue_handoff")
         try:
-            await self._start_turn(item.session_id, target, item.stdin_content)
+            await self._start_runtime(item.session_id, target, item.stdin_content)
         except RuntimeUnavailableError:
             pass
 
@@ -599,9 +682,57 @@ class RuntimeManager:
         self, item: _QueuedTurn, state: _RuntimeSession
     ) -> None:
         try:
-            await self._start_turn(item.session_id, state, item.stdin_content)
+            await self._start_runtime(item.session_id, state, item.stdin_content)
         except RuntimeUnavailableError:
             pass
+
+    async def _warm_runtime(
+        self, session_id: str, state: _RuntimeSession
+    ) -> None:
+        try:
+            await self._start_runtime(session_id, state, None)
+        except RuntimeUnavailableError:
+            pass
+
+    async def _start_after_eviction(
+        self,
+        victim: tuple[str, _RuntimeSession],
+        session_id: str,
+        state: _RuntimeSession,
+        stdin_content: str | None,
+    ) -> None:
+        await self._terminate_state(*victim, reason="capacity_eviction")
+        try:
+            await self._start_runtime(session_id, state, stdin_content)
+        except RuntimeUnavailableError:
+            pass
+
+    async def _send_when_ready(
+        self, session_id: str, state: _RuntimeSession, stdin_content: str
+    ) -> None:
+        try:
+            await asyncio.wait_for(state.ready.wait(), timeout=30)
+        except TimeoutError as error:
+            raise RuntimeUnavailableError("MyCode prompt did not become ready.") from error
+        while True:
+            async with self._lock:
+                if state.status == "idle" and self._is_live(state):
+                    state.status = "running"
+                    state.busy = True
+                    state.ready.clear()
+                    self._touch(session_id, state)
+                    break
+                if state.status in {"error", "stopped", "stopping"}:
+                    raise RuntimeUnavailableError(
+                        "MyCode process stopped during startup."
+                    )
+            await asyncio.sleep(0)
+        await self.events.publish(session_id, "runtime_status", status="running")
+        try:
+            await self._write(state, stdin_content + "\n")
+        except Exception:
+            await self.stop_session(session_id)
+            raise
 
     async def _write(self, state: _RuntimeSession, content: str) -> None:
         process = state.process
@@ -640,6 +771,8 @@ class RuntimeManager:
         await self.events.publish(
             session_id, "runtime_status", status="stopped", reason=reason
         )
+        if self._runtime_stop_hook is not None:
+            await self._runtime_stop_hook(session_id)
 
     def _prepare_start_locked(
         self, session_id: str, state: _RuntimeSession
@@ -692,4 +825,15 @@ class RuntimeManager:
     def _spawn(self, coroutine: Coroutine[object, object, None]) -> None:
         task = asyncio.create_task(coroutine)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._background_task_done)
+
+    def _background_task_done(self, task: asyncio.Task[None]) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Runtime background task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )

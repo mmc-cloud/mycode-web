@@ -6,11 +6,15 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from app.api.dependencies import WebContext, current_context, services
+from app.api.dependencies import WebContext, current_context, current_user, services
+from app.db.database import WebSession, WebUser
 from app.models.api import (
+    ConsoleEventResponse,
+    ConsoleSnapshotResponse,
     MessageRequest,
     PermissionDecisionRequest,
     ProfileUpdate,
+    SessionListResponse,
     SessionResponse,
     UserResponse,
 )
@@ -32,34 +36,94 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/session", response_model=SessionResponse)
-@router.post("/session", response_model=SessionResponse)
-def get_session(
+def _session_response(request: Request, session: WebSession) -> SessionResponse:
+    runtime = services(request).runtime
+    return SessionResponse(
+        id=session.id,
+        created_at=session.created_at,
+        last_active_at=session.last_active_at,
+        runtime_status=runtime.status(session.id),
+        pending_permission=runtime.pending_permission(session.id),
+    )
+
+
+@router.get("/sessions", response_model=SessionListResponse)
+def list_sessions(
+    request: Request,
+    user: WebUser = Depends(current_user),
+) -> SessionListResponse:
+    return SessionListResponse(
+        display_name=user.display_name,
+        sessions=[
+            _session_response(request, session)
+            for session in services(request).database.list_sessions(user.id)
+        ],
+    )
+
+
+@router.post("/sessions", response_model=SessionResponse, status_code=201)
+def create_session(
+    request: Request,
+    user: WebUser = Depends(current_user),
+) -> SessionResponse:
+    app_services = services(request)
+    session = app_services.database.create_session(user.id)
+    app_services.workspace.ensure_session_directories(session.id)
+    return _session_response(request, session)
+
+
+@router.get("/sessions/{session_id}", response_model=SessionResponse)
+async def get_session(
     request: Request,
     context: WebContext = Depends(current_context),
 ) -> SessionResponse:
-    runtime_status = services(request).runtime.status(context.session.id)
-    return SessionResponse(
-        display_name=context.user.display_name,
-        created_at=context.session.created_at,
-        last_active_at=context.session.last_active_at,
-        runtime_status=runtime_status,
+    app_services = services(request)
+    app_services.database.touch_session(context.session.id)
+    session = app_services.database.get_session(context.session.id, context.user.id)
+    assert session is not None
+    return _session_response(request, session)
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+async def delete_session(
+    request: Request,
+    context: WebContext = Depends(current_context),
+) -> None:
+    deleted = await services(request).lifecycle.delete_session(
+        context.session.id, user_id=context.user.id
     )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+
+@router.post("/sessions/{session_id}/activate", status_code=202)
+async def activate_session(
+    request: Request,
+    context: WebContext = Depends(current_context),
+) -> dict[str, str]:
+    app_services = services(request)
+    try:
+        status = await app_services.runtime.activate(context.session.id)
+    except RuntimeCapacityError as error:
+        raise HTTPException(status_code=429, detail=str(error)) from error
+    except RuntimeUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"status": status}
 
 
 @router.post("/profile", response_model=UserResponse)
 def update_profile(
     payload: ProfileUpdate,
     request: Request,
-    context: WebContext = Depends(current_context),
+    user: WebUser = Depends(current_user),
 ) -> UserResponse:
     user = services(request).database.update_display_name(
-        context.user.id, payload.display_name
+        user.id, payload.display_name
     )
     return UserResponse(display_name=user.display_name)
 
 
-@router.post("/message", status_code=202)
+@router.post("/sessions/{session_id}/message", status_code=202)
 async def send_message(
     payload: MessageRequest,
     request: Request,
@@ -69,24 +133,35 @@ async def send_message(
         admission = await services(request).runtime.send_message(
             context.session.id, payload.content
         )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     except RuntimeConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except RuntimeCapacityError as error:
         raise HTTPException(status_code=429, detail=str(error)) from error
     except RuntimeUnavailableError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    await services(request).events.publish(
+        context.session.id, "user_message", content=payload.content
+    )
     return {"status": admission}
 
 
-@router.get("/events")
+@router.get("/sessions/{session_id}/events")
 async def events(
     request: Request,
     context: WebContext = Depends(current_context),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-    after: int = Query(default=0, ge=0),
+    after: int | None = Query(default=None, ge=0),
 ) -> StreamingResponse:
     try:
-        cursor = int(last_event_id) if last_event_id is not None else after
+        cursor = (
+            int(last_event_id)
+            if last_event_id is not None
+            else after
+            if after is not None
+            else services(request).events.latest_id(context.session.id)
+        )
     except ValueError as error:
         raise HTTPException(status_code=400, detail="Invalid Last-Event-ID.") from error
 
@@ -108,7 +183,25 @@ async def events(
     )
 
 
-@router.post("/permission")
+@router.get(
+    "/sessions/{session_id}/console",
+    response_model=ConsoleSnapshotResponse,
+)
+def console_history(
+    request: Request,
+    context: WebContext = Depends(current_context),
+) -> ConsoleSnapshotResponse:
+    app_services = services(request)
+    event_cursor = app_services.events.latest_id(context.session.id)
+    events = list(
+        app_services.database.console_history(
+            context.session.id, context.user.id
+        )
+    )
+    return ConsoleSnapshotResponse(events=events, event_cursor=event_cursor)
+
+
+@router.post("/sessions/{session_id}/permission")
 async def permission(
     payload: PermissionDecisionRequest,
     request: Request,
@@ -125,7 +218,7 @@ async def permission(
     return {"status": "resolved"}
 
 
-@router.post("/files/upload", status_code=201)
+@router.post("/sessions/{session_id}/files/upload", status_code=201)
 async def upload_file(
     request: Request,
     upload: UploadFile = File(...),
@@ -149,10 +242,13 @@ async def upload_file(
         raise HTTPException(status_code=400, detail=str(error)) from error
     finally:
         await upload.close()
+    await services(request).events.publish(
+        context.session.id, "workspace_changed", changes=[]
+    )
     return {"status": "uploaded"}
 
 
-@router.get("/files/tree")
+@router.get("/sessions/{session_id}/files/tree")
 async def file_tree(
     request: Request,
     context: WebContext = Depends(current_context),
@@ -166,7 +262,7 @@ async def file_tree(
     return {"entries": tree}
 
 
-@router.get("/files/content")
+@router.get("/sessions/{session_id}/files/content")
 async def file_content(
     request: Request,
     path: str = Query(..., min_length=1),
@@ -185,7 +281,27 @@ async def file_content(
     return {"path": path, "content": content}
 
 
-@router.get("/files/download")
+@router.delete("/sessions/{session_id}/files")
+async def delete_path(
+    request: Request,
+    path: str = Query(..., min_length=1),
+    context: WebContext = Depends(current_context),
+) -> dict[str, str]:
+    try:
+        await run_in_threadpool(
+            services(request).workspace.delete_path, context.session.id, path
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="File not found.") from error
+    except WorkspaceError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await services(request).events.publish(
+        context.session.id, "workspace_changed", changes=[]
+    )
+    return {"status": "deleted"}
+
+
+@router.get("/sessions/{session_id}/files/download")
 async def download_file(
     request: Request,
     path: str = Query(..., min_length=1),
@@ -202,7 +318,7 @@ async def download_file(
     return FileResponse(target, filename=target.name)
 
 
-@router.get("/workspace/download")
+@router.get("/sessions/{session_id}/workspace/download")
 async def download_workspace(
     request: Request,
     context: WebContext = Depends(current_context),

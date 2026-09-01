@@ -85,6 +85,15 @@ class FakeLauncher:
         return process
 
 
+class ManualPromptLauncher(FakeLauncher):
+    async def launch(self, session_id: str, workspace: Path, mycode_state: Path):
+        self.calls += 1
+        process = FakeProcess()
+        self.processes.append(process)
+        self.by_session.setdefault(session_id, []).append(process)
+        return process
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -158,6 +167,90 @@ def test_runtime_writes_multiline_browser_message_once(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_activate_is_async_idempotent_and_message_waits_same_runtime(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = ManualPromptLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+
+        assert await manager.activate("session") == "starting"
+        assert await manager.activate("session") == "starting"
+        await asyncio.sleep(0)
+        assert launcher.calls == 1
+        send = asyncio.create_task(manager.send_message("session", "hello"))
+        await asyncio.sleep(0)
+        assert not send.done()
+        await launcher.process.stdout.feed(b"started\nyou> ")
+        assert await asyncio.wait_for(send, timeout=1) == "running"
+        assert launcher.calls == 1
+        assert launcher.process.stdin.writes == [b"hello\n"]
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_sse_reconnect_and_repeated_open_do_not_restart_runtime(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        events = EventHub()
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher
+        )
+        assert await manager.activate("session") == "starting"
+        await wait_for_status(manager, "session", "idle")
+        first_stream = events.stream("session", after_id=10_000)
+        pending = asyncio.create_task(anext(first_stream))
+        await asyncio.sleep(0)
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await first_stream.aclose()
+        second_stream = events.stream("session", after_id=10_000)
+        second_pending = asyncio.create_task(anext(second_stream))
+        await asyncio.sleep(0)
+        assert await manager.activate("session") == "idle"
+        assert launcher.calls == 1
+        second_pending.cancel()
+        await asyncio.gather(second_pending, return_exceptions=True)
+        await second_stream.aclose()
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("return_code", "expected_status", "expects_error"),
+    [(0, "stopped", False), (17, "error", True)],
+)
+def test_process_exit_semantics(
+    tmp_path: Path, return_code: int, expected_status: str, expects_error: bool
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        events = EventHub()
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher
+        )
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+        launcher.process.returncode = return_code
+        launcher.process.done.set()
+        await launcher.process.stdout.feed(b"")
+        await wait_for_status(manager, "session", expected_status)
+        errors = [event for event in events.history("session") if event.type == "error"]
+        assert bool(errors) is expects_error
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_cli_message_normalization_rejects_whitespace_only() -> None:
     with pytest.raises(ValueError, match="must not be empty"):
         _normalize_cli_message(" \t\r\n  \n")
@@ -207,6 +300,31 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         ]
         assert any(event.type == "permission_request" for event in events.history("session"))
         assert any(event.type == "permission_resolved" for event in events.history("session"))
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_permission_is_strictly_bound_to_its_session(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.send_message("a", "task a")
+        await manager.send_message("b", "task b")
+        await launcher.by_session["a"][0].stdout.feed(
+            "permission> write_file 需要确认\n是否批准？[y/N] ".encode()
+        )
+        await wait_for_status(manager, "a", "waiting_permission")
+        assert manager.pending_permission("a") is not None
+        assert manager.pending_permission("b") is None
+        with pytest.raises(RuntimeConflictError, match="no pending permission"):
+            await manager.resolve_permission("b", True)
+        assert launcher.by_session["b"][0].stdin.writes == [b"task b\n"]
+        await manager.resolve_permission("a", False)
+        assert launcher.by_session["a"][0].stdin.writes[-1] == b"n\n"
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -364,8 +482,16 @@ def test_oldest_idle_is_evicted_instead_of_queueing(tmp_path: Path) -> None:
         config = settings(tmp_path)
         workspace = WorkspaceService(config)
         launcher = FakeLauncher()
+        start_watcher = AsyncMock()
+        stop_watcher = AsyncMock()
         manager = RuntimeManager(
-            config, workspace, EventHub(), launcher=launcher, clock=clock
+            config,
+            workspace,
+            EventHub(),
+            launcher=launcher,
+            clock=clock,
+            runtime_start_hook=start_watcher,
+            runtime_stop_hook=stop_watcher,
         )
 
         await manager.send_message("old-idle", "first")
@@ -381,6 +507,7 @@ def test_oldest_idle_is_evicted_instead_of_queueing(tmp_path: Path) -> None:
 
         assert await manager.send_message("new", "third") == "running"
         assert manager.status("old-idle") == "stopped"
+        stop_watcher.assert_any_await("old-idle")
         assert manager.queued_count == 0
         assert (marker_workspace / "keep.txt").read_text(encoding="utf-8") == "workspace"
         assert (marker_state / "keep.txt").read_text(encoding="utf-8") == "state"
@@ -428,8 +555,16 @@ def test_idle_ttl_only_reclaims_expired_runtime_and_preserves_data(
         )
         workspace = WorkspaceService(config)
         launcher = FakeLauncher()
+        start_watcher = AsyncMock()
+        stop_watcher = AsyncMock()
         manager = RuntimeManager(
-            config, workspace, EventHub(), launcher=launcher, clock=clock
+            config,
+            workspace,
+            EventHub(),
+            launcher=launcher,
+            clock=clock,
+            runtime_start_hook=start_watcher,
+            runtime_stop_hook=stop_watcher,
         )
         await manager.send_message("session", "task")
         root, state_root = workspace.ensure_session_directories("session")
@@ -444,8 +579,13 @@ def test_idle_ttl_only_reclaims_expired_runtime_and_preserves_data(
         clock.advance(1)
         assert await manager.sweep_expired() == ("session",)
         assert manager.status("session") == "stopped"
+        stop_watcher.assert_awaited_with("session")
         assert (root / "keep.txt").exists()
         assert (state_root / "keep.txt").exists()
+
+        assert await manager.activate("session") == "starting"
+        await wait_for_status(manager, "session", "idle")
+        assert start_watcher.await_count == 2
         await manager.shutdown()
 
     asyncio.run(scenario())

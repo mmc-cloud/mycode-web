@@ -12,6 +12,7 @@ from app.main import create_app
 from app.services.events import EventHub
 from app.services.lifecycle import SessionLifecycleService
 from app.services.runtime import RuntimeManager
+from app.services.watcher import WorkspaceWatchManager
 from app.services.workspace import WorkspaceError, WorkspaceService
 
 
@@ -43,8 +44,12 @@ def make_services(tmp_path: Path):
     database = WebDatabase(settings.database_path)
     database.initialize()
     workspace = WorkspaceService(settings)
-    runtime = RuntimeManager(settings, workspace, EventHub())
-    lifecycle = SessionLifecycleService(settings, database, workspace, runtime)
+    events = EventHub()
+    runtime = RuntimeManager(settings, workspace, events)
+    watcher = WorkspaceWatchManager(workspace, events)
+    lifecycle = SessionLifecycleService(
+        settings, database, workspace, runtime, watcher, events
+    )
     return settings, database, workspace, runtime, lifecycle
 
 
@@ -52,7 +57,7 @@ def test_expired_session_data_and_metadata_are_removed(tmp_path: Path) -> None:
     async def scenario() -> None:
         _settings, database, workspace, runtime, lifecycle = make_services(tmp_path)
         user, _ = database.get_or_create_user(None)
-        session = database.ensure_session(user.id)
+        session = database.create_session(user.id)
         workspace_root, state_root = workspace.ensure_session_directories(session.id)
         (workspace_root / "project.py").write_text("pass", encoding="utf-8")
         (state_root / "session.json").write_text("{}", encoding="utf-8")
@@ -73,7 +78,7 @@ def test_recent_session_is_retained(tmp_path: Path) -> None:
     async def scenario() -> None:
         _settings, database, workspace, runtime, lifecycle = make_services(tmp_path)
         user, _ = database.get_or_create_user(None)
-        session = database.ensure_session(user.id)
+        session = database.create_session(user.id)
         workspace.ensure_session_directories(session.id)
         now = datetime(2026, 8, 31, tzinfo=timezone.utc)
         database.touch_session(
@@ -83,6 +88,40 @@ def test_recent_session_is_retained(tmp_path: Path) -> None:
         assert await lifecycle.cleanup_expired_once(now=now) == ()
         assert workspace.session_dir(session.id).exists()
         assert database.inactive_session_ids(now.isoformat()) == (session.id,)
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_delete_session_stops_only_its_runtime_and_removes_its_state(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        _settings, database, workspace, runtime, lifecycle = make_services(tmp_path)
+        user, _ = database.get_or_create_user(None)
+        session_a = database.create_session(user.id)
+        session_b = database.create_session(user.id)
+        root_a, state_a = workspace.ensure_session_directories(session_a.id)
+        root_b, state_b = workspace.ensure_session_directories(session_b.id)
+        (root_a / "a.txt").write_text("a", encoding="utf-8")
+        (state_a / "session.json").write_text("a", encoding="utf-8")
+        (root_b / "b.txt").write_text("b", encoding="utf-8")
+        (state_b / "session.json").write_text("b", encoding="utf-8")
+        runtime.stop_session = AsyncMock(wraps=runtime.stop_session)
+
+        assert await lifecycle.delete_session(
+            session_a.id, user_id="different-user"
+        ) is False
+        runtime.stop_session.assert_not_awaited()
+        assert root_a.exists() and state_a.exists()
+
+        assert await lifecycle.delete_session(
+            session_a.id, user_id=user.id
+        ) is True
+        runtime.stop_session.assert_awaited_once_with(session_a.id)
+        assert not workspace.session_dir(session_a.id).exists()
+        assert root_b.exists() and state_b.exists()
+        assert database.get_session(session_b.id, user.id) == session_b
         await runtime.shutdown()
 
     asyncio.run(scenario())

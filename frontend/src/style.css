@@ -45,6 +45,8 @@ h2 { margin-bottom: 0; font-size: 1.15rem; }
 .status[data-status="idle"] { background: #b8dfbd; }
 .status[data-status="waiting_permission"] { background: #f0b9a8; }
 .status[data-status="queued"] { background: #c9d6f0; }
+.status[data-status="starting"] { background: #d9c8f0; }
+.status[data-status="error"] { background: #efb3ad; }
 .error-banner { grid-column: 1 / -1; margin: 0; border-radius: 8px; background: #a33932; color: white; padding: 0.8rem 1rem; }
 .workspace-panel, .agent-panel { min-height: 0; border: 1px solid #d2d6cc; border-radius: 14px; background: #fafbf7; padding: 1rem; box-shadow: 0 12px 30px rgb(35 52 39 / 8%); }
 .panel-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.9rem; }
@@ -75,6 +77,28 @@ nav, .preview { overflow: auto; border: 1px solid #e0e3db; border-radius: 9px; b
 .queue-notice { margin: 0.75rem 0 0; color: #445b85; }
 .composer textarea { resize: vertical; border: 1px solid #cdd2c8; border-radius: 9px; padding: 0.7rem; }
 .muted { color: #7b847c; }
+
+.session-shell { grid-template-columns: minmax(210px, 0.45fr) minmax(340px, 0.8fr) minmax(480px, 1.2fr); }
+.session-panel { min-height: 0; border: 1px solid #d2d6cc; border-radius: 14px; background: #fafbf7; padding: 1rem; box-shadow: 0 12px 30px rgb(35 52 39 / 8%); }
+.session-list { display: flex; flex-direction: column; gap: 0.45rem; }
+.session-item { display: flex; justify-content: space-between; gap: 0.5rem; background: #e6ebe2; color: #243128; text-align: left; }
+.session-item.active { background: #24573a; color: white; }
+.session-item small { opacity: 0.72; }
+.session-delete { margin-top: 0.5rem; }
+.file-tree summary { display: flex; align-items: center; justify-content: space-between; gap: 0.3rem; }
+.file-row { display: flex; align-items: center; gap: 0.2rem; }
+.tree-delete { flex: 0 0 auto; padding: 0.12rem 0.42rem; border-radius: 5px; background: transparent; color: #9b3c35; }
+.tree-delete:hover { background: #f6dedb; }
+.console-history { flex: 1; overflow: auto; border-radius: 9px; background: #111713; color: #dce7dc; padding: 0.8rem; }
+.console-card { border-left: 3px solid #6f8575; margin: 0 0 0.7rem; padding: 0.5rem 0.65rem; background: #19221c; }
+.console-card strong { display: block; margin-bottom: 0.28rem; color: #9fc5a7; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; }
+.console-card pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 0.84rem/1.5 "Cascadia Code", Consolas, monospace; }
+.console-card[data-kind="user"] { border-color: #7ba4d8; }
+.console-card[data-kind="user"] strong { color: #a9c8ef; }
+.console-card[data-kind="permission"] { border-color: #e6b071; }
+.console-card[data-kind="permission"] strong { color: #efc38e; }
+.console-card[data-kind="error"] { border-color: #d96d64; }
+.console-card[data-kind="error"] strong { color: #efaaa4; }
 
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }

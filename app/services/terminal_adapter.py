@@ -69,6 +69,12 @@ class TerminalOutputAdapter:
         self._permission = {}
         self._buffer = ""
 
+    @property
+    def pending_permission(self) -> dict[str, object] | None:
+        if not self.awaiting_permission:
+            return None
+        return dict(self._permission)
+
     def _observe_line(self, line: str) -> None:
         if line.startswith("permission> "):
             self._permission = {}
