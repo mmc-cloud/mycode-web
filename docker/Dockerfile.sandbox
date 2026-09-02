@@ -10,11 +10,10 @@ RUN python -m pip install --no-cache-dir "uv==0.9.21"
 
 FROM base AS dependencies
 
-ENV UV_PROJECT_ENVIRONMENT=/opt/mycode-venv \
-    PATH="/opt/mycode-venv/bin:${PATH}"
 WORKDIR /opt/mycode-source
 COPY --from=mycode README.md pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN UV_PROJECT_ENVIRONMENT=/opt/mycode-venv \
+    uv sync --locked --no-dev --no-install-project
 
 FROM dependencies AS sandbox-tools
 
@@ -22,13 +21,14 @@ RUN apt-get -o Acquire::Retries=3 update \
     && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         ca-certificates curl findutils git grep unzip wget zip \
     && rm -rf /var/lib/apt/lists/* \
-    && uv pip install --python /opt/mycode-venv/bin/python pytest requests ruff \
     && useradd --create-home --uid 10001 --shell /bin/bash mycode
 
 FROM sandbox-tools AS application
 
 COPY --from=mycode mycode /opt/mycode-source/mycode
-RUN uv sync --locked --no-dev --inexact \
+RUN UV_PROJECT_ENVIRONMENT=/opt/mycode-venv \
+    uv sync --locked --no-dev --inexact \
+    && ln -s /opt/mycode-venv/bin/mycode /usr/local/bin/mycode \
     && mkdir -p /workspace /home/mycode/.mycode \
     && chown -R mycode:mycode /workspace /home/mycode
 

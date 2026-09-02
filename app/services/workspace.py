@@ -18,6 +18,18 @@ class WorkspaceLimitError(WorkspaceError):
     pass
 
 
+GENERATED_DIRECTORY_NAMES = frozenset(
+    {
+        ".venv",
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+)
+
+
 @dataclass(frozen=True)
 class WorkspaceStats:
     file_count: int
@@ -343,6 +355,8 @@ def _require_within(candidate: Path, root: Path) -> None:
 def _tree_entries(directory: Path, root: Path) -> list[dict[str, object]]:
     entries: list[dict[str, object]] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
+        if path.name in GENERATED_DIRECTORY_NAMES:
+            continue
         relative = path.relative_to(root).as_posix()
         if _is_link(path):
             entries.append({"name": path.name, "path": relative, "kind": "symlink"})

@@ -55,6 +55,22 @@ def test_dockerfile_uses_named_mycode_context_and_root_lock() -> None:
     assert "pip install --no-deps" not in dockerfile
 
 
+def test_sandbox_keeps_mycode_venv_private_from_user_projects() -> None:
+    dockerfile = (ROOT / "docker/Dockerfile.sandbox").read_text(
+        encoding="utf-8"
+    )
+    assert "ENV UV_PROJECT_ENVIRONMENT=/opt/mycode-venv" not in dockerfile
+    assert 'PATH="/opt/mycode-venv/bin:${PATH}"' not in dockerfile
+    assert "ENV VIRTUAL_ENV=" not in dockerfile
+    assert "ENV PYTHONPATH=" not in dockerfile
+    assert dockerfile.count("UV_PROJECT_ENVIRONMENT=/opt/mycode-venv") == 2
+    assert "uv pip install --python /opt/mycode-venv/bin/python" not in dockerfile
+    for extra_package in ("pytest", "requests", "ruff"):
+        assert extra_package not in dockerfile
+    assert "ln -s /opt/mycode-venv/bin/mycode /usr/local/bin/mycode" in dockerfile
+    assert 'CMD ["mycode", "agent", "--continue"]' in dockerfile
+
+
 def test_build_scripts_accept_external_mycode_source() -> None:
     powershell = (ROOT / "scripts/build-sandbox.ps1").read_text(encoding="utf-8")
     shell = (ROOT / "scripts/build-sandbox.sh").read_text(encoding="utf-8")

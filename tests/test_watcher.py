@@ -5,15 +5,17 @@ from watchfiles import Change
 
 from app.config import ServerSettings
 from app.services.events import EventHub
-from app.services.watcher import WorkspaceWatchManager
+from app.services.watcher import WATCH_IGNORE_DIRS, WorkspaceWatchManager
 from app.services.workspace import WorkspaceService
 
 
 class FakeWatchFactory:
     def __init__(self) -> None:
         self.queues: dict[Path, asyncio.Queue[set[tuple[Change, str]]]] = {}
+        self.options: dict[Path, dict[str, object]] = {}
 
-    def __call__(self, root: Path, **_kwargs):
+    def __call__(self, root: Path, **kwargs):
+        self.options[Path(root)] = kwargs
         queue = self.queues.setdefault(Path(root), asyncio.Queue())
 
         async def stream():
@@ -73,5 +75,41 @@ def test_watcher_projects_create_modify_delete_rename_and_isolates_session(
         assert "a" not in watcher._tasks
         await watcher.shutdown()
         assert not watcher._tasks
+
+    asyncio.run(scenario())
+
+
+def test_watcher_ignores_generated_directories_but_watches_project_files(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+        workspace = WorkspaceService(settings)
+        events = EventHub()
+        factory = FakeWatchFactory()
+        watcher = WorkspaceWatchManager(workspace, events, watch_factory=factory)
+        root, _ = workspace.ensure_session_directories("session")
+        await watcher.ensure("session")
+        await asyncio.sleep(0)
+
+        watch_filter = factory.options[root]["watch_filter"]
+        for directory in (
+            ".venv",
+            ".git",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            ".ruff_cache",
+        ):
+            assert directory in WATCH_IGNORE_DIRS
+            assert not watch_filter(
+                Change.modified, str(root / directory / "file.py")
+            )
+        assert watch_filter(Change.modified, str(root / "pyproject.toml"))
+        assert watch_filter(Change.modified, str(root / "uv.lock"))
+        assert watch_filter(Change.modified, str(root / "src" / "main.py"))
+        assert watch_filter(Change.modified, str(root / "tests" / "test_main.py"))
+
+        await watcher.shutdown()
 
     asyncio.run(scenario())

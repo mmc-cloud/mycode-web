@@ -171,3 +171,50 @@ def test_stats_tree_and_directory_delete_prune_symlinks(tmp_path: Path) -> None:
 
     assert not folder.exists()
     assert (outside / "secret.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_tree_hides_generated_directories_but_stats_still_count_them(
+    tmp_path: Path,
+) -> None:
+    workspace = service(tmp_path)
+    root, _ = workspace.ensure_session_directories("session")
+    visible_files = (
+        root / "src" / "main.py",
+        root / "tests" / "test_main.py",
+        root / "pyproject.toml",
+        root / "uv.lock",
+    )
+    hidden_files = tuple(
+        root / directory / "nested" / "generated.txt"
+        for directory in (
+            ".venv",
+            ".git",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            ".ruff_cache",
+        )
+    )
+    for path in visible_files + hidden_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+
+    tree = workspace.tree("session")
+
+    assert {entry["name"] for entry in tree} == {
+        "pyproject.toml",
+        "src",
+        "tests",
+        "uv.lock",
+    }
+    assert {
+        child["name"]
+        for entry in tree
+        if entry["kind"] == "directory"
+        for child in entry["children"]
+    } == {"main.py", "test_main.py"}
+    stats = workspace.stats(root)
+    assert stats.file_count == len(visible_files) + len(hidden_files)
+    assert stats.total_bytes == sum(
+        path.stat().st_size for path in visible_files + hidden_files
+    )

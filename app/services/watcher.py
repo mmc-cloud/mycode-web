@@ -4,14 +4,20 @@ import logging
 import os
 from pathlib import Path
 
-from watchfiles import Change, awatch
+from watchfiles import Change, DefaultFilter, awatch
 
 from app.services.events import EventHub
-from app.services.workspace import WorkspaceService
+from app.services.workspace import GENERATED_DIRECTORY_NAMES, WorkspaceService
 
 
 logger = logging.getLogger(__name__)
 WatchFactory = Callable[..., AsyncIterator[set[tuple[Change, str]]]]
+WATCH_IGNORE_DIRS = tuple(
+    sorted(
+        set(DefaultFilter.ignore_dirs)
+        | GENERATED_DIRECTORY_NAMES
+    )
+)
 
 
 class WorkspaceWatchManager:
@@ -76,6 +82,7 @@ class WorkspaceWatchManager:
         try:
             async for changes in self._watch_factory(
                 workspace_root,
+                watch_filter=DefaultFilter(ignore_dirs=WATCH_IGNORE_DIRS),
                 debounce=250,
                 step=50,
                 stop_event=stop_event,
