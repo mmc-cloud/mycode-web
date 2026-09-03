@@ -108,3 +108,15 @@ def test_terminal_clipboard_ux_uses_xterm_paste_and_cleans_listeners() -> None:
     assert 'addEventListener("keydown", handleKeyDown, true)' in terminal
     assert 'removeEventListener("keydown", handleKeyDown, true)' in terminal
     assert "socket.send(text)" not in terminal
+
+
+def test_execution_group_completed_turns_keep_user_toggle_state() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "const explicitExpanded = expanded[group.key]" in source
+    assert "expandedGroups.value[group.key] = !group.expanded" in source
+    assert "if (ACTIVE_TURN_STATUSES.includes(previous) && status === \"idle\")" in source
+    assert "expandedGroups.value[turnId] = false" in source
+    assert "expandedGroups.value = {}" in source

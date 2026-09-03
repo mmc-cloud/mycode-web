@@ -15,6 +15,7 @@ const layoutDefaults = {
   workspaceCollapsed: false,
   terminalCollapsed: false,
 }
+const ACTIVE_TURN_STATUSES = ["starting", "queued", "running", "waiting_permission"]
 
 function defaultLayout() {
   return { ...layoutDefaults }
@@ -136,6 +137,7 @@ async function openSession(sessionId, replace = false) {
   liveConsole.value = null
   permission.value = null
   turnStates.value = {}
+  expandedGroups.value = {}
   const url = new URL(window.location.href)
   url.searchParams.set("session", sessionId)
   window.history[replace ? "replaceState" : "pushState"]({}, "", url)
@@ -158,7 +160,7 @@ async function loadMetadata(sessionId, token) {
   currentSession.value = result
   permission.value = result.pending_permission
   if (result.active_turn_id) {
-    turnStates.value[result.active_turn_id] = { status: result.runtime_status }
+    updateTurnStatus(result.active_turn_id, result.runtime_status)
   }
   const index = sessions.value.findIndex((item) => item.id === sessionId)
   if (index >= 0) sessions.value[index] = result
@@ -213,8 +215,8 @@ function applyRuntimeStatus(data) {
   if (!currentSession.value) return
   currentSession.value.runtime_status = data.status
   if (!data.turn_id) return
-  turnStates.value[data.turn_id] = { status: data.status }
-  if (["starting", "queued", "running", "waiting_permission"].includes(data.status)) {
+  updateTurnStatus(data.turn_id, data.status)
+  if (ACTIVE_TURN_STATUSES.includes(data.status)) {
     currentSession.value.active_turn_id = data.turn_id
   } else if (currentSession.value.active_turn_id === data.turn_id) {
     currentSession.value.active_turn_id = null
@@ -243,7 +245,7 @@ function connectEvents(sessionId, token, after) {
     if (generation !== token) return
     const data = JSON.parse(event.data)
     permission.value = data
-    if (data.turn_id) turnStates.value[data.turn_id] = { status: "waiting_permission" }
+    if (data.turn_id) updateTurnStatus(data.turn_id, "waiting_permission")
   })
   eventSource.addEventListener("permission_resolved", (event) => {
     if (generation !== token) return
@@ -253,7 +255,7 @@ function connectEvents(sessionId, token, after) {
       const status = currentSession.value?.runtime_status === "idle"
         ? "idle"
         : "running"
-      turnStates.value[data.turn_id] = { status }
+      updateTurnStatus(data.turn_id, status)
     }
   })
   eventSource.addEventListener("workspace_changed", () => {
@@ -284,6 +286,14 @@ function upsertConsole(event) {
   if (index >= 0) consoleEvents.value[index] = normalized
   else consoleEvents.value.push(normalized)
   scrollConsole()
+}
+
+function updateTurnStatus(turnId, status) {
+  const previous = turnStates.value[turnId]?.status
+  turnStates.value[turnId] = { status }
+  if (ACTIVE_TURN_STATUSES.includes(previous) && status === "idle") {
+    expandedGroups.value[turnId] = false
+  }
 }
 
 function scrollConsole() {
@@ -371,7 +381,7 @@ async function sendMessage() {
     })
     currentSession.value.runtime_status = result.status
     currentSession.value.active_turn_id = result.turn_id
-    turnStates.value[result.turn_id] = { status: result.status }
+    updateTurnStatus(result.turn_id, result.status)
     message.value = ""
   } catch (reason) { showError(reason) }
 }
@@ -579,9 +589,10 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
     const status = hasError ? "error" : active && (state === "waiting_permission" || groupPending) ? "waiting" : active ? (state === "queued" ? "queued" : "running") : "completed"
     const statusLabel = { running: "Running", waiting: "Waiting for permission", queued: "Queued", error: "Error", completed: "Completed" }[status]
     const stepCount = tools.length + permissions.length
-    const groupExpanded = Object.prototype.hasOwnProperty.call(expanded, group.key)
-      ? expanded[group.key]
-      : ["running", "waiting", "queued", "error"].includes(status)
+    const explicitExpanded = expanded[group.key]
+    const groupExpanded = explicitExpanded === undefined
+      ? ["running", "waiting", "queued", "error"].includes(status)
+      : explicitExpanded
     return {
       ...group,
       tools,
