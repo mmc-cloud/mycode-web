@@ -212,15 +212,27 @@ Browser
 
 1. 将 `mycode.icu` 的 DNS A record 指向服务器公网 IP，并确认 TCP 80/443 对外开放。
 2. 保持现有可工作的 HTTP-only Nginx server（如果服务器已有适合 Certbot 的 HTTP server，直接复用）。
-3. 在服务器安装 Certbot，先申请证书：
+3. 使用 Docker Certbot + webroot 先申请证书（挂载 `/etc/letsencrypt` 和 `/var/www/certbot`）：
 
    ```sh
-   sudo certbot --nginx -d mycode.icu
+   docker run --rm \
+     -v /etc/letsencrypt:/etc/letsencrypt \
+     -v /var/www/certbot:/var/www/certbot \
+     certbot/certbot certonly --webroot \
+     --webroot-path /var/www/certbot -d mycode.icu
    ```
 
 4. 确认 `/etc/letsencrypt/live/mycode.icu/fullchain.pem` 和 `/etc/letsencrypt/live/mycode.icu/privkey.pem` 均已存在。
 5. 再安装 `deploy/nginx/mycode.conf`，执行 `sudo nginx -t`，然后 `sudo systemctl reload nginx`。
-6. 确认 Certbot 自动续期 timer/cron 已启用，并执行 `sudo certbot renew --dry-run`。
+6. 确认自动续期 timer/cron 调用同一 Docker Certbot 挂载，并执行：
+
+   ```sh
+   docker run --rm \
+     -v /etc/letsencrypt:/etc/letsencrypt \
+     -v /var/www/certbot:/var/www/certbot \
+     certbot/certbot renew --dry-run
+   ```
+
 7. 验证 `https://mycode.icu/web/` 和 `https://mycode.icu/web/api/health`。
 
 ### 生产 `.env` 升级

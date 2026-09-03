@@ -53,6 +53,11 @@ def test_nginx_template_keeps_web_api_ws_sse_and_legacy_redirects() -> None:
     content = template.read_text(encoding="utf-8")
 
     assert "map $http_upgrade $connection_upgrade" in content
+    assert "location ^~ /.well-known/acme-challenge/" in content
+    assert "root /var/www/certbot;" in content
+    assert "default_type text/plain;" in content
+    assert "try_files $uri =404;" in content
+    assert "location / {\n        return 301 https://$host$request_uri;\n    }" in content
     assert "location /web/api/" in content
     assert "proxy_pass http://127.0.0.1:8000;" in content
     assert "proxy_set_header Upgrade $http_upgrade;" in content
