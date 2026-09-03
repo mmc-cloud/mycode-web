@@ -26,12 +26,19 @@ button:hover:not(:disabled), .button-link:hover, .button-label:hover { filter: b
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr) 8px var(--terminal-height);
+  grid-template-areas:
+    "header"
+    "notice"
+    "main"
+    "splitter"
+    "terminal";
   gap: 8px;
   height: 100vh;
   min-height: 620px;
   padding: 12px;
 }
 .app-header {
+  grid-area: header;
   position: relative;
   display: flex;
   align-items: center;
@@ -69,11 +76,13 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 }
 .settings-popover label { display: grid; gap: 0.25rem; color: #5f6b62; font-size: 0.72rem; font-weight: 700; }
 .settings-popover input { width: 100%; border: 1px solid #c9cec4; border-radius: 6px; padding: 0.45rem; background: #fafbf7; }
-.error-banner, .global-notice { grid-column: 1; margin: 0; border-radius: 7px; padding: 0.55rem 0.8rem; font-size: 0.8rem; }
+.notice-area { grid-area: notice; min-height: 0; }
+.error-banner, .global-notice { margin: 0; border-radius: 7px; padding: 0.55rem 0.8rem; font-size: 0.8rem; }
 .error-banner { background: #a33932; color: white; }
 .queue-notice { margin: 0.45rem 0 0; color: #445b85; font-size: 0.78rem; }
 .global-notice { color: #445b85; background: #dce6f8; }
 .main-area {
+  grid-area: main;
   display: grid;
   grid-template-columns: var(--sessions-width) 8px var(--workspace-width) 8px minmax(320px, 1fr);
   min-width: 0;
@@ -97,6 +106,7 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 .splitter { position: relative; z-index: 2; background: transparent; }
 .splitter::after { content: ""; position: absolute; background: #cbd3c7; opacity: 0.7; border-radius: 3px; }
 .splitter.vertical { cursor: col-resize; }
+.splitter.horizontal { grid-area: splitter; }
 .splitter.vertical::after { top: 35%; bottom: 35%; left: 3px; width: 2px; }
 .splitter.horizontal { cursor: row-resize; }
 .splitter.horizontal::after { left: 35%; right: 35%; top: 3px; height: 2px; }
@@ -170,7 +180,7 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 .composer textarea { resize: vertical; min-height: 58px; border: 1px solid #cdd2c8; border-radius: 7px; padding: 0.55rem; }
 .composer button { align-self: end; height: 38px; }
 .muted { color: #7b847c; font-size: 0.78rem; }
-.terminal-drawer { display: flex; flex-direction: column; padding: 0.55rem 0.72rem 0.72rem; }
+.terminal-drawer { grid-area: terminal; display: flex; flex-direction: column; padding: 0.55rem 0.72rem 0.72rem; }
 .terminal-drawer.collapsed { padding-bottom: 0.4rem; }
 .terminal-heading { margin-bottom: 0.35rem; }
 .terminal-heading h2 small { color: #6b746c; font-size: 0.7rem; }

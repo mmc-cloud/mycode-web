@@ -614,8 +614,10 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
         </div>
       </div>
     </header>
-    <p v-if="error" class="error-banner">{{ error }}</p>
-    <p v-if="lifecycleNotice" class="queue-notice global-notice">{{ lifecycleNotice }}</p>
+    <div class="notice-area">
+      <p v-if="error" class="error-banner">{{ error }}</p>
+      <p v-if="lifecycleNotice" class="queue-notice global-notice">{{ lifecycleNotice }}</p>
+    </div>
 
     <section class="main-area">
       <aside class="panel sessions-panel" :class="{ collapsed: layout.sessionsCollapsed }">
