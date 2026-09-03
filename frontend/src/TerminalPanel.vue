@@ -14,12 +14,15 @@ const props = defineProps({
 const terminalElement = ref(null)
 const status = ref("closed")
 const notice = ref("")
+const clipboardNotice = ref("")
 let terminal = null
 let fitAddon = null
 let socket = null
 let resizeObserver = null
 let dataDisposable = null
 let resizeDisposable = null
+let clipboardElement = null
+let clipboardNoticeTimer = null
 let generation = 0
 let retryTimer = null
 let retryCount = 0
@@ -51,6 +54,89 @@ function fit() {
   sendResize()
 }
 
+function clearClipboardNotice() {
+  if (clipboardNoticeTimer !== null) {
+    window.clearTimeout(clipboardNoticeTimer)
+    clipboardNoticeTimer = null
+  }
+  clipboardNotice.value = ""
+}
+
+function showClipboardNotice(message) {
+  if (clipboardNoticeTimer !== null) window.clearTimeout(clipboardNoticeTimer)
+  clipboardNotice.value = message
+  clipboardNoticeTimer = window.setTimeout(() => {
+    clipboardNoticeTimer = null
+    clipboardNotice.value = ""
+  }, 2500)
+}
+
+async function copySelection() {
+  const selection = terminal?.getSelection() || ""
+  if (!selection) return
+  const token = generation
+  try {
+    await navigator.clipboard.writeText(selection)
+    if (generation === token) clearClipboardNotice()
+  } catch (_) {
+    if (generation === token) {
+      showClipboardNotice("复制失败，请使用 Ctrl+Shift+C")
+    }
+  }
+}
+
+async function pasteClipboard() {
+  const token = generation
+  try {
+    const text = await navigator.clipboard.readText()
+    if (generation !== token || !terminal) return
+    terminal.paste(text)
+    terminal.focus()
+    clearClipboardNotice()
+  } catch (_) {
+    if (generation === token) {
+      showClipboardNotice("剪贴板读取失败，请使用 Ctrl+Shift+V")
+      terminal?.focus()
+    }
+  }
+}
+
+function handlePointerUp(event) {
+  if (event.button === 0) void copySelection()
+}
+
+function handleContextMenu(event) {
+  event.preventDefault()
+  void pasteClipboard()
+}
+
+function handleKeyDown(event) {
+  if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return
+  const key = event.key.toLowerCase()
+  if (key === "c" || key === "v") {
+    event.preventDefault()
+    event.stopPropagation()
+    if (key === "c") void copySelection()
+    else void pasteClipboard()
+  }
+}
+
+function registerClipboardListeners() {
+  clipboardElement = terminalElement.value
+  if (!clipboardElement) return
+  clipboardElement.addEventListener("pointerup", handlePointerUp)
+  clipboardElement.addEventListener("contextmenu", handleContextMenu)
+  clipboardElement.addEventListener("keydown", handleKeyDown, true)
+}
+
+function unregisterClipboardListeners() {
+  if (!clipboardElement) return
+  clipboardElement.removeEventListener("pointerup", handlePointerUp)
+  clipboardElement.removeEventListener("contextmenu", handleContextMenu)
+  clipboardElement.removeEventListener("keydown", handleKeyDown, true)
+  clipboardElement = null
+}
+
 function destroyTerminal() {
   generation += 1
   if (retryTimer !== null) {
@@ -59,6 +145,8 @@ function destroyTerminal() {
   }
   resizeObserver?.disconnect()
   resizeObserver = null
+  clearClipboardNotice()
+  unregisterClipboardListeners()
   dataDisposable?.dispose()
   resizeDisposable?.dispose()
   dataDisposable = null
@@ -116,6 +204,7 @@ async function connect(resetRetries = true) {
   fitAddon = new FitAddon()
   terminal.loadAddon(fitAddon)
   terminal.open(terminalElement.value)
+  registerClipboardListeners()
   status.value = "starting"
   notice.value = ""
   fit()
@@ -190,6 +279,7 @@ onBeforeUnmount(destroyTerminal)
       <span class="terminal-caption">bash · /workspace</span>
       <span class="terminal-status" :data-status="status">{{ statusLabels[status] || status }}</span>
       <span v-if="notice" class="terminal-notice">{{ notice }}</span>
+      <span v-if="clipboardNotice" class="terminal-notice terminal-clipboard-notice">{{ clipboardNotice }}</span>
     </div>
     <div ref="terminalElement" class="xterm-host" aria-label="Web Terminal" />
   </div>

@@ -79,3 +79,32 @@ def test_frontend_uses_web_base_and_protocol_aware_websocket_builder() -> None:
     assert 'base: `${WEB_BASE_PATH}/`' in vite
     assert 'proxy: {' in vite
     assert "ws: true" in vite
+
+
+def test_terminal_clipboard_ux_uses_xterm_paste_and_cleans_listeners() -> None:
+    terminal = (
+        Path(__file__).resolve().parents[1] / "frontend/src/TerminalPanel.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "navigator.clipboard.writeText(selection)" in terminal
+    assert "navigator.clipboard.readText()" in terminal
+    assert "terminal.paste(text)" in terminal
+    assert 'const clipboardNotice = ref("")' in terminal
+    assert "let clipboardNoticeTimer = null" in terminal
+    assert "clipboardNoticeTimer = window.setTimeout" in terminal
+    assert "clearClipboardNotice()" in terminal
+    assert 'v-if="clipboardNotice"' in terminal
+    assert "clipboardNotice.value = message" in terminal
+    assert "notice.value = message" not in terminal
+    assert "if (generation === token) clearClipboardNotice()" in terminal
+    assert "if (generation !== token || !terminal) return" in terminal
+    assert 'event.key.toLowerCase()' in terminal
+    assert 'if (key === "c") void copySelection()' in terminal
+    assert 'else void pasteClipboard()' in terminal
+    assert 'addEventListener("pointerup", handlePointerUp)' in terminal
+    assert 'addEventListener("contextmenu", handleContextMenu)' in terminal
+    assert 'removeEventListener("pointerup", handlePointerUp)' in terminal
+    assert 'removeEventListener("contextmenu", handleContextMenu)' in terminal
+    assert 'addEventListener("keydown", handleKeyDown, true)' in terminal
+    assert 'removeEventListener("keydown", handleKeyDown, true)' in terminal
+    assert "socket.send(text)" not in terminal
