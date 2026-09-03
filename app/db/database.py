@@ -21,6 +21,7 @@ class WebUser:
 class WebSession:
     id: str
     user_id: str
+    name: str | None
     created_at: str
     last_active_at: str
 
@@ -60,6 +61,7 @@ class WebDatabase:
                 CREATE TABLE IF NOT EXISTS web_sessions (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
+                    name TEXT,
                     created_at TEXT NOT NULL,
                     last_active_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES web_users(id) ON DELETE CASCADE
@@ -79,6 +81,21 @@ class WebDatabase:
                     ON console_events(session_id, id DESC);
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(web_sessions)")
+            }
+            if "name" not in columns:
+                connection.execute("ALTER TABLE web_sessions ADD COLUMN name TEXT")
+
+    def get_user(self, user_id: str | None) -> WebUser | None:
+        if not user_id:
+            return None
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM web_users WHERE id = ?", (user_id,)
+            ).fetchone()
+        return None if row is None else _user_from_row(row)
 
     def get_or_create_user(self, candidate_id: str | None) -> tuple[WebUser, bool]:
         now = _utc_now()
@@ -106,10 +123,33 @@ class WebDatabase:
         with self._lock, self._connect() as connection:
             session_id = secrets.token_urlsafe(24)
             connection.execute(
-                "INSERT INTO web_sessions VALUES (?, ?, ?, ?)",
+                "INSERT INTO web_sessions "
+                "(id, user_id, name, created_at, last_active_at) "
+                "VALUES (?, ?, NULL, ?, ?)",
                 (session_id, user_id, now, now),
             )
-        return WebSession(session_id, user_id, now, now)
+        return WebSession(session_id, user_id, None, now, now)
+
+    def update_session_name(
+        self, session_id: str, user_id: str, name: str
+    ) -> WebSession:
+        normalized = name.strip()
+        if not normalized or len(normalized) > 80:
+            raise ValueError("name must contain 1 to 80 characters.")
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE web_sessions SET name = ?, last_active_at = ? "
+                "WHERE id = ? AND user_id = ?",
+                (normalized, now, session_id, user_id),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("Web session no longer exists.")
+            row = connection.execute(
+                "SELECT * FROM web_sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
+            ).fetchone()
+        return _session_from_row(row)
 
     def list_sessions(self, user_id: str) -> tuple[WebSession, ...]:
         with self._lock, self._connect() as connection:
@@ -195,10 +235,13 @@ class WebDatabase:
                 "ORDER BY id DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
+            previous_data = json.loads(row["data_json"]) if row is not None else {}
+            incoming_turn_id = (data or {}).get("turn_id")
             if (
                 coalesce
                 and row is not None
                 and row["kind"] == kind
+                and previous_data.get("turn_id") == incoming_turn_id
                 and len(row["content"]) + len(normalized) <= CONSOLE_EVENT_MAX_CHARS
             ):
                 content_value = row["content"] + "\n" + normalized
@@ -281,6 +324,7 @@ def _session_from_row(
     return WebSession(
         id=row["id"],
         user_id=row["user_id"],
+        name=row["name"] if "name" in row.keys() else None,
         created_at=row["created_at"],
         last_active_at=last_active_at or row["last_active_at"],
     )

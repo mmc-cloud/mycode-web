@@ -1,7 +1,21 @@
 from pathlib import Path
+import asyncio
+import secrets
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -15,6 +29,7 @@ from app.models.api import (
     PermissionDecisionRequest,
     ProfileUpdate,
     SessionListResponse,
+    SessionRename,
     SessionResponse,
     UserResponse,
 )
@@ -26,6 +41,7 @@ from app.services.runtime import (
     RuntimeUnavailableError,
 )
 from app.services.workspace import WorkspaceError, WorkspaceLimitError
+from app.services.terminal import TerminalUnavailableError
 
 
 router = APIRouter(prefix="/mycode/api")
@@ -40,9 +56,11 @@ def _session_response(request: Request, session: WebSession) -> SessionResponse:
     runtime = services(request).runtime
     return SessionResponse(
         id=session.id,
+        name=session.name,
         created_at=session.created_at,
         last_active_at=session.last_active_at,
         runtime_status=runtime.status(session.id),
+        active_turn_id=runtime.active_turn_id(session.id),
         pending_permission=runtime.pending_permission(session.id),
     )
 
@@ -96,6 +114,23 @@ async def delete_session(
         raise HTTPException(status_code=404, detail="Session not found.")
 
 
+@router.patch("/sessions/{session_id}", response_model=SessionResponse)
+def rename_session(
+    payload: SessionRename,
+    request: Request,
+    context: WebContext = Depends(current_context),
+) -> SessionResponse:
+    try:
+        session = services(request).database.update_session_name(
+            context.session.id, context.user.id, payload.name
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail="Session not found.") from error
+    return _session_response(request, session)
+
+
 @router.post("/sessions/{session_id}/activate", status_code=202)
 async def activate_session(
     request: Request,
@@ -129,9 +164,10 @@ async def send_message(
     request: Request,
     context: WebContext = Depends(current_context),
 ) -> dict[str, str]:
+    turn_id = secrets.token_urlsafe(16)
     try:
         admission = await services(request).runtime.send_message(
-            context.session.id, payload.content
+            context.session.id, payload.content, turn_id=turn_id
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -141,10 +177,63 @@ async def send_message(
         raise HTTPException(status_code=429, detail=str(error)) from error
     except RuntimeUnavailableError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    await services(request).events.publish(
-        context.session.id, "user_message", content=payload.content
-    )
-    return {"status": admission}
+    return {"status": admission, "turn_id": turn_id}
+
+
+@router.websocket("/sessions/{session_id}/terminal")
+async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
+    await websocket.accept()
+    app_services = services(websocket)  # type: ignore[arg-type]
+    user_id = websocket.cookies.get(app_services.settings.cookie_name)
+    user = app_services.database.get_user(user_id)
+    if user is None or app_services.database.get_session(session_id, user.id) is None:
+        await websocket.close(code=1008)
+        return
+
+    connection = None
+    sender: asyncio.Task[None] | None = None
+    try:
+        connection = await app_services.terminal.attach(session_id)
+        sender = asyncio.create_task(_send_terminal_messages(websocket, connection))
+        while True:
+            payload = await websocket.receive_json()
+            if not isinstance(payload, dict):
+                continue
+            message_type = payload.get("type")
+            if message_type == "input" and isinstance(payload.get("data"), str):
+                await app_services.terminal.input(connection, payload["data"])
+            elif message_type == "resize":
+                await app_services.terminal.resize(
+                    connection, payload.get("cols"), payload.get("rows")
+                )
+    except WebSocketDisconnect:
+        pass
+    except TerminalUnavailableError as error:
+        if not websocket.client_state.name == "DISCONNECTED":
+            await websocket.send_json(
+                {"type": "status", "status": "error", "message": str(error)}
+            )
+            await websocket.close(code=1011)
+    finally:
+        if sender is not None:
+            if not sender.done():
+                sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+        if connection is not None:
+            await app_services.terminal.detach(connection)
+
+
+async def _send_terminal_messages(websocket: WebSocket, connection) -> None:
+    while True:
+        message = await connection.messages.get()
+        await websocket.send_json(message)
+        if message.get("type") == "status" and message.get("status") in {
+            "closed", "error"
+        }:
+            await websocket.close(
+                code=1011 if message.get("status") == "error" else 1000
+            )
+            return
 
 
 @router.get("/sessions/{session_id}/events")

@@ -12,12 +12,14 @@ from typing import Coroutine, Protocol
 
 from app.config import ServerSettings
 from app.services.events import EventHub
+from app.services.relay import RuntimeTokenRegistry
 from app.services.terminal_adapter import TerminalOutputAdapter
 from app.services.workspace import WorkspaceService
 
 
 logger = logging.getLogger(__name__)
 MANAGED_SANDBOX_LABEL = "mycode-web.managed=true"
+AGENT_USER = "mycode-agent"
 
 
 class RuntimeConflictError(RuntimeError):
@@ -44,6 +46,10 @@ def _normalize_cli_message(content: str) -> str:
     return normalized
 
 
+def _turn_payload(turn_id: str | None) -> dict[str, str]:
+    return {} if turn_id is None else {"turn_id": turn_id}
+
+
 class ProcessStdin(Protocol):
     def write(self, data: bytes) -> None: ...
     async def drain(self) -> None: ...
@@ -68,15 +74,36 @@ class SandboxLauncher(Protocol):
         self, session_id: str, workspace: Path, mycode_state: Path
     ) -> SandboxProcess: ...
 
+    def container_ref(self, session_id: str) -> str: ...
+
+
+def _safe_container_session(session_id: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]", "-", session_id)[:48]
+
 
 class DockerSandboxLauncher:
     def __init__(self, settings: ServerSettings) -> None:
         self.settings = settings
+        self._runtime_tokens: dict[str, str] = {}
+
+    def container_ref(self, session_id: str) -> str:
+        return f"mycode-web-{_safe_container_session(session_id)}"
+
+    def set_runtime_token(self, session_id: str, token: str) -> None:
+        self._runtime_tokens[session_id] = token
+
+    def clear_runtime_token(self, session_id: str, token: str | None = None) -> None:
+        if token is None or self._runtime_tokens.get(session_id) == token:
+            self._runtime_tokens.pop(session_id, None)
 
     def command(
         self, session_id: str, workspace: Path, mycode_state: Path
     ) -> list[str]:
-        safe_session = re.sub(r"[^a-zA-Z0-9_.-]", "-", session_id)[:48]
+        runtime_token = self._runtime_tokens.get(session_id)
+        if runtime_token is None:
+            raise RuntimeUnavailableError(
+                "Runtime relay credential has not been issued."
+            )
         command = [
             self.settings.docker_command,
             "run",
@@ -87,11 +114,11 @@ class DockerSandboxLauncher:
             "--label",
             f"mycode-web.session={session_id}",
             "--name",
-            f"mycode-web-{safe_session}",
+            self.container_ref(session_id),
             "--workdir",
             "/workspace",
             "--user",
-            "mycode",
+            AGENT_USER,
             "--network",
             "bridge",
             "--cap-drop",
@@ -117,7 +144,7 @@ class DockerSandboxLauncher:
             "-e",
             "PYTHONUNBUFFERED=1",
             "-e",
-            f"MYCODE_API_KEY={self.settings.relay_token}",
+            f"MYCODE_API_KEY={runtime_token}",
             "-e",
             f"MYCODE_BASE_URL={self.settings.relay_base_url_for_sandbox}",
             "-e",
@@ -190,6 +217,7 @@ class _QueuedTurn:
     session_id: str
     original_content: str | None
     stdin_content: str | None
+    turn_id: str | None
     enqueued_at: str
 
 
@@ -208,6 +236,11 @@ class _RuntimeSession:
     stopping: bool = False
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     last_activity: float = 0.0
+    container_ref: str | None = None
+    active_turn_id: str | None = None
+    terminal_clients: int = 0
+    runtime_generation: int = 0
+    relay_token: str | None = None
 
 
 class RuntimeManager:
@@ -222,6 +255,7 @@ class RuntimeManager:
         activity_hook: Callable[[str], None] | None = None,
         runtime_start_hook: Callable[[str], Awaitable[None]] | None = None,
         runtime_stop_hook: Callable[[str], Awaitable[None]] | None = None,
+        relay_tokens: RuntimeTokenRegistry | None = None,
     ) -> None:
         self.settings = settings
         self.workspace_service = workspace_service
@@ -231,6 +265,7 @@ class RuntimeManager:
         self._activity_hook = activity_hook
         self._runtime_start_hook = runtime_start_hook
         self._runtime_stop_hook = runtime_stop_hook
+        self.relay_tokens = relay_tokens or RuntimeTokenRegistry()
         self._sessions: dict[str, _RuntimeSession] = {}
         self._queue: deque[_QueuedTurn] = deque()
         self._lock = asyncio.Lock()
@@ -244,6 +279,82 @@ class RuntimeManager:
     def pending_permission(self, session_id: str) -> dict[str, object] | None:
         state = self._sessions.get(session_id)
         return None if state is None else state.adapter.pending_permission
+
+    def active_turn_id(self, session_id: str) -> str | None:
+        state = self._sessions.get(session_id)
+        return None if state is None else state.active_turn_id
+
+    def container_ref(self, session_id: str) -> str | None:
+        state = self._sessions.get(session_id)
+        return None if state is None else state.container_ref
+
+    def runtime_token(self, session_id: str) -> str | None:
+        state = self._sessions.get(session_id)
+        return None if state is None else state.relay_token
+
+    def runtime_generation(self, session_id: str) -> int:
+        state = self._sessions.get(session_id)
+        return 0 if state is None else state.runtime_generation
+
+    async def wait_until_ready(
+        self, session_id: str, *, timeout: float = 30
+    ) -> str:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            async with self._lock:
+                state = self._sessions.get(session_id)
+                if state is None:
+                    raise RuntimeUnavailableError("Runtime is not active.")
+                status = state.status
+                if status in {"idle", "running", "waiting_permission"} and self._is_live(state):
+                    return status
+                if status in {"error", "stopped", "stopping"}:
+                    raise RuntimeUnavailableError(
+                        f"Runtime is {status} and cannot host a terminal."
+                    )
+                ready = state.ready
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RuntimeUnavailableError("Runtime did not become ready.")
+            if status == "starting":
+                try:
+                    await asyncio.wait_for(ready.wait(), timeout=remaining)
+                except TimeoutError as error:
+                    raise RuntimeUnavailableError(
+                        "Runtime did not become ready."
+                    ) from error
+            else:
+                await asyncio.sleep(min(0.05, remaining))
+
+    async def acquire_terminal_lease(self, session_id: str) -> None:
+        async with self._lock:
+            if self._closed:
+                raise RuntimeUnavailableError("Runtime manager is shutting down.")
+            state = self._sessions.setdefault(session_id, _RuntimeSession())
+            if state.status == "stopping":
+                raise RuntimeUnavailableError("Runtime is not active.")
+            state.terminal_clients += 1
+            self._touch(session_id, state)
+
+    async def release_terminal_lease(self, session_id: str) -> None:
+        schedule_dispatch = False
+        async with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None or state.terminal_clients == 0:
+                return
+            state.terminal_clients -= 1
+            self._touch(session_id, state)
+            schedule_dispatch = (
+                state.terminal_clients == 0
+                and state.status == "idle"
+                and bool(self._queue)
+            )
+        if schedule_dispatch:
+            self._spawn(self._dispatch_from_idle(session_id, state))
+
+    def terminal_clients(self, session_id: str) -> int:
+        state = self._sessions.get(session_id)
+        return 0 if state is None else state.terminal_clients
 
     @property
     def active_count(self) -> int:
@@ -285,12 +396,14 @@ class RuntimeManager:
                         raise RuntimeCapacityError("The Sandbox queue is full.")
                     state.status = "queued"
                     state.busy = False
+                    state.active_turn_id = None
                     self._touch(session_id, state)
                     self._queue.append(
                         _QueuedTurn(
                             session_id=session_id,
                             original_content=None,
                             stdin_content=None,
+                            turn_id=None,
                             enqueued_at=datetime.now(timezone.utc).isoformat(),
                         )
                     )
@@ -311,7 +424,9 @@ class RuntimeManager:
             )
         return "starting"
 
-    async def send_message(self, session_id: str, content: str) -> str:
+    async def send_message(
+        self, session_id: str, content: str, *, turn_id: str | None = None
+    ) -> str:
         stdin_content = _normalize_cli_message(content)
         victim: tuple[str, _RuntimeSession] | None = None
         start_state: _RuntimeSession | None = None
@@ -324,6 +439,7 @@ class RuntimeManager:
                 raise RuntimeUnavailableError("Runtime manager is shutting down.")
             state = self._sessions.setdefault(session_id, _RuntimeSession())
             if state.status == "starting" and not state.busy:
+                state.active_turn_id = turn_id
                 waiting_start_state = state
             elif state.status in {
                 "queued", "running", "waiting_permission", "stopping"
@@ -335,10 +451,12 @@ class RuntimeManager:
                 state.status = "running"
                 state.busy = True
                 state.ready.clear()
+                state.active_turn_id = turn_id
                 self._touch(session_id, state)
                 reuse_state = state
             elif waiting_start_state is None and self._occupied_slots_locked() < self.settings.sandbox_max_active:
                 self._prepare_start_locked(session_id, state)
+                state.active_turn_id = turn_id
                 start_state = state
             elif waiting_start_state is None:
                 idle = self._oldest_idle_locked()
@@ -347,6 +465,7 @@ class RuntimeManager:
                     victim_state.status = "stopping"
                     victim_state.stopping = True
                     self._prepare_start_locked(session_id, state)
+                    state.active_turn_id = turn_id
                     victim = (victim_id, victim_state)
                     start_state = state
                 else:
@@ -354,28 +473,46 @@ class RuntimeManager:
                         raise RuntimeCapacityError("The Sandbox queue is full.")
                     state.status = "queued"
                     state.busy = False
+                    state.active_turn_id = turn_id
                     self._touch(session_id, state)
                     self._queue.append(
                         _QueuedTurn(
-                            session_id=session_id,
-                            original_content=content,
-                            stdin_content=stdin_content,
-                            enqueued_at=datetime.now(timezone.utc).isoformat(),
+                        session_id=session_id,
+                        original_content=content,
+                        stdin_content=stdin_content,
+                        turn_id=turn_id,
+                        enqueued_at=datetime.now(timezone.utc).isoformat(),
                         )
                     )
                     queue_position = len(self._queue)
 
         if queue_position:
+            message_data = {"content": content}
+            if turn_id is not None:
+                message_data["turn_id"] = turn_id
+            await self.events.publish(session_id, "user_message", **message_data)
             await self.events.publish(
                 session_id, "runtime_status", status="queued",
                 queue_position=queue_position,
+                **_turn_payload(turn_id),
             )
             return "queued"
         if waiting_start_state is not None:
+            message_data = {"content": content}
+            if turn_id is not None:
+                message_data["turn_id"] = turn_id
+            await self.events.publish(session_id, "user_message", **message_data)
             await self._send_when_ready(session_id, waiting_start_state, stdin_content)
             return "running"
         if reuse_state is not None:
-            await self.events.publish(session_id, "runtime_status", status="running")
+            message_data = {"content": content}
+            if turn_id is not None:
+                message_data["turn_id"] = turn_id
+            await self.events.publish(session_id, "user_message", **message_data)
+            await self.events.publish(
+                session_id, "runtime_status", status="running",
+                **_turn_payload(turn_id),
+            )
             try:
                 await self._write(reuse_state, stdin_content + "\n")
             except Exception:
@@ -386,6 +523,10 @@ class RuntimeManager:
             await self._terminate_state(*victim, reason="capacity_eviction")
         if start_state is None:
             raise RuntimeUnavailableError("Sandbox admission failed.")
+        message_data = {"content": content}
+        if turn_id is not None:
+            message_data["turn_id"] = turn_id
+        await self.events.publish(session_id, "user_message", **message_data)
         await self._start_runtime(session_id, start_state, stdin_content)
         return "running"
 
@@ -394,12 +535,21 @@ class RuntimeManager:
             state = self._sessions.get(session_id)
             if state is None or not state.adapter.awaiting_permission:
                 raise RuntimeConflictError("There is no pending permission request.")
+            permission_data = dict(state.adapter.pending_permission or {})
+            turn_id = state.active_turn_id
             state.status = "running"
             self._touch(session_id, state)
         await self._write(state, "y\n" if allow else "n\n")
         state.adapter.resolve_permission()
-        await self.events.publish(session_id, "permission_resolved", allowed=allow)
-        await self.events.publish(session_id, "runtime_status", status="running")
+        await self.events.publish(
+            session_id, "permission_resolved", allowed=allow,
+            **permission_data,
+            **_turn_payload(turn_id),
+        )
+        await self.events.publish(
+            session_id, "runtime_status", status="running",
+            **_turn_payload(turn_id),
+        )
 
     async def sweep_expired(self) -> tuple[str, ...]:
         now = self._clock()
@@ -409,6 +559,7 @@ class RuntimeManager:
                 if (
                     state.status in {"idle", "waiting_permission"}
                     and self._is_live(state)
+                    and state.terminal_clients == 0
                     and now - state.last_activity
                     >= self.settings.sandbox_idle_ttl_seconds
                 ):
@@ -418,9 +569,12 @@ class RuntimeManager:
                     expired.append((session_id, state, previous))
         for session_id, state, previous in expired:
             if previous == "waiting_permission":
+                permission_data = dict(state.adapter.pending_permission or {})
                 state.adapter.resolve_permission()
                 await self.events.publish(
-                    session_id, "permission_resolved", allowed=False, expired=True
+                    session_id, "permission_resolved", allowed=False, expired=True,
+                    **permission_data,
+                    **_turn_payload(state.active_turn_id),
                 )
             await self._terminate_state(session_id, state, reason="inactivity_ttl")
             await self.events.publish(
@@ -446,6 +600,8 @@ class RuntimeManager:
                 self._queue = deque(
                     item for item in self._queue if item.session_id != session_id
                 )
+                completed_turn_id = state.active_turn_id
+                state.active_turn_id = None
                 state.status = "stopped"
                 queued = True
             elif self._is_live(state) or state.status == "starting":
@@ -454,7 +610,10 @@ class RuntimeManager:
             else:
                 state.status = "stopped"
         if queued:
-            await self.events.publish(session_id, "runtime_status", status="stopped")
+            await self.events.publish(
+                session_id, "runtime_status", status="stopped",
+                **_turn_payload(completed_turn_id),
+            )
             return
         await self._terminate_state(session_id, state, reason="session_stop")
         await self._schedule_waiting()
@@ -480,29 +639,47 @@ class RuntimeManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self.relay_tokens.clear()
 
     async def _start_runtime(
         self, session_id: str, state: _RuntimeSession, stdin_content: str | None
     ) -> None:
-        workspace, mycode_state = self.workspace_service.ensure_session_directories(
-            session_id
-        )
-        await self.events.publish(session_id, "runtime_status", status="starting")
         try:
+            workspace, mycode_state = self.workspace_service.ensure_session_directories(
+                session_id
+            )
+            await self.events.publish(
+                session_id, "runtime_status", status="starting",
+                **_turn_payload(state.active_turn_id),
+            )
             if self._runtime_start_hook is not None:
                 await self._runtime_start_hook(session_id)
+            set_token = getattr(self.launcher, "set_runtime_token", None)
+            if set_token is not None:
+                if state.relay_token is None:
+                    raise RuntimeUnavailableError(
+                        "Runtime relay credential was not issued."
+                    )
+                set_token(session_id, state.relay_token)
             process = await self.launcher.launch(session_id, workspace, mycode_state)
+            ref_factory = getattr(self.launcher, "container_ref", None)
+            container_ref = ref_factory(session_id) if ref_factory else None
         except Exception as error:
             async with self._lock:
                 state.status = "error"
                 state.busy = False
                 state.ready.set()
+                self._revoke_runtime_token_locked(session_id, state)
             await self.events.publish(
                 session_id,
                 "error",
                 message=f"Sandbox failed to start: {type(error).__name__}: {error}",
+                **_turn_payload(state.active_turn_id),
             )
-            await self.events.publish(session_id, "runtime_status", status="error")
+            await self.events.publish(
+                session_id, "runtime_status", status="error",
+                **_turn_payload(state.active_turn_id),
+            )
             if self._runtime_stop_hook is not None:
                 await self._runtime_stop_hook(session_id)
             await self._schedule_waiting()
@@ -513,6 +690,7 @@ class RuntimeManager:
             else:
                 should_stop = False
                 state.process = process
+                state.container_ref = container_ref
                 state.reader_task = asyncio.create_task(
                     self._read_output(session_id, state, process)
                 )
@@ -520,6 +698,8 @@ class RuntimeManager:
         if should_stop:
             process.terminate()
             await process.wait()
+            async with self._lock:
+                self._revoke_runtime_token_locked(session_id, state)
             raise RuntimeUnavailableError("Runtime manager is shutting down.")
         try:
             await asyncio.wait_for(state.ready.wait(), timeout=30)
@@ -528,6 +708,7 @@ class RuntimeManager:
                 session_id,
                 "error",
                 message="Sandbox started but the MyCode prompt did not become ready.",
+                **_turn_payload(state.active_turn_id),
             )
             await self.stop_session(session_id)
             raise RuntimeUnavailableError("MyCode prompt did not become ready.") from error
@@ -539,7 +720,10 @@ class RuntimeManager:
             if stdin_content is not None:
                 state.ready.clear()
             self._touch(session_id, state)
-        await self.events.publish(session_id, "runtime_status", status=state.status)
+        await self.events.publish(
+            session_id, "runtime_status", status=state.status,
+            **_turn_payload(state.active_turn_id),
+        )
         if stdin_content is None:
             self._spawn(self._dispatch_from_idle(session_id, state))
             return
@@ -563,7 +747,10 @@ class RuntimeManager:
                 if not text:
                     continue
                 self._touch(session_id, state)
-                await self.events.publish(session_id, "agent_output", content=text)
+                await self.events.publish(
+                    session_id, "agent_output", content=text,
+                    **_turn_payload(state.active_turn_id),
+                )
                 for signal in state.adapter.feed(text):
                     await self._handle_signal(
                         session_id, state, signal.type, signal.data
@@ -572,16 +759,21 @@ class RuntimeManager:
             if final_text:
                 self._touch(session_id, state)
                 await self.events.publish(
-                    session_id, "agent_output", content=final_text
+                    session_id, "agent_output", content=final_text,
+                    **_turn_payload(state.active_turn_id),
                 )
             return_code = await process.wait()
             async with self._lock:
                 if state.process is not process:
                     return
+                completed_turn_id = state.active_turn_id
                 state.process = None
                 state.reader_task = None
                 state.busy = False
                 state.ready.clear()
+                self._revoke_runtime_token_locked(session_id, state)
+                state.active_turn_id = None
+                state.container_ref = None
                 stopped_intentionally = state.stopping
                 clean_exit = return_code == 0
                 state.status = "stopped" if stopped_intentionally or clean_exit else "error"
@@ -590,9 +782,11 @@ class RuntimeManager:
                     session_id,
                     "error",
                     message=f"MyCode process exited with code {return_code}.",
+                    **_turn_payload(completed_turn_id),
                 )
             await self.events.publish(
-                session_id, "runtime_status", status=state.status
+                session_id, "runtime_status", status=state.status,
+                **_turn_payload(completed_turn_id),
             )
             if self._runtime_stop_hook is not None:
                 await self._runtime_stop_hook(session_id)
@@ -609,6 +803,7 @@ class RuntimeManager:
                 session_id,
                 "error",
                 message=f"Runtime output reader failed: {type(error).__name__}: {error}",
+                **_turn_payload(state.active_turn_id),
             )
             await self._terminate_state(
                 session_id, state, reason="reader_failure"
@@ -625,9 +820,13 @@ class RuntimeManager:
                     return
                 state.status = "waiting_permission"
                 self._touch(session_id, state)
-            await self.events.publish(session_id, "permission_request", **data)
             await self.events.publish(
-                session_id, "runtime_status", status="waiting_permission"
+                session_id, "permission_request", **data,
+                **_turn_payload(state.active_turn_id),
+            )
+            await self.events.publish(
+                session_id, "runtime_status", status="waiting_permission",
+                **_turn_payload(state.active_turn_id),
             )
             return
         if signal_type != "ready":
@@ -642,20 +841,31 @@ class RuntimeManager:
             state.busy = False
             state.status = "idle"
             state.ready.set()
-        await self.events.publish(session_id, "runtime_status", status="idle")
+            completed_turn_id = state.active_turn_id
+            state.active_turn_id = None
+        await self.events.publish(
+            session_id, "runtime_status", status="idle",
+            **_turn_payload(completed_turn_id),
+        )
         self._spawn(self._dispatch_from_idle(session_id, state))
 
     async def _dispatch_from_idle(
         self, session_id: str, state: _RuntimeSession
     ) -> None:
         async with self._lock:
-            if self._closed or state.status != "idle" or not self._queue:
+            if (
+                self._closed
+                or state.status != "idle"
+                or state.terminal_clients > 0
+                or not self._queue
+            ):
                 return
             item = self._queue.popleft()
             target = self._sessions[item.session_id]
             state.status = "stopping"
             state.stopping = True
             self._prepare_start_locked(item.session_id, target)
+            target.active_turn_id = item.turn_id
         await self._terminate_state(session_id, state, reason="queue_handoff")
         try:
             await self._start_runtime(item.session_id, target, item.stdin_content)
@@ -674,6 +884,7 @@ class RuntimeManager:
                 item = self._queue.popleft()
                 state = self._sessions[item.session_id]
                 self._prepare_start_locked(item.session_id, state)
+                state.active_turn_id = item.turn_id
                 starts.append((item, state))
         for item, state in starts:
             self._spawn(self._start_queued_turn(item, state))
@@ -727,7 +938,10 @@ class RuntimeManager:
                         "MyCode process stopped during startup."
                     )
             await asyncio.sleep(0)
-        await self.events.publish(session_id, "runtime_status", status="running")
+        await self.events.publish(
+            session_id, "runtime_status", status="running",
+            **_turn_payload(state.active_turn_id),
+        )
         try:
             await self._write(state, stdin_content + "\n")
         except Exception:
@@ -767,9 +981,15 @@ class RuntimeManager:
             state.busy = False
             state.ready.clear()
             state.stopping = False
+            state.terminal_clients = 0
+            completed_turn_id = state.active_turn_id
+            self._revoke_runtime_token_locked(session_id, state)
+            state.active_turn_id = None
+            state.container_ref = None
             state.status = "stopped"
         await self.events.publish(
-            session_id, "runtime_status", status="stopped", reason=reason
+            session_id, "runtime_status", status="stopped", reason=reason,
+            **_turn_payload(completed_turn_id),
         )
         if self._runtime_stop_hook is not None:
             await self._runtime_stop_hook(session_id)
@@ -777,13 +997,32 @@ class RuntimeManager:
     def _prepare_start_locked(
         self, session_id: str, state: _RuntimeSession
     ) -> None:
+        self._revoke_runtime_token_locked(session_id, state)
         state.adapter = TerminalOutputAdapter()
         state.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         state.ready.clear()
         state.stopping = False
         state.status = "starting"
         state.busy = False
+        state.container_ref = None
+        state.active_turn_id = None
+        state.runtime_generation += 1
+        state.relay_token = self.relay_tokens.issue(
+            session_id, state.runtime_generation
+        )
         self._touch(session_id, state)
+
+    def _revoke_runtime_token_locked(
+        self, session_id: str, state: _RuntimeSession
+    ) -> None:
+        token = state.relay_token
+        state.relay_token = None
+        if token is None:
+            return
+        self.relay_tokens.revoke(token)
+        clear_token = getattr(self.launcher, "clear_runtime_token", None)
+        if clear_token is not None:
+            clear_token(session_id, token)
 
     def _occupied_slots_locked(self) -> int:
         return sum(
@@ -796,7 +1035,11 @@ class RuntimeManager:
         candidates = [
             (session_id, state)
             for session_id, state in self._sessions.items()
-            if state.status == "idle" and self._is_live(state)
+            if (
+                state.status == "idle"
+                and self._is_live(state)
+                and state.terminal_clients == 0
+            )
         ]
         return min(candidates, key=lambda item: item[1].last_activity, default=None)
 

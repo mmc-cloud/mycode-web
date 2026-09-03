@@ -5,6 +5,10 @@ class ProfileUpdate(BaseModel):
     display_name: str = Field(min_length=1, max_length=80)
 
 
+class SessionRename(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
 class MessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=100_000)
 
@@ -19,9 +23,11 @@ class UserResponse(BaseModel):
 
 class SessionResponse(BaseModel):
     id: str
+    name: str | None = None
     created_at: str
     last_active_at: str
     runtime_status: str
+    active_turn_id: str | None = None
     pending_permission: dict[str, object] | None = None
 
 

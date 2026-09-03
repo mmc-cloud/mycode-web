@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, call
 
@@ -7,11 +8,13 @@ import pytest
 from app.config import ServerSettings
 from app.services.events import EventHub
 from app.services.runtime import (
+    AGENT_USER,
     DockerSandboxLauncher,
     MANAGED_SANDBOX_LABEL,
     RuntimeCapacityError,
     RuntimeConflictError,
     RuntimeManager,
+    RuntimeUnavailableError,
     _normalize_cli_message,
 )
 from app.services.workspace import WorkspaceService
@@ -332,16 +335,19 @@ def test_permission_is_strictly_bound_to_its_session(tmp_path: Path) -> None:
 
 def test_docker_command_mounts_only_session_and_hides_provider_key(tmp_path: Path) -> None:
     config = settings(tmp_path)
-    command = DockerSandboxLauncher(config).command(
+    launcher = DockerSandboxLauncher(config)
+    launcher.set_runtime_token("session", "runtime-token")
+    command = launcher.command(
         "session", tmp_path / "workspace", tmp_path / "mycode_state"
     )
     rendered = " ".join(str(part) for part in command)
     assert "target=/workspace" in rendered
     assert "target=/home/mycode/.mycode" in rendered
-    assert "MYCODE_API_KEY=relay-token" in rendered
+    assert "MYCODE_API_KEY=runtime-token" in rendered
+    assert "MYCODE_API_KEY=relay-token" not in rendered
     assert "MYCODE_BASE_URL=" in rendered
     assert "real-provider-secret" not in rendered
-    assert "--user mycode" in rendered
+    assert f"--user {AGENT_USER}" in rendered
     assert "--cap-drop ALL" in rendered
     assert f"--label {MANAGED_SANDBOX_LABEL}" in rendered
     assert "--label mycode-web.session=session" in rendered
@@ -405,10 +411,10 @@ def test_docker_command_passes_only_configured_optional_mycode_env(
             ("LLM_MAX_OUTPUT_TOKENS", "4096"),
         ),
     )
+    launcher = DockerSandboxLauncher(config)
+    launcher.set_runtime_token("session", "runtime-token")
     rendered = " ".join(
-        DockerSandboxLauncher(config).command(
-            "session", tmp_path / "workspace", tmp_path / "mycode_state"
-        )
+        launcher.command("session", tmp_path / "workspace", tmp_path / "mycode_state")
     )
     assert "MYCODE_COMPACT_MODEL=compact-model" in rendered
     assert "LLM_CONTEXT_WINDOW_TOKENS=64000" in rendered
@@ -430,7 +436,9 @@ def test_docker_command_includes_configured_resource_limits(tmp_path: Path) -> N
         sandbox_cpus=1.5,
         sandbox_pids_limit=300,
     )
-    command = DockerSandboxLauncher(config).command(
+    launcher = DockerSandboxLauncher(config)
+    launcher.set_runtime_token("session", "runtime-token")
+    command = launcher.command(
         "session", tmp_path / "workspace", tmp_path / "state"
     )
 
@@ -586,6 +594,268 @@ def test_idle_ttl_only_reclaims_expired_runtime_and_preserves_data(
         assert await manager.activate("session") == "starting"
         await wait_for_status(manager, "session", "idle")
         assert start_watcher.await_count == 2
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_connected_terminal_lease_protects_idle_runtime_from_ttl(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = ServerSettings(
+            data_dir=tmp_path / "data",
+            relay_token="token",
+            sandbox_idle_ttl_seconds=10,
+        )
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            clock=clock,
+        )
+        await manager.send_message("session", "task")
+        await launcher.process.stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "session", "idle")
+
+        await manager.acquire_terminal_lease("session")
+        clock.advance(10)
+        assert await manager.sweep_expired() == ()
+        assert manager.status("session") == "idle"
+        assert manager.terminal_clients("session") == 1
+
+        await manager.release_terminal_lease("session")
+        clock.advance(10)
+        assert await manager.sweep_expired() == ("session",)
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_connected_terminal_runtime_is_not_an_idle_eviction_victim(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = ServerSettings(
+            data_dir=tmp_path / "data",
+            relay_token="token",
+            sandbox_max_active=2,
+        )
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.send_message("protected", "one")
+        await manager.send_message("other", "two")
+        await launcher.by_session["protected"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["other"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "protected", "idle")
+        await wait_for_status(manager, "other", "idle")
+        await manager.acquire_terminal_lease("protected")
+
+        assert await manager.send_message("new", "three") == "running"
+        assert manager.status("protected") == "idle"
+        assert manager.status("other") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_lease_blocks_queue_handoff_until_disconnect(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), sandbox_max_active=1)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.send_message("a", "first")
+        await launcher.by_session["a"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "a", "idle")
+        await manager.acquire_terminal_lease("a")
+
+        assert await manager.send_message("b", "second") == "queued"
+        await asyncio.sleep(0)
+        assert manager.status("a") == "idle"
+        assert manager.status("b") == "queued"
+        assert manager.queued_count == 1
+
+        await manager.release_terminal_lease("a")
+        await wait_for_status(manager, "b", "running")
+        assert manager.status("a") == "stopped"
+        assert manager.queued_count == 0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_last_terminal_disconnect_releases_multi_client_protection(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), sandbox_max_active=1)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.send_message("a", "first")
+        await launcher.by_session["a"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "a", "idle")
+        await manager.acquire_terminal_lease("a")
+        await manager.acquire_terminal_lease("a")
+        assert manager.terminal_clients("a") == 2
+
+        assert await manager.send_message("b", "second") == "queued"
+        await manager.release_terminal_lease("a")
+        await asyncio.sleep(0)
+        assert manager.terminal_clients("a") == 1
+        assert manager.status("a") == "idle"
+        assert manager.status("b") == "queued"
+
+        await manager.release_terminal_lease("a")
+        await wait_for_status(manager, "b", "running")
+        assert manager.terminal_clients("a") == 0
+        assert manager.status("a") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_events_carry_web_turn_id_to_completion(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        events = EventHub()
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher
+        )
+        await manager.send_message("session", "task", turn_id="turn-1")
+        await launcher.process.stdout.feed(b"assistant> answer\nyou> ")
+        await wait_for_status(manager, "session", "idle")
+
+        relevant = [
+            event for event in events.history("session")
+            if event.type in {"user_message", "agent_output", "runtime_status"}
+        ]
+        assert relevant[0].type == "user_message"
+        assert relevant[0].data["turn_id"] == "turn-1"
+        assert any(event.data.get("turn_id") == "turn-1" for event in relevant)
+        assert any(
+            event.type == "runtime_status"
+            and event.data.get("status") == "idle"
+            and event.data.get("turn_id") == "turn-1"
+            for event in relevant
+        )
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_reservation_protects_starting_runtime_before_ready(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), sandbox_max_active=1)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+
+        await manager.acquire_terminal_lease("a")
+        assert manager.terminal_clients("a") == 1
+        assert await manager.activate("a") == "starting"
+        assert await manager.send_message("b", "second") == "queued"
+
+        await wait_for_status(manager, "a", "idle")
+        assert manager.status("a") == "idle"
+        assert manager.status("b") == "queued"
+        assert manager.queued_count == 1
+
+        await manager.release_terminal_lease("a")
+        await wait_for_status(manager, "b", "running")
+        assert manager.status("a") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_tokens_rotate_per_session_runtime_and_revoke_on_stop(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.send_message("a", "first")
+        await manager.send_message("b", "second")
+        token_a = manager.runtime_token("a")
+        token_b = manager.runtime_token("b")
+        assert token_a is not None and token_b is not None
+        assert token_a != token_b
+        assert manager.relay_tokens.lookup(token_a) is not None
+        assert manager.relay_tokens.lookup(token_b) is not None
+
+        await manager.stop_session("a")
+        assert manager.runtime_token("a") is None
+        assert manager.relay_tokens.lookup(token_a) is None
+        assert manager.relay_tokens.lookup(token_b) is not None
+
+        await manager.send_message("a", "restart")
+        token_a_restart = manager.runtime_token("a")
+        assert token_a_restart is not None
+        assert token_a_restart != token_a
+        assert manager.relay_tokens.lookup(token_a) is None
+        assert manager.relay_tokens.lookup(token_a_restart) is not None
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_start_failure_revokes_issued_token(tmp_path: Path) -> None:
+    class FailingLauncher:
+        async def launch(self, session_id: str, workspace: Path, mycode_state: Path):
+            raise RuntimeError("launcher failed")
+
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=FailingLauncher(),
+        )
+        with pytest.raises(RuntimeUnavailableError):
+            await manager.send_message("session", "task")
+        assert manager.runtime_token("session") is None
+        assert manager.relay_tokens.active_count == 0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_workspace_start_failure_revokes_issued_token(tmp_path: Path) -> None:
+    class FailingWorkspace:
+        def ensure_session_directories(self, session_id: str):
+            raise OSError("workspace setup failed")
+
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        manager = RuntimeManager(
+            config,
+            FailingWorkspace(),
+            EventHub(),
+            launcher=FakeLauncher(),
+        )
+        with pytest.raises(RuntimeUnavailableError):
+            await manager.send_message("session", "task")
+        assert manager.runtime_token("session") is None
+        assert manager.relay_tokens.active_count == 0
         await manager.shutdown()
 
     asyncio.run(scenario())

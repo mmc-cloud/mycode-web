@@ -1,6 +1,7 @@
 from io import BytesIO
 from pathlib import Path
 import stat
+from unittest.mock import call, patch
 import zipfile
 
 import pytest
@@ -26,6 +27,20 @@ def test_default_workspace_limits_match_web_demo_contract(tmp_path: Path) -> Non
     assert settings.upload_zip_limit_bytes == 150 * 1024 * 1024
     assert settings.workspace_limit_bytes == 2 * 1024 * 1024 * 1024
     assert settings.workspace_file_limit == 20_000
+
+
+def test_session_directories_prepare_shared_workspace_and_private_state(
+    tmp_path: Path,
+) -> None:
+    workspace_service = service(tmp_path)
+
+    with patch("app.services.workspace.os.chmod") as chmod:
+        workspace, mycode_state = workspace_service.ensure_session_directories(
+            "session"
+        )
+
+    assert call(workspace, 0o2775) in chmod.call_args_list
+    assert call(mycode_state, 0o700) in chmod.call_args_list
 
 
 def zip_bytes(entries: list[tuple[zipfile.ZipInfo | str, bytes]]) -> BytesIO:

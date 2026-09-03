@@ -68,6 +68,15 @@ def test_sandbox_keeps_mycode_venv_private_from_user_projects() -> None:
     for extra_package in ("pytest", "requests", "ruff"):
         assert extra_package not in dockerfile
     assert "ln -s /opt/mycode-venv/bin/mycode /usr/local/bin/mycode" in dockerfile
+    assert "groupadd --gid 10001 workspace" in dockerfile
+    assert "--uid 10001 --gid workspace" in dockerfile
+    assert "--uid 10002 --gid workspace" in dockerfile
+    assert "USER mycode-agent" in dockerfile
+    assert "chmod 2775 /workspace" in dockerfile
+    assert "chmod 0700 /home/mycode /home/workspace-user /opt/mycode-venv" in dockerfile
+    assert "chown -R mycode-agent:workspace /workspace /home/mycode" in dockerfile
+    assert "chown -R workspace-user:workspace /home/workspace-user" in dockerfile
+    assert "COPY docker/entrypoint-sandbox.sh /usr/local/bin/sandbox-entrypoint" in dockerfile
     assert 'CMD ["mycode", "agent", "--continue"]' in dockerfile
 
 

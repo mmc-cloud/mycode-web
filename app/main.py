@@ -11,8 +11,9 @@ from app.services.container import AppServices
 from app.services.events import EventHub
 from app.services.console import ConsoleRecorder
 from app.services.lifecycle import SessionLifecycleService
-from app.services.relay import LLMRelay
+from app.services.relay import LLMRelay, RuntimeTokenRegistry
 from app.services.runtime import RuntimeManager, SandboxLauncher
+from app.services.terminal import TerminalManager
 from app.services.workspace import WorkspaceService
 from app.services.watcher import WorkspaceWatchManager
 
@@ -43,6 +44,15 @@ def create_app(
     console = ConsoleRecorder(database)
     events = EventHub(console=console)
     watcher = WorkspaceWatchManager(workspace, events)
+    relay_tokens = RuntimeTokenRegistry()
+
+    terminal_holder: list[TerminalManager] = []
+
+    async def runtime_stop_hook(session_id: str) -> None:
+        await watcher.stop(session_id)
+        if terminal_holder:
+            await terminal_holder[0].stop_session(session_id)
+
     runtime = RuntimeManager(
         effective_settings,
         workspace,
@@ -50,18 +60,22 @@ def create_app(
         launcher=launcher,
         activity_hook=database.touch_session,
         runtime_start_hook=watcher.ensure,
-        runtime_stop_hook=watcher.stop,
+        runtime_stop_hook=runtime_stop_hook,
+        relay_tokens=relay_tokens,
     )
+    terminal = TerminalManager(runtime, effective_settings)
+    terminal_holder.append(terminal)
     lifecycle = SessionLifecycleService(
         effective_settings, database, workspace, runtime, watcher, events
     )
-    relay = LLMRelay(effective_settings)
+    relay = LLMRelay(effective_settings, token_registry=relay_tokens)
     app_services = AppServices(
         settings=effective_settings,
         database=database,
         workspace=workspace,
         events=events,
         runtime=runtime,
+        terminal=terminal,
         watcher=watcher,
         lifecycle=lifecycle,
         relay=relay,
@@ -83,6 +97,7 @@ def create_app(
                 task.cancel()
             await asyncio.gather(*background_tasks, return_exceptions=True)
             await runtime.shutdown()
+            await terminal.shutdown()
             await watcher.shutdown()
             await relay.aclose()
 

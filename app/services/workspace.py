@@ -28,6 +28,9 @@ GENERATED_DIRECTORY_NAMES = frozenset(
         ".ruff_cache",
     }
 )
+WORKSPACE_DIRECTORY_MODE = 0o2775
+WORKSPACE_FILE_MODE = 0o0664
+MYCODE_STATE_DIRECTORY_MODE = 0o700
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,8 @@ class WorkspaceService:
         mycode_state = session_dir / "mycode_state"
         workspace.mkdir(parents=True, exist_ok=True)
         mycode_state.mkdir(parents=True, exist_ok=True)
+        _set_directory_mode(workspace, WORKSPACE_DIRECTORY_MODE)
+        _set_directory_mode(mycode_state, MYCODE_STATE_DIRECTORY_MODE)
         return workspace, mycode_state
 
     def delete_session_data(self, session_id: str) -> None:
@@ -126,7 +131,9 @@ class WorkspaceService:
                     stats.total_bytes - old_size + new_size,
                 )
                 target.parent.mkdir(parents=True, exist_ok=True)
+                _set_workspace_directory_modes(target.parent, workspace)
                 os.replace(temporary, target)
+                _set_file_mode(target, WORKSPACE_FILE_MODE)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -271,7 +278,9 @@ class WorkspaceService:
                 target = workspace.joinpath(*relative.parts)
                 _reject_symlink_chain(target, workspace)
                 target.parent.mkdir(parents=True, exist_ok=True)
+                _set_workspace_directory_modes(target.parent, workspace)
                 os.replace(source, target)
+                _set_file_mode(target, WORKSPACE_FILE_MODE)
         except (zipfile.BadZipFile, RuntimeError) as error:
             raise WorkspaceError("Invalid or unsupported ZIP archive.") from error
         finally:
@@ -295,6 +304,32 @@ def _copy_limited(source: BinaryIO, destination: Path, limit: int) -> None:
             if total > limit:
                 raise WorkspaceLimitError("Upload size limit exceeded.")
             sink.write(chunk)
+
+
+def _set_directory_mode(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError as error:
+        raise WorkspaceError(
+            f"Could not establish workspace permissions for {path.name}."
+        ) from error
+
+
+def _set_file_mode(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError as error:
+        raise WorkspaceError(
+            f"Could not establish workspace file permissions for {path.name}."
+        ) from error
+
+
+def _set_workspace_directory_modes(path: Path, workspace: Path) -> None:
+    current = path
+    workspace_parent = workspace.parent
+    while current != workspace_parent:
+        _set_directory_mode(current, WORKSPACE_DIRECTORY_MODE)
+        current = current.parent
 
 
 def _safe_relative_path(value: str) -> PurePosixPath:

@@ -5,7 +5,12 @@ from fastapi.testclient import TestClient
 
 from app.config import ServerSettings
 from app.main import create_app
-from app.services.relay import LLMRelay, RelayAuthenticationError, RelayConfigurationError
+from app.services.relay import (
+    LLMRelay,
+    RelayAuthenticationError,
+    RelayConfigurationError,
+    RuntimeTokenRegistry,
+)
 
 
 class NoopLauncher:
@@ -51,13 +56,15 @@ class FakeClient:
 def test_relay_token_validation_and_missing_provider_configuration(tmp_path: Path) -> None:
     settings = ServerSettings(
         data_dir=tmp_path,
-        relay_token="internal-token",
+        relay_token="legacy-global-token",
         provider_api_key=None,
     )
-    relay = LLMRelay(settings)
+    registry = RuntimeTokenRegistry()
+    token = registry.issue("session-a", 1)
+    relay = LLMRelay(settings, token_registry=registry)
     with pytest.raises(RelayAuthenticationError):
         relay.authenticate("Bearer wrong")
-    relay.authenticate("Bearer internal-token")
+    relay.authenticate(f"Bearer {token}")
 
     async def missing_provider() -> None:
         with pytest.raises(RelayConfigurationError):
@@ -66,6 +73,32 @@ def test_relay_token_validation_and_missing_provider_configuration(tmp_path: Pat
     import asyncio
 
     asyncio.run(missing_provider())
+
+
+def test_runtime_tokens_are_random_scoped_and_revocable() -> None:
+    registry = RuntimeTokenRegistry()
+    token_a = registry.issue("session-a", 1)
+    token_b = registry.issue("session-b", 1)
+    relay = LLMRelay(
+        ServerSettings(relay_token="legacy-global-token"),
+        token_registry=registry,
+    )
+
+    assert token_a != token_b
+    assert len(token_a) >= 43
+    assert relay.authenticate(f"Bearer {token_a}").session_id == "session-a"
+    assert relay.authenticate(f"Bearer {token_b}").session_id == "session-b"
+    with pytest.raises(RelayAuthenticationError):
+        relay.authenticate("Bearer random-token")
+
+    registry.revoke(token_a)
+    with pytest.raises(RelayAuthenticationError):
+        relay.authenticate(f"Bearer {token_a}")
+
+    token_a_restart = registry.issue("session-a", 2)
+    assert token_a_restart != token_a
+    assert registry.lookup(token_a) is None
+    assert relay.authenticate(f"Bearer {token_b}").session_id == "session-b"
 
 
 def test_relay_api_rejects_missing_internal_token(tmp_path: Path) -> None:

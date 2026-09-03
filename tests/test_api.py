@@ -4,7 +4,9 @@ import asyncio
 import time
 import zipfile
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app.config import ServerSettings
 from app.main import create_app
@@ -59,6 +61,36 @@ def test_cookie_user_can_create_and_list_multiple_sessions(tmp_path: Path) -> No
         assert "HttpOnly" in cookie
         assert "SameSite=lax" in cookie
         assert "Path=/mycode" in cookie
+
+
+def test_session_can_be_renamed_and_name_is_returned(tmp_path: Path) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        session = client.post("/mycode/api/sessions").json()
+        renamed = client.patch(
+            f"/mycode/api/sessions/{session['id']}",
+            json={"name": "numpy playground"},
+        )
+        listed = client.get("/mycode/api/sessions")
+
+    assert renamed.status_code == 200
+    assert renamed.json()["name"] == "numpy playground"
+    assert listed.json()["sessions"][0]["name"] == "numpy playground"
+
+
+def test_terminal_websocket_rejects_other_user_without_session_disclosure(
+    tmp_path: Path,
+) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as owner, TestClient(app) as stranger:
+        session_id = owner.post("/mycode/api/sessions").json()["id"]
+        with pytest.raises(WebSocketDisconnect) as error:
+            with stranger.websocket_connect(
+                f"/mycode/api/sessions/{session_id}/terminal"
+            ) as socket:
+                socket.receive_json()
+
+    assert error.value.code == 1008
 
 
 def test_profile_workspace_tree_content_and_downloads(tmp_path: Path) -> None:

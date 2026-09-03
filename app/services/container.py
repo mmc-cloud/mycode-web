@@ -6,6 +6,7 @@ from app.services.events import EventHub
 from app.services.lifecycle import SessionLifecycleService
 from app.services.relay import LLMRelay
 from app.services.runtime import RuntimeManager
+from app.services.terminal import TerminalManager
 from app.services.watcher import WorkspaceWatchManager
 from app.services.workspace import WorkspaceService
 
@@ -17,6 +18,7 @@ class AppServices:
     workspace: WorkspaceService
     events: EventHub
     runtime: RuntimeManager
+    terminal: TerminalManager
     watcher: WorkspaceWatchManager
     lifecycle: SessionLifecycleService
     relay: LLMRelay
