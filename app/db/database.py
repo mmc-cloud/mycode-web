@@ -168,6 +168,13 @@ class WebDatabase:
             ).fetchone()
         return None if row is None else _session_from_row(row)
 
+    def get_session_owner_id(self, session_id: str) -> str | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT user_id FROM web_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return None if row is None else row["user_id"]
+
     def update_display_name(self, user_id: str, display_name: str) -> WebUser:
         normalized = display_name.strip()
         if not normalized or len(normalized) > 80:

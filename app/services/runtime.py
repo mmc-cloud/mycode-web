@@ -256,6 +256,7 @@ class RuntimeManager:
         runtime_start_hook: Callable[[str], Awaitable[None]] | None = None,
         runtime_stop_hook: Callable[[str], Awaitable[None]] | None = None,
         relay_tokens: RuntimeTokenRegistry | None = None,
+        session_owner_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self.settings = settings
         self.workspace_service = workspace_service
@@ -266,6 +267,7 @@ class RuntimeManager:
         self._runtime_start_hook = runtime_start_hook
         self._runtime_stop_hook = runtime_stop_hook
         self.relay_tokens = relay_tokens or RuntimeTokenRegistry()
+        self._session_owner_resolver = session_owner_resolver
         self._sessions: dict[str, _RuntimeSession] = {}
         self._queue: deque[_QueuedTurn] = deque()
         self._lock = asyncio.Lock()
@@ -379,12 +381,12 @@ class RuntimeManager:
                 return state.status
             if state.status == "stopping":
                 return "stopped"
-            if self._occupied_slots_locked() < self.settings.sandbox_max_active:
+            if self._can_start_locked(session_id):
                 self._prepare_start_locked(session_id, state)
                 start_state = state
             else:
                 idle = self._oldest_idle_locked()
-                if idle is not None:
+                if idle is not None and self._user_has_capacity_locked(session_id):
                     victim_id, victim_state = idle
                     victim_state.status = "stopping"
                     victim_state.stopping = True
@@ -454,13 +456,13 @@ class RuntimeManager:
                 state.active_turn_id = turn_id
                 self._touch(session_id, state)
                 reuse_state = state
-            elif waiting_start_state is None and self._occupied_slots_locked() < self.settings.sandbox_max_active:
+            elif waiting_start_state is None and self._can_start_locked(session_id):
                 self._prepare_start_locked(session_id, state)
                 state.active_turn_id = turn_id
                 start_state = state
             elif waiting_start_state is None:
                 idle = self._oldest_idle_locked()
-                if idle is not None:
+                if idle is not None and self._user_has_capacity_locked(session_id):
                     victim_id, victim_state = idle
                     victim_state.status = "stopping"
                     victim_state.stopping = True
@@ -860,7 +862,9 @@ class RuntimeManager:
                 or not self._queue
             ):
                 return
-            item = self._queue.popleft()
+            item = self._pop_next_eligible_locked(releasing_session_id=session_id)
+            if item is None:
+                return
             target = self._sessions[item.session_id]
             state.status = "stopping"
             state.stopping = True
@@ -881,7 +885,9 @@ class RuntimeManager:
                 self._queue
                 and self._occupied_slots_locked() < self.settings.sandbox_max_active
             ):
-                item = self._queue.popleft()
+                item = self._pop_next_eligible_locked()
+                if item is None:
+                    break
                 state = self._sessions[item.session_id]
                 self._prepare_start_locked(item.session_id, state)
                 state.active_turn_id = item.turn_id
@@ -1024,11 +1030,53 @@ class RuntimeManager:
         if clear_token is not None:
             clear_token(session_id, token)
 
+    def _can_start_locked(self, session_id: str) -> bool:
+        return (
+            self._occupied_slots_locked() < self.settings.sandbox_max_active
+            and self._user_has_capacity_locked(session_id)
+        )
+
+    def _user_has_capacity_locked(
+        self, session_id: str, *, releasing_session_id: str | None = None
+    ) -> bool:
+        if self._session_owner_resolver is None:
+            return True
+        owner_id = self._session_owner_resolver(session_id)
+        if owner_id is None:
+            return True
+        active_for_user = sum(
+            self._occupies_slot(state)
+            and candidate_id != releasing_session_id
+            and self._session_owner_resolver(candidate_id) == owner_id
+            for candidate_id, state in self._sessions.items()
+        )
+        return active_for_user < self.settings.sandbox_max_active_per_user
+
+    def _pop_next_eligible_locked(
+        self, *, releasing_session_id: str | None = None
+    ) -> _QueuedTurn | None:
+        index = 0
+        while index < len(self._queue):
+            item = self._queue[index]
+            state = self._sessions.get(item.session_id)
+            if state is None or state.status != "queued":
+                del self._queue[index]
+                continue
+            if self._user_has_capacity_locked(
+                item.session_id, releasing_session_id=releasing_session_id
+            ):
+                del self._queue[index]
+                return item
+            index += 1
+        return None
+
     def _occupied_slots_locked(self) -> int:
-        return sum(
-            state.status == "starting"
-            or (self._is_live(state) and state.status != "stopping")
-            for state in self._sessions.values()
+        return sum(self._occupies_slot(state) for state in self._sessions.values())
+
+    @classmethod
+    def _occupies_slot(cls, state: _RuntimeSession) -> bool:
+        return state.status == "starting" or (
+            cls._is_live(state) and state.status != "stopping"
         )
 
     def _oldest_idle_locked(self) -> tuple[str, _RuntimeSession] | None:

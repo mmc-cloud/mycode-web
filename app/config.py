@@ -106,6 +106,9 @@ class ServerSettings:
     sandbox_queue_max: int = field(
         default_factory=lambda: _env_int("SANDBOX_QUEUE_MAX", 20)
     )
+    sandbox_max_active_per_user: int = field(
+        default_factory=lambda: _env_int("SANDBOX_MAX_ACTIVE_PER_USER", 5)
+    )
     sandbox_memory_limit: str = field(
         default_factory=lambda: os.getenv("SANDBOX_MEMORY_LIMIT", "640m")
     )

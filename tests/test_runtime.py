@@ -97,6 +97,18 @@ class ManualPromptLauncher(FakeLauncher):
         return process
 
 
+class FailNextLauncher(FakeLauncher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next = False
+
+    async def launch(self, session_id: str, workspace: Path, mycode_state: Path):
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("simulated startup failure")
+        return await super().launch(session_id, workspace, mycode_state)
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -476,6 +488,244 @@ def test_two_running_sessions_admit_and_third_queues_fifo(tmp_path: Path) -> Non
         await wait_for_status(manager, "four", "running")
         assert launcher.by_session["four"][0].stdin.writes == [b"fourth\n"]
         assert manager.active_count <= config.sandbox_max_active
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_per_user_active_quota_does_not_block_another_user(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = replace(
+            settings(tmp_path), sandbox_max_active=10, sandbox_max_active_per_user=2
+        )
+        owners = {"a1": "user-a", "a2": "user-a", "a3": "user-a", "b1": "user-b"}
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            session_owner_resolver=owners.get,
+        )
+
+        assert await manager.send_message("a1", "one") == "running"
+        assert await manager.send_message("a2", "two") == "running"
+        assert await manager.send_message("a3", "three") == "queued"
+        assert await manager.send_message("b1", "one") == "running"
+        assert manager.active_count == 3
+        assert manager.queued_count == 1
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_per_user_quota_release_handoffs_queued_session(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = replace(
+            settings(tmp_path), sandbox_max_active=2, sandbox_max_active_per_user=2
+        )
+        owners = {"a1": "user-a", "a2": "user-a", "a3": "user-a"}
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            session_owner_resolver=owners.get,
+        )
+
+        await manager.send_message("a1", "one")
+        await manager.send_message("a2", "two")
+        assert await manager.send_message("a3", "three") == "queued"
+        await manager.stop_session("a1")
+        await wait_for_status(manager, "a3", "running")
+        assert manager.status("a2") == "running"
+        assert manager.queued_count == 0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_idle_handoff_releases_victim_user_slot_before_eligibility_check(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(
+            settings(tmp_path), sandbox_max_active=10, sandbox_max_active_per_user=2
+        )
+        owners = {"a1": "user-a", "a2": "user-a", "a3": "user-a"}
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            session_owner_resolver=owners.get,
+        )
+
+        await manager.send_message("a1", "one")
+        await manager.send_message("a2", "two")
+        assert await manager.send_message("a3", "three") == "queued"
+
+        await launcher.by_session["a1"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "a3", "running")
+        assert manager.status("a1") == "stopped"
+        assert manager.status("a2") == "running"
+        assert manager.queued_count == 0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_queue_skips_user_quota_head_of_line_blocker(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = replace(
+            settings(tmp_path), sandbox_max_active=3, sandbox_max_active_per_user=2
+        )
+        owners = {
+            "a1": "user-a", "a2": "user-a", "a3": "user-a",
+            "b1": "user-b", "b2": "user-b",
+        }
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            session_owner_resolver=owners.get,
+        )
+
+        await manager.send_message("a1", "one")
+        await manager.send_message("a2", "two")
+        await manager.send_message("b1", "one")
+        assert await manager.send_message("a3", "three") == "queued"
+        assert await manager.send_message("b2", "two") == "queued"
+
+        await manager.stop_session("b1")
+        await wait_for_status(manager, "b2", "running")
+        assert manager.status("a3") == "queued"
+        assert manager.queued_count == 1
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_repeated_activate_and_terminal_leases_count_one_sandbox(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), sandbox_max_active_per_user=1)
+        owners = {"session": "user-a"}
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            session_owner_resolver=owners.get,
+        )
+
+        assert await manager.activate("session") == "starting"
+        assert await manager.activate("session") == "starting"
+        await wait_for_status(manager, "session", "idle")
+        await manager.acquire_terminal_lease("session")
+        await manager.acquire_terminal_lease("session")
+        assert await manager.activate("session") == "idle"
+        assert await manager.send_message("session", "task") == "running"
+        assert manager.active_count == 1
+        assert launcher.calls == 1
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_same_user_admission_respects_per_user_limit(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(
+            settings(tmp_path), sandbox_max_active=10, sandbox_max_active_per_user=2
+        )
+        owners = {f"session-{index}": "user-a" for index in range(8)}
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            session_owner_resolver=owners.get,
+        )
+
+        results = await asyncio.gather(
+            *(manager.send_message(session_id, "task") for session_id in owners)
+        )
+
+        assert results.count("running") == 2
+        assert results.count("queued") == 6
+        assert manager.active_count == 2
+        assert launcher.calls == 2
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_startup_failure_releases_quota_and_allows_next_queue_item(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(
+            settings(tmp_path), sandbox_max_active=1, sandbox_max_active_per_user=1
+        )
+        owners = {"a1": "user-a", "a2": "user-a", "b1": "user-b"}
+        launcher = FailNextLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            session_owner_resolver=owners.get,
+        )
+
+        await manager.send_message("a1", "one")
+        assert await manager.send_message("a2", "two") == "queued"
+        assert await manager.send_message("b1", "one") == "queued"
+        launcher.fail_next = True
+        await manager.stop_session("a1")
+        await wait_for_status(manager, "b1", "running")
+        assert manager.status("a2") == "error"
+        assert manager.active_count == 1
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_idle_ttl_releases_per_user_quota_for_queued_session(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = replace(
+            settings(tmp_path),
+            sandbox_max_active=2,
+            sandbox_max_active_per_user=1,
+            sandbox_idle_ttl_seconds=10,
+        )
+        owners = {"a1": "user-a", "a2": "user-a"}
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            clock=clock,
+            session_owner_resolver=owners.get,
+        )
+
+        await manager.send_message("a1", "one")
+        await launcher.process.stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "a1", "idle")
+        assert await manager.send_message("a2", "two") == "queued"
+        clock.advance(10)
+        assert await manager.sweep_expired() == ("a1",)
+        await wait_for_status(manager, "a2", "running")
         await manager.shutdown()
 
     asyncio.run(scenario())

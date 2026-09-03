@@ -62,6 +62,7 @@ def create_app(
         runtime_start_hook=watcher.ensure,
         runtime_stop_hook=runtime_stop_hook,
         relay_tokens=relay_tokens,
+        session_owner_resolver=database.get_session_owner_id,
     )
     terminal = TerminalManager(runtime, effective_settings)
     terminal_holder.append(terminal)

@@ -45,11 +45,11 @@ Session 支持 create、list、switch 和 delete。进入或切换 Session 后�
 
 Runtime 状态包括：`starting`、`idle`、`running`、`waiting_permission`、`queued`、`stopped` 和 `error`。
 
-Runtime Pool、FIFO Queue 和调度锁都位于单个 FastAPI 进程内。最大 active Sandbox、Queue 上限和 idle TTL 由配置决定，admission 遵循以下规则：
+Runtime Pool、FIFO Queue 和调度锁都位于单个 FastAPI 进程内。最大 active Sandbox、单个 Web User 的 active Sandbox 配额、Queue 上限和 idle TTL 由配置决定，admission 遵循以下规则：
 
-1. capacity 未满时，为 Session activate Runtime；
-2. capacity 已满但存在 idle Runtime 时，驱逐最久未活动的 idle Runtime；
-3. capacity 已满且没有可驱逐的 idle Runtime 时，新请求进入有界 FIFO Queue。
+1. 全局 capacity 和该 Web User 的 active Sandbox 配额都未满时，为 Session activate Runtime；
+2. 全局 capacity 已满但存在 idle Runtime，且用户配额允许时，驱逐最久未活动的 idle Runtime；
+3. 没有可立即启动的 Runtime 时，新请求进入有界 FIFO Queue；队列 handoff 会跳过当前用户配额已满的候选，避免队首阻塞。
 
 `starting`、`running` 和 `waiting_permission` 都可能占用 active capacity。Runtime 可因 idle TTL、capacity eviction、explicit stop、process exit 或 lifecycle cleanup 停止，但这些操作不会删除 Workspace、`mycode_state` 或 SQLite Session metadata。再次 activate 时会启动新 Sandbox，并通过 `mycode agent --continue` 恢复 Session。
 
@@ -127,6 +127,7 @@ MYCODE_MODEL=模型名
 ```dotenv
 SANDBOX_MAX_ACTIVE=2
 SANDBOX_QUEUE_MAX=20
+SANDBOX_MAX_ACTIVE_PER_USER=5
 SANDBOX_MEMORY_LIMIT=640m
 SANDBOX_MEMORY_SWAP_LIMIT=1g
 SANDBOX_CPUS=1.0
