@@ -654,7 +654,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
           </div>
           <div class="workspace-body">
             <nav class="tree-pane"><FileTree :entries="entries" :selected="selectedPath" @open="openFile" @delete="deleteEntry" /><p v-if="!entries.length" class="muted">Workspace 为空</p></nav>
-            <div class="splitter horizontal inner" title="拖动调整 File Tree 高度" @pointerdown="startResize('workspaceTree', $event)" />
+            <div class="splitter horizontal inner workspace-splitter" title="拖动调整 File Tree 高度" @pointerdown="startResize('workspaceTree', $event)" />
             <article class="preview"><div class="preview-title"><span>{{ selectedPath || "选择一个文本文件" }}</span><a v-if="selectedPath" :href="`${API_BASE}${scoped('/files/download')}?path=${encodeURIComponent(selectedPath)}`">Download</a></div><pre>{{ fileContent }}</pre></article>
           </div>
         </template>
@@ -683,7 +683,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
       </section>
     </section>
 
-    <div class="splitter horizontal" title="拖动调整 Terminal 高度" @pointerdown="startResize('terminal', $event)" />
+    <div class="splitter horizontal terminal-splitter" title="拖动调整 Terminal 高度" @pointerdown="startResize('terminal', $event)" />
     <section class="panel terminal-drawer" :class="{ collapsed: layout.terminalCollapsed }">
       <div class="panel-heading terminal-heading" @click="layout.terminalCollapsed && togglePanel('terminal')"><div><p class="eyebrow">TERMINAL</p><h2>Terminal <small>{{ layout.terminalCollapsed ? '▲' : '▼' }}</small></h2></div><button class="icon-button" :title="layout.terminalCollapsed ? '展开 Terminal' : '折叠 Terminal'" @click.stop="togglePanel('terminal')">{{ layout.terminalCollapsed ? '▲' : '▼' }}</button></div>
       <TerminalPanel v-if="!layout.terminalCollapsed" :session-id="currentSession?.id || ''" :collapsed="layout.terminalCollapsed" />

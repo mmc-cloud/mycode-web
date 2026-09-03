@@ -106,7 +106,7 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 .splitter { position: relative; z-index: 2; background: transparent; }
 .splitter::after { content: ""; position: absolute; background: #cbd3c7; opacity: 0.7; border-radius: 3px; }
 .splitter.vertical { cursor: col-resize; }
-.splitter.horizontal { grid-area: splitter; }
+.terminal-splitter { grid-area: splitter; }
 .splitter.vertical::after { top: 35%; bottom: 35%; left: 3px; width: 2px; }
 .splitter.horizontal { cursor: row-resize; }
 .splitter.horizontal::after { left: 35%; right: 35%; top: 3px; height: 2px; }
@@ -123,11 +123,14 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 .session-menu button { border-radius: 5px; background: transparent; color: #243128; text-align: left; }
 .session-menu button:hover { background: #e7eee4; }
 .session-menu .menu-danger { color: #a33932; }
-.workspace-panel { display: flex; flex-direction: column; }
+.workspace-panel { display: flex; flex-direction: column; min-height: 0; }
 .workspace-toolbar { display: flex; align-items: center; gap: 0.32rem; flex-wrap: wrap; margin-bottom: 0.45rem; }
 .button-label, .button-link { padding: 0.35rem 0.55rem; font-size: 0.72rem; }
 .button-label input { display: none; }
-.workspace-body { display: grid; grid-template-rows: minmax(120px, var(--workspace-tree-height)) 8px minmax(120px, 1fr); min-height: 0; flex: 1; }
+.workspace-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(120px, var(--workspace-tree-height)) 8px minmax(120px, 1fr); min-height: 0; flex: 1; }
+.tree-pane { grid-column: 1; grid-row: 1; }
+.workspace-splitter { grid-column: 1; grid-row: 2; }
+.preview { grid-column: 1; grid-row: 3; }
 .tree-pane, .preview { min-height: 0; overflow: auto; border: 1px solid #e0e3db; border-radius: 7px; background: white; padding: 0.5rem; }
 .file-tree { list-style: none; margin: 0; padding-left: 0.5rem; font-size: 0.78rem; }
 .file-tree li { margin: 0.12rem 0; }
