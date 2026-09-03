@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.config import ServerSettings
 from app.main import create_app
+from app.paths import API_BASE_PATH
 
 
 class NoopLauncher:
@@ -30,7 +31,6 @@ def create_test_app(tmp_path: Path):
 def configured_settings(tmp_path: Path) -> ServerSettings:
     return ServerSettings(
         data_dir=tmp_path / "data",
-        relay_token="internal-test-token",
         provider_api_key=None,
     )
 
@@ -38,11 +38,11 @@ def configured_settings(tmp_path: Path) -> ServerSettings:
 def test_cookie_user_can_create_and_list_multiple_sessions(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as client:
-        initial = client.get("/mycode/api/sessions")
-        first = client.post("/mycode/api/sessions")
+        initial = client.get(f"{API_BASE_PATH}/sessions")
+        first = client.post(f"{API_BASE_PATH}/sessions")
         first_user_id = client.cookies.get("mycode_user")
-        second = client.post("/mycode/api/sessions")
-        listed = client.get("/mycode/api/sessions")
+        second = client.post(f"{API_BASE_PATH}/sessions")
+        listed = client.get(f"{API_BASE_PATH}/sessions")
         second_user_id = client.cookies.get("mycode_user")
 
     assert initial.json()["sessions"] == []
@@ -60,18 +60,26 @@ def test_cookie_user_can_create_and_list_multiple_sessions(tmp_path: Path) -> No
         assert "expires=" in cookie.lower()
         assert "HttpOnly" in cookie
         assert "SameSite=lax" in cookie
-        assert "Path=/mycode" in cookie
+        assert "Path=/web" in cookie
+
+
+def test_legacy_mycode_api_path_is_not_registered(tmp_path: Path) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        response = client.get("/mycode/api/health")
+
+    assert response.status_code == 404
 
 
 def test_session_can_be_renamed_and_name_is_returned(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as client:
-        session = client.post("/mycode/api/sessions").json()
+        session = client.post(f"{API_BASE_PATH}/sessions").json()
         renamed = client.patch(
-            f"/mycode/api/sessions/{session['id']}",
+            f"{API_BASE_PATH}/sessions/{session['id']}",
             json={"name": "numpy playground"},
         )
-        listed = client.get("/mycode/api/sessions")
+        listed = client.get(f"{API_BASE_PATH}/sessions")
 
     assert renamed.status_code == 200
     assert renamed.json()["name"] == "numpy playground"
@@ -83,10 +91,10 @@ def test_terminal_websocket_rejects_other_user_without_session_disclosure(
 ) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as owner, TestClient(app) as stranger:
-        session_id = owner.post("/mycode/api/sessions").json()["id"]
+        session_id = owner.post(f"{API_BASE_PATH}/sessions").json()["id"]
         with pytest.raises(WebSocketDisconnect) as error:
             with stranger.websocket_connect(
-                f"/mycode/api/sessions/{session_id}/terminal"
+                f"{API_BASE_PATH}/sessions/{session_id}/terminal"
             ) as socket:
                 socket.receive_json()
 
@@ -96,10 +104,10 @@ def test_terminal_websocket_rejects_other_user_without_session_disclosure(
 def test_profile_workspace_tree_content_and_downloads(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as client:
-        session_id = client.post("/mycode/api/sessions").json()["id"]
-        base = f"/mycode/api/sessions/{session_id}"
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        base = f"{API_BASE_PATH}/sessions/{session_id}"
         profile = client.post(
-            "/mycode/api/profile", json={"display_name": "Demo User"}
+            f"{API_BASE_PATH}/profile", json={"display_name": "Demo User"}
         )
         upload = client.post(
             base + "/files/upload",
@@ -127,9 +135,9 @@ def test_profile_workspace_tree_content_and_downloads(tmp_path: Path) -> None:
 def test_file_api_rejects_path_traversal(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as client:
-        session_id = client.post("/mycode/api/sessions").json()["id"]
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
         response = client.get(
-            f"/mycode/api/sessions/{session_id}/files/content",
+            f"{API_BASE_PATH}/sessions/{session_id}/files/content",
             params={"path": "../outside.txt"},
         )
     assert response.status_code == 400
@@ -142,8 +150,8 @@ def test_zip_upload_extracts_safe_project(tmp_path: Path) -> None:
         archive.writestr("project/README.md", "hello")
     app = create_test_app(tmp_path)
     with TestClient(app) as client:
-        session_id = client.post("/mycode/api/sessions").json()["id"]
-        base = f"/mycode/api/sessions/{session_id}"
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        base = f"{API_BASE_PATH}/sessions/{session_id}"
         response = client.post(
             base + "/files/upload",
             data={"archive": "true"},
@@ -159,37 +167,37 @@ def test_zip_upload_extracts_safe_project(tmp_path: Path) -> None:
 def test_session_ownership_and_workspace_are_isolated(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as owner, TestClient(app) as stranger:
-        session_a = owner.post("/mycode/api/sessions").json()["id"]
-        session_b = owner.post("/mycode/api/sessions").json()["id"]
-        stranger_session = stranger.post("/mycode/api/sessions").json()["id"]
+        session_a = owner.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        session_b = owner.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        stranger_session = stranger.post(f"{API_BASE_PATH}/sessions").json()["id"]
         upload = owner.post(
-            f"/mycode/api/sessions/{session_a}/files/upload",
+            f"{API_BASE_PATH}/sessions/{session_a}/files/upload",
             data={"archive": "false"},
             files={"upload": ("only-a.txt", b"A", "text/plain")},
         )
 
         assert upload.status_code == 201
         assert owner.get(
-            f"/mycode/api/sessions/{session_a}/files/content",
+            f"{API_BASE_PATH}/sessions/{session_a}/files/content",
             params={"path": "only-a.txt"},
         ).json()["content"] == "A"
         assert owner.get(
-            f"/mycode/api/sessions/{session_b}/files/content",
+            f"{API_BASE_PATH}/sessions/{session_b}/files/content",
             params={"path": "only-a.txt"},
         ).status_code == 404
         assert stranger.get(
-            f"/mycode/api/sessions/{session_a}"
+            f"{API_BASE_PATH}/sessions/{session_a}"
         ).status_code == 404
         assert owner.get(
-            f"/mycode/api/sessions/{stranger_session}"
+            f"{API_BASE_PATH}/sessions/{stranger_session}"
         ).status_code == 404
 
 
 def test_delete_file_directory_and_session_data(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as client:
-        session_id = client.post("/mycode/api/sessions").json()["id"]
-        base = f"/mycode/api/sessions/{session_id}"
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        base = f"{API_BASE_PATH}/sessions/{session_id}"
         for path in ("one.txt", "folder/two.txt"):
             client.post(
                 base + "/files/upload",
@@ -209,8 +217,8 @@ def test_delete_file_directory_and_session_data(tmp_path: Path) -> None:
 def test_console_history_api_is_owned_and_session_scoped(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as owner, TestClient(app) as stranger:
-        session_a = owner.post("/mycode/api/sessions").json()["id"]
-        session_b = owner.post("/mycode/api/sessions").json()["id"]
+        session_a = owner.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        session_b = owner.post(f"{API_BASE_PATH}/sessions").json()["id"]
         app.state.services.database.append_console_event(
             session_a, "assistant", "only a"
         )
@@ -218,17 +226,17 @@ def test_console_history_api_is_owned_and_session_scoped(tmp_path: Path) -> None
             session_b, "assistant", "only b"
         )
         snapshot_a = owner.get(
-            f"/mycode/api/sessions/{session_a}/console"
+            f"{API_BASE_PATH}/sessions/{session_a}/console"
         ).json()
         snapshot_b = owner.get(
-            f"/mycode/api/sessions/{session_b}/console"
+            f"{API_BASE_PATH}/sessions/{session_b}/console"
         ).json()
         assert snapshot_a["events"][0]["content"] == "only a"
         assert snapshot_b["events"][0]["content"] == "only b"
         assert snapshot_a["event_cursor"] == 0
         assert snapshot_b["event_cursor"] == 0
         assert stranger.get(
-            f"/mycode/api/sessions/{session_a}/console"
+            f"{API_BASE_PATH}/sessions/{session_a}/console"
         ).status_code == 404
 
 
@@ -237,9 +245,9 @@ def test_console_snapshot_cursor_replays_event_published_before_sse(
 ) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as client:
-        session_id = client.post("/mycode/api/sessions").json()["id"]
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
         snapshot = client.get(
-            f"/mycode/api/sessions/{session_id}/console"
+            f"{API_BASE_PATH}/sessions/{session_id}/console"
         ).json()
 
         async def publish_then_connect():
@@ -266,10 +274,10 @@ def test_console_snapshot_cursor_replays_event_published_before_sse(
 def test_activate_api_returns_before_slow_runtime_startup(tmp_path: Path) -> None:
     app = create_app(configured_settings(tmp_path), launcher=SlowLauncher())
     with TestClient(app) as client:
-        session_id = client.post("/mycode/api/sessions").json()["id"]
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
         started = time.monotonic()
         response = client.post(
-            f"/mycode/api/sessions/{session_id}/activate"
+            f"{API_BASE_PATH}/sessions/{session_id}/activate"
         )
         elapsed = time.monotonic() - started
 

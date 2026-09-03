@@ -8,7 +8,7 @@ from app.services.events import EventHub
 
 
 def make_database(tmp_path: Path) -> tuple[WebDatabase, str, str]:
-    settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+    settings = ServerSettings(data_dir=tmp_path / "data")
     settings.ensure_directories()
     database = WebDatabase(settings.database_path)
     database.initialize()

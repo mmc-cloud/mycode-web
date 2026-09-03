@@ -37,7 +37,7 @@ def test_watcher_projects_create_modify_delete_rename_and_isolates_session(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+        settings = ServerSettings(data_dir=tmp_path / "data")
         workspace = WorkspaceService(settings)
         events = EventHub()
         factory = FakeWatchFactory()
@@ -83,7 +83,7 @@ def test_watcher_ignores_generated_directories_but_watches_project_files(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+        settings = ServerSettings(data_dir=tmp_path / "data")
         workspace = WorkspaceService(settings)
         events = EventHub()
         factory = FakeWatchFactory()

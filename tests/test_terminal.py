@@ -101,7 +101,7 @@ async def wait_for_status(connection, status: str) -> None:
 def test_terminal_command_uses_system_path_without_private_runtime_env(
     tmp_path: Path,
 ) -> None:
-    settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+    settings = ServerSettings(data_dir=tmp_path / "data")
     command = DockerPtyTerminalBackend(settings).command("mycode-web-session")
     rendered = " ".join(command)
 
@@ -121,7 +121,7 @@ def test_terminal_command_uses_system_path_without_private_runtime_env(
 def test_terminal_start_failure_releases_attach_reservation(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime = FakeRuntime()
-        settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+        settings = ServerSettings(data_dir=tmp_path / "data")
         manager = TerminalManager(
             runtime, settings, backend=FailingTerminalBackend()
         )
@@ -138,7 +138,7 @@ def test_terminal_reuses_one_shell_and_broadcasts_output(tmp_path: Path) -> None
     async def scenario() -> None:
         runtime = FakeRuntime()
         backend = FakeTerminalBackend()
-        settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+        settings = ServerSettings(data_dir=tmp_path / "data")
         manager = TerminalManager(runtime, settings, backend=backend)
 
         first = await manager.attach("session", cols=120, rows=32)
@@ -175,7 +175,7 @@ def test_terminal_ring_buffer_is_bounded_and_replayed(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime = FakeRuntime()
         backend = FakeTerminalBackend()
-        settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+        settings = ServerSettings(data_dir=tmp_path / "data")
         manager = TerminalManager(runtime, settings, backend=backend, buffer_limit=8)
 
         first = await manager.attach("session")

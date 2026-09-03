@@ -14,7 +14,6 @@ def service(tmp_path: Path, **limits: int) -> WorkspaceService:
     return WorkspaceService(
         ServerSettings(
             data_dir=tmp_path / "data",
-            relay_token="token",
             workspace_limit_bytes=limits.get("workspace_limit_bytes", 1024),
             workspace_file_limit=limits.get("workspace_file_limit", 10),
             upload_zip_limit_bytes=limits.get("upload_zip_limit_bytes", 1024),
@@ -23,7 +22,7 @@ def service(tmp_path: Path, **limits: int) -> WorkspaceService:
 
 
 def test_default_workspace_limits_match_web_demo_contract(tmp_path: Path) -> None:
-    settings = ServerSettings(data_dir=tmp_path, relay_token="token")
+    settings = ServerSettings(data_dir=tmp_path)
     assert settings.upload_zip_limit_bytes == 150 * 1024 * 1024
     assert settings.workspace_limit_bytes == 2 * 1024 * 1024 * 1024
     assert settings.workspace_file_limit == 20_000

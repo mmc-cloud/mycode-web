@@ -19,9 +19,9 @@
 ## 架构
 
 ```text
-Browser /mycode/
+Browser /web/
   -> Vue 3 + Vite
-  -> FastAPI /mycode/api/*
+  -> FastAPI /web/api/*
   -> Docker Sandbox
   -> long-lived `mycode agent --continue`
   -> FastAPI OpenAI-compatible Relay
@@ -39,7 +39,7 @@ Sandbox 只挂载对应 Session 的这两个目录。
 
 ## Session 与 Runtime 生命周期
 
-HttpOnly Cookie 只标识 Web User。一个 User 可以拥有多个 Session，并通过 `/mycode/?session=<session_id>` 选择当前 Session。首次访问没有 Session 时，前端自动创建一个；URL 未指定 Session 时进入最近活跃的 Session。
+HttpOnly Cookie 只标识 Web User。一个 User 可以拥有多个 Session，并通过 `/web/?session=<session_id>` 选择当前 Session。首次访问没有 Session 时，前端自动创建一个；URL 未指定 Session 时进入最近活跃的 Session。
 
 Session 支持 create、list、switch 和 delete。进入或切换 Session 后，前端立即调用 activate，并在后台启动或复用 Sandbox 与 `mycode agent --continue`。浏览器刷新不会停止 Runtime，也不会创建重复 Agent process。
 
@@ -104,13 +104,15 @@ SSE replay buffer 位于 FastAPI 进程内。Replayable stable events 可以进�
 
 ## 配置与启动 FastAPI
 
-在 `mycode-web` 根目录执行：
+全新本地安装时，在 `mycode-web` 根目录执行：
 
 ```powershell
 Copy-Item .\.env.example .\.env
 uv sync
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --env-file .env
 ```
+
+`Copy-Item` 仅适用于全新本地安装；升级已有服务器时不要用 `.env.example` 覆盖生产 `.env`。
 
 `.env` 至少设置：
 
@@ -148,7 +150,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 验证 FastAPI：
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8000/mycode/api/health
+Invoke-RestMethod http://127.0.0.1:8000/web/api/health
 ```
 
 ## 构建 Sandbox Image
@@ -186,23 +188,81 @@ npm install
 npm run dev
 ```
 
-浏览器打开 <http://localhost:5173/mycode/>。Vite base 固定为 `/mycode/`，并把 `/mycode/api/*` 代理到 `http://127.0.0.1:8000`。
+浏览器打开 <http://localhost:5173/web/>。Vite base 固定为 `/web/`，并把 `/web/api/*` 代理到 `http://127.0.0.1:8000`。
 
 ## Production Deployment
 
-当前实现已经在 Linux production topology 上完成真实链路验证：
+Production topology：
 
 ```text
 Browser
-  -> Nginx /mycode/
-  -> Vue static assets / FastAPI /mycode/api/*
+  -> Nginx /web/
+  -> Vue static assets / FastAPI /web/api/*
   -> Docker Sandbox
   -> mycode agent --continue
   -> FastAPI internal Relay
   -> Provider
 ```
 
-验证范围包括 Linux Host、Docker Sandbox、bind mount UID/GID、Docker bridge 到 FastAPI Relay、真实 Provider request、systemd、Nginx、单 FastAPI worker 和 Browser E2E。README 不记录公网地址、真实 Provider 地址、密钥或服务器私有信息。
+服务器 Nginx 模板位于 `deploy/nginx/mycode.conf`，最终公网入口为 `https://mycode.icu/web/`。该模板包含 HTTP→HTTPS、SPA fallback、SSE 无缓冲、WebSocket Upgrade，以及旧 `/mycode` 路径到 `/web` 的兼容跳转。Linux Docker、Browser 和真实 Provider E2E 仍需按部署 checklist 单独执行，不以本地 fake tests 代替。
+
+## HTTPS 部署与 Phase 2 升级
+
+首次 HTTPS bootstrap 必须先确保 ACME challenge 可用；证书不存在时不要先安装引用证书文件的最终 443 配置：
+
+1. 将 `mycode.icu` 的 DNS A record 指向服务器公网 IP，并确认 TCP 80/443 对外开放。
+2. 保持现有可工作的 HTTP-only Nginx server（如果服务器已有适合 Certbot 的 HTTP server，直接复用）。
+3. 在服务器安装 Certbot，先申请证书：
+
+   ```sh
+   sudo certbot --nginx -d mycode.icu
+   ```
+
+4. 确认 `/etc/letsencrypt/live/mycode.icu/fullchain.pem` 和 `/etc/letsencrypt/live/mycode.icu/privkey.pem` 均已存在。
+5. 再安装 `deploy/nginx/mycode.conf`，执行 `sudo nginx -t`，然后 `sudo systemctl reload nginx`。
+6. 确认 Certbot 自动续期 timer/cron 已启用，并执行 `sudo certbot renew --dry-run`。
+7. 验证 `https://mycode.icu/web/` 和 `https://mycode.icu/web/api/health`。
+
+### 生产 `.env` 升级
+
+Phase 2 升级时编辑服务器上已有的 `/opt/mycode-web/.env`，不要执行 `cp .env.example .env` 或用 `.env.example` 覆盖生产配置。保留现有 Provider、Sandbox pool、queue、memory 和 TTL 配置；重点确认或增加：
+
+```dotenv
+MYCODE_COOKIE_SECURE=true
+MYCODE_RELAY_BASE_URL_FOR_SANDBOX=http://host.docker.internal:8000/web/api/relay/v1
+```
+
+如果没有显式设置 Relay base URL，则使用当前代码中的新默认值。`.env.example` 只用于全新安装参考。
+
+### 旧 Web 数据
+
+旧 `/mycode` 的 Cookie 使用 `Path=/mycode`，不会随 `/web/` 请求发送，因此首次打开 `/web/` 会创建新的 Web User。旧测试数据不做 cookie、User 或 Session migration；上线时可按需清理，不增加迁移代码。
+
+清理前先按当前源码解析真实路径，不要凭空假设数据目录：
+
+```sh
+cd /opt/mycode-web
+uv run --env-file .env python -c 'from app.config import ServerSettings; s=ServerSettings(); print("data_dir=", s.data_dir); print("database=", s.database_path); print("sessions=", s.sessions_dir)'
+```
+
+当前代码语义是 `MYCODE_SERVER_DATA_DIR`（未设置时为服务工作目录下的 `./data`）、数据库 `<data_dir>/web-v2.sqlite3`，以及 Session 数据 `<data_dir>/sessions/<session_id>/{workspace,mycode_state}`。确认打印路径确实是旧 Web 数据后，再在服务器执行：
+
+```sh
+# 将下面两项替换为上一步确认过的真实输出路径。
+DATA_DIR=/path/from-the-command
+DB="$DATA_DIR/web-v2.sqlite3"
+SESSIONS="$DATA_DIR/sessions"
+test -f "$DB" && test -d "$SESSIONS"
+
+sudo systemctl stop mycode-web
+# 可选但建议：先备份 "$DB" 和 "$SESSIONS"。
+sudo cp -a "$DB" "$DB.phase2-backup"
+sudo rm -f "$DB"
+sudo rm -rf "$SESSIONS"
+sudo systemctl start mycode-web
+```
+
+只在确认目标是旧 Web 测试数据后执行删除；FastAPI 会在启动时自动创建新 schema 和新 Session 目录。不要在本机 Windows 环境执行上述生产数据清理；证书、私钥和生产 `.env` 也不提交到仓库。
 
 ## 测试
 

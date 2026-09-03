@@ -2,7 +2,7 @@
 
 ## 状态
 
-已接受，适用于第一版本地 Web Demo。
+已接受，适用于 Web Demo 的 CLI Adapter、Session Sandbox 与宿主 Relay 设计；公开部署路径由 Phase 2 部署配置定义。
 
 ## 背景
 
@@ -30,4 +30,4 @@ Web Demo 已从 MyCode 核心仓库拆分为独立 `mycode-web` 仓库，因此 
 
 ## 暂不实施
 
-本 ADR 不引入 JSONL Presenter、TUI、自然语言权限判断、Permission Scope、Queue、Sandbox 自动回收、Nginx/HTTPS、生产账号或服务器部署。
+本 ADR 不引入 JSONL Presenter、TUI、自然语言权限判断、Permission Scope 或生产账号；Nginx/HTTPS 与服务器部署属于后续部署层配置，不改变本 ADR 的 Adapter、Sandbox 和 Relay 边界。

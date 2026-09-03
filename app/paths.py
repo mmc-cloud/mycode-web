@@ -1,0 +1,3 @@
+WEB_BASE_PATH = "/web"
+API_BASE_PATH = f"{WEB_BASE_PATH}/api"
+RELAY_BASE_PATH = f"{API_BASE_PATH}/relay/v1"

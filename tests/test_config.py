@@ -11,7 +11,7 @@ def test_optional_mycode_runtime_env_is_read_without_server_defaults(
     monkeypatch.setenv("LLM_RESERVED_OUTPUT_TOKENS", "8192")
     monkeypatch.setenv("LLM_STREAM_INCLUDE_USAGE", "false")
 
-    settings = ServerSettings(data_dir=tmp_path, relay_token="token")
+    settings = ServerSettings(data_dir=tmp_path)
 
     assert settings.sandbox_optional_env == (
         ("LLM_RESERVED_OUTPUT_TOKENS", "8192"),
@@ -25,7 +25,7 @@ def test_missing_optional_mycode_runtime_env_is_not_injected(
     for name in MYCODE_SANDBOX_OPTIONAL_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
 
-    settings = ServerSettings(data_dir=tmp_path, relay_token="token")
+    settings = ServerSettings(data_dir=tmp_path)
 
     assert settings.sandbox_optional_env == ()
 
@@ -48,7 +48,7 @@ def test_sandbox_capacity_lifecycle_and_resource_defaults(
     for name in names:
         monkeypatch.delenv(name, raising=False)
 
-    settings = ServerSettings(data_dir=tmp_path, relay_token="token")
+    settings = ServerSettings(data_dir=tmp_path)
 
     assert settings.sandbox_max_active == 2
     assert settings.sandbox_queue_max == 20

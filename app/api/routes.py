@@ -42,9 +42,10 @@ from app.services.runtime import (
 )
 from app.services.workspace import WorkspaceError, WorkspaceLimitError
 from app.services.terminal import TerminalUnavailableError
+from app.paths import API_BASE_PATH
 
 
-router = APIRouter(prefix="/mycode/api")
+router = APIRouter(prefix=API_BASE_PATH)
 
 
 @router.get("/health")

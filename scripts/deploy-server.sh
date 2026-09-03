@@ -4,7 +4,7 @@ set -Eeuo pipefail
 MYCODE_DIR="/opt/mycode"
 WEB_DIR="/opt/mycode-web"
 SERVICE="mycode-web"
-HEALTH_URL="http://127.0.0.1:8000/mycode/api/health"
+HEALTH_URL="http://127.0.0.1:8000/web/api/health"
 
 # CentOS 7 ships an old Git that does not support `git -C`.
 git_in() {

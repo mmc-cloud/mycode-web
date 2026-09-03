@@ -56,7 +56,6 @@ class FakeClient:
 def test_relay_token_validation_and_missing_provider_configuration(tmp_path: Path) -> None:
     settings = ServerSettings(
         data_dir=tmp_path,
-        relay_token="legacy-global-token",
         provider_api_key=None,
     )
     registry = RuntimeTokenRegistry()
@@ -80,7 +79,7 @@ def test_runtime_tokens_are_random_scoped_and_revocable() -> None:
     token_a = registry.issue("session-a", 1)
     token_b = registry.issue("session-b", 1)
     relay = LLMRelay(
-        ServerSettings(relay_token="legacy-global-token"),
+        ServerSettings(),
         token_registry=registry,
     )
 
@@ -104,12 +103,11 @@ def test_runtime_tokens_are_random_scoped_and_revocable() -> None:
 def test_relay_api_rejects_missing_internal_token(tmp_path: Path) -> None:
     settings = ServerSettings(
         data_dir=tmp_path,
-        relay_token="internal-token",
         provider_api_key="provider-secret",
     )
     with TestClient(create_app(settings, launcher=NoopLauncher())) as client:
         response = client.post(
-            "/mycode/api/relay/v1/chat/completions", json={"model": "test"}
+            "/web/api/relay/v1/chat/completions", json={"model": "test"}
         )
     assert response.status_code == 401
     assert "provider-secret" not in response.text
@@ -120,7 +118,6 @@ def test_relay_reuses_lifespan_client_and_closes_it(tmp_path: Path) -> None:
     async def scenario() -> None:
         settings = ServerSettings(
             data_dir=tmp_path,
-            relay_token="internal-token",
             provider_api_key="provider-secret",
         )
         fake_client = FakeClient()
@@ -154,7 +151,6 @@ def test_app_lifespan_starts_and_stops_relay_client(tmp_path: Path) -> None:
     app = create_app(
         ServerSettings(
             data_dir=tmp_path,
-            relay_token="internal-token",
             provider_api_key=None,
         ),
         launcher=NoopLauncher(),

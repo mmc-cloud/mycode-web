@@ -1,8 +1,8 @@
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
-import secrets
 
+from app.paths import RELAY_BASE_PATH
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
 MYCODE_SANDBOX_OPTIONAL_ENV_NAMES = (
@@ -141,13 +141,8 @@ class ServerSettings:
     relay_base_url_for_sandbox: str = field(
         default_factory=lambda: os.getenv(
             "MYCODE_RELAY_BASE_URL_FOR_SANDBOX",
-            "http://host.docker.internal:8000/mycode/api/relay/v1",
+            f"http://host.docker.internal:8000{RELAY_BASE_PATH}",
         ).rstrip("/")
-    )
-    relay_token: str = field(
-        default_factory=lambda: os.getenv("MYCODE_RELAY_TOKEN")
-        or secrets.token_urlsafe(32),
-        repr=False,
     )
     provider_api_key: str | None = field(
         default_factory=lambda: os.getenv("MYCODE_PROVIDER_API_KEY"),

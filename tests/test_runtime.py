@@ -123,7 +123,6 @@ async def wait_for_status(
 def settings(tmp_path: Path) -> ServerSettings:
     return ServerSettings(
         data_dir=tmp_path / "data",
-        relay_token="relay-token",
         provider_api_key="real-provider-secret",
         model="demo-model",
         sandbox_optional_env=(),
@@ -399,7 +398,6 @@ def test_docker_command_passes_only_configured_optional_mycode_env(
 ) -> None:
     config = ServerSettings(
         data_dir=tmp_path / "data",
-        relay_token="relay-token",
         provider_api_key="real-provider-secret",
         model="demo-model",
         sandbox_optional_env=(
@@ -430,7 +428,6 @@ def test_docker_command_passes_only_configured_optional_mycode_env(
 def test_docker_command_includes_configured_resource_limits(tmp_path: Path) -> None:
     config = ServerSettings(
         data_dir=tmp_path / "data",
-        relay_token="token",
         sandbox_memory_limit="768m",
         sandbox_memory_swap_limit="1200m",
         sandbox_cpus=1.5,
@@ -530,7 +527,6 @@ def test_duplicate_queue_entry_and_queue_capacity_are_rejected(
     async def scenario() -> None:
         config = ServerSettings(
             data_dir=tmp_path / "data",
-            relay_token="token",
             sandbox_max_active=2,
             sandbox_queue_max=1,
         )
@@ -558,7 +554,6 @@ def test_idle_ttl_only_reclaims_expired_runtime_and_preserves_data(
         clock = FakeClock()
         config = ServerSettings(
             data_dir=tmp_path / "data",
-            relay_token="token",
             sandbox_idle_ttl_seconds=7200,
         )
         workspace = WorkspaceService(config)
@@ -606,7 +601,6 @@ def test_connected_terminal_lease_protects_idle_runtime_from_ttl(
         clock = FakeClock()
         config = ServerSettings(
             data_dir=tmp_path / "data",
-            relay_token="token",
             sandbox_idle_ttl_seconds=10,
         )
         launcher = FakeLauncher()
@@ -641,7 +635,6 @@ def test_connected_terminal_runtime_is_not_an_idle_eviction_victim(
     async def scenario() -> None:
         config = ServerSettings(
             data_dir=tmp_path / "data",
-            relay_token="token",
             sandbox_max_active=2,
         )
         launcher = FakeLauncher()
@@ -868,7 +861,6 @@ def test_waiting_permission_expires_and_clears_pending_state(
         clock = FakeClock()
         config = ServerSettings(
             data_dir=tmp_path / "data",
-            relay_token="token",
             sandbox_idle_ttl_seconds=10,
         )
         events = EventHub()

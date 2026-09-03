@@ -37,7 +37,6 @@ class FailingCleanupLauncher(StartupLauncher):
 def make_services(tmp_path: Path):
     settings = ServerSettings(
         data_dir=tmp_path / "data",
-        relay_token="token",
         session_retention_seconds=14 * 24 * 60 * 60,
     )
     settings.ensure_directories()
@@ -157,14 +156,14 @@ def test_session_cleanup_does_not_follow_directory_symlink(tmp_path: Path) -> No
 
 
 def test_application_lifespan_shuts_down_runtime(tmp_path: Path) -> None:
-    settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+    settings = ServerSettings(data_dir=tmp_path / "data")
     launcher = StartupLauncher()
     app = create_app(settings, launcher=launcher)
     shutdown = AsyncMock()
     app.state.services.runtime.shutdown = shutdown
 
     with TestClient(app) as client:
-        assert client.get("/mycode/api/health").status_code == 200
+        assert client.get("/web/api/health").status_code == 200
 
     assert launcher.cleanup_calls == 1
     shutdown.assert_awaited_once_with()
@@ -173,13 +172,13 @@ def test_application_lifespan_shuts_down_runtime(tmp_path: Path) -> None:
 def test_application_startup_logs_cleanup_failure_and_continues(
     tmp_path: Path, caplog
 ) -> None:
-    settings = ServerSettings(data_dir=tmp_path / "data", relay_token="token")
+    settings = ServerSettings(data_dir=tmp_path / "data")
     launcher = FailingCleanupLauncher()
     app = create_app(settings, launcher=launcher)
     caplog.set_level("ERROR")
 
     with TestClient(app) as client:
-        assert client.get("/mycode/api/health").status_code == 200
+        assert client.get("/web/api/health").status_code == 200
 
     assert launcher.cleanup_calls == 1
     assert "startup cleanup failed; startup will continue" in caplog.text

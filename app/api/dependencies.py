@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from fastapi import HTTPException, Request, Response
 
 from app.db.database import WebSession, WebUser
+from app.paths import WEB_BASE_PATH
 from app.services.container import AppServices
 
 
@@ -28,7 +29,7 @@ def current_user(request: Request, response: Response) -> WebUser:
         httponly=True,
         secure=app_services.settings.cookie_secure,
         samesite="lax",
-        path="/mycode",
+        path=WEB_BASE_PATH,
     )
     return user
 
