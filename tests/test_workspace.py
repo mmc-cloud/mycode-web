@@ -42,6 +42,56 @@ def test_session_directories_prepare_shared_workspace_and_private_state(
     assert call(mycode_state, 0o700) in chmod.call_args_list
 
 
+def test_sessions_for_one_user_share_workspace_but_not_mycode_state(
+    tmp_path: Path,
+) -> None:
+    workspace_service = service(tmp_path)
+
+    workspace_a, state_a = workspace_service.ensure_session_directories(
+        "session-a", user_id="user-a"
+    )
+    workspace_b, state_b = workspace_service.ensure_session_directories(
+        "session-b", user_id="user-a"
+    )
+
+    assert workspace_a == workspace_b == workspace_service.workspace_dir("user-a")
+    assert state_a != state_b
+    (workspace_a / "shared.txt").write_text("shared", encoding="utf-8")
+    assert workspace_service.read_text(
+        "session-b", "shared.txt", user_id="user-a"
+    ) == "shared"
+
+
+def test_different_users_have_isolated_workspaces(tmp_path: Path) -> None:
+    workspace_service = service(tmp_path)
+    workspace_a, _ = workspace_service.ensure_session_directories(
+        "session-a", user_id="user-a"
+    )
+    workspace_b, _ = workspace_service.ensure_session_directories(
+        "session-b", user_id="user-b"
+    )
+    (workspace_a / "private.txt").write_text("A", encoding="utf-8")
+
+    assert workspace_a != workspace_b
+    with pytest.raises(FileNotFoundError):
+        workspace_service.read_text("session-b", "private.txt", user_id="user-b")
+
+
+def test_deleting_session_data_keeps_user_workspace(tmp_path: Path) -> None:
+    workspace_service = service(tmp_path)
+    workspace, state = workspace_service.ensure_session_directories(
+        "session-a", user_id="user-a"
+    )
+    (workspace / "keep.txt").write_text("keep", encoding="utf-8")
+    (state / "private.json").write_text("{}", encoding="utf-8")
+
+    workspace_service.delete_session_data("session-a")
+
+    assert workspace.exists()
+    assert not state.parent.exists()
+    assert (workspace / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
 def zip_bytes(entries: list[tuple[zipfile.ZipInfo | str, bytes]]) -> BytesIO:
     result = BytesIO()
     with zipfile.ZipFile(result, "w") as archive:

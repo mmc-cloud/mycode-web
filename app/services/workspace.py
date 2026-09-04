@@ -50,9 +50,24 @@ class WorkspaceService:
         _require_within(path, self.settings.sessions_dir.resolve())
         return path
 
-    def ensure_session_directories(self, session_id: str) -> tuple[Path, Path]:
+    def user_dir(self, user_id: str) -> Path:
+        if not user_id or any(character in user_id for character in "/\\"):
+            raise WorkspaceError("Invalid user identifier.")
+        path = (self.settings.users_dir / user_id).resolve()
+        _require_within(path, self.settings.users_dir.resolve())
+        return path
+
+    def workspace_dir(self, user_id: str) -> Path:
+        return self.user_dir(user_id) / "workspace"
+
+    def ensure_session_directories(
+        self, session_id: str, *, user_id: str | None = None
+    ) -> tuple[Path, Path]:
         session_dir = self.session_dir(session_id)
-        workspace = session_dir / "workspace"
+        # The optional fallback keeps low-level callers that do not have a
+        # database owner resolver useful, while production always supplies the
+        # Web User id.
+        workspace = self.workspace_dir(user_id or session_id)
         mycode_state = session_dir / "mycode_state"
         workspace.mkdir(parents=True, exist_ok=True)
         mycode_state.mkdir(parents=True, exist_ok=True)
@@ -77,10 +92,27 @@ class WorkspaceService:
         if target.exists():
             shutil.rmtree(target)
 
+    def delete_user_workspace(self, user_id: str) -> None:
+        """Delete one retained user workspace without following links outside it."""
+        root = self.settings.users_dir.resolve()
+        target = self.user_dir(user_id)
+        if target.parent != root:
+            raise WorkspaceError("Path escapes user root.")
+        if _is_link(target):
+            _unlink_link(target)
+            return
+        if target.exists():
+            shutil.rmtree(target)
+
     def resolve_file(
-        self, session_id: str, relative_path: str, *, must_exist: bool = True
+        self,
+        session_id: str,
+        relative_path: str,
+        *,
+        user_id: str | None = None,
+        must_exist: bool = True,
     ) -> Path:
-        workspace, _ = self.ensure_session_directories(session_id)
+        workspace, _ = self.ensure_session_directories(session_id, user_id=user_id)
         relative = _safe_relative_path(relative_path)
         target = workspace.joinpath(*relative.parts)
         _reject_symlink_chain(target, workspace)
@@ -100,8 +132,9 @@ class WorkspaceService:
         *,
         archive: bool,
         relative_path: str | None = None,
+        user_id: str | None = None,
     ) -> None:
-        workspace, _ = self.ensure_session_directories(session_id)
+        workspace, _ = self.ensure_session_directories(session_id, user_id=user_id)
         upload_dir = self.session_dir(session_id) / ".uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
         suffix = ".zip" if archive else ".upload"
@@ -116,11 +149,14 @@ class WorkspaceService:
             )
             _copy_limited(source, temporary, upload_limit)
             if archive:
-                self._extract_zip(workspace, temporary)
+                self._extract_zip(workspace, temporary, session_id)
             else:
                 destination_name = relative_path or filename
                 target = self.resolve_file(
-                    session_id, destination_name, must_exist=False
+                    session_id,
+                    destination_name,
+                    user_id=user_id,
+                    must_exist=False,
                 )
                 stats = self.stats(workspace)
                 old_size = target.stat().st_size if target.exists() else 0
@@ -137,13 +173,17 @@ class WorkspaceService:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def tree(self, session_id: str) -> list[dict[str, object]]:
-        workspace, _ = self.ensure_session_directories(session_id)
+    def tree(
+        self, session_id: str, *, user_id: str | None = None
+    ) -> list[dict[str, object]]:
+        workspace, _ = self.ensure_session_directories(session_id, user_id=user_id)
         self.stats(workspace)
         return _tree_entries(workspace, workspace)
 
-    def read_text(self, session_id: str, relative_path: str) -> str:
-        path = self.resolve_file(session_id, relative_path)
+    def read_text(
+        self, session_id: str, relative_path: str, *, user_id: str | None = None
+    ) -> str:
+        path = self.resolve_file(session_id, relative_path, user_id=user_id)
         size = path.stat().st_size
         if size > self.settings.text_preview_limit_bytes:
             raise WorkspaceLimitError("File is too large for text preview.")
@@ -155,9 +195,11 @@ class WorkspaceService:
         except UnicodeDecodeError as error:
             raise WorkspaceError("Text preview currently requires UTF-8.") from error
 
-    def delete_path(self, session_id: str, relative_path: str) -> None:
+    def delete_path(
+        self, session_id: str, relative_path: str, *, user_id: str | None = None
+    ) -> None:
         """Delete one file or directory without allowing root or symlink escape."""
-        workspace, _ = self.ensure_session_directories(session_id)
+        workspace, _ = self.ensure_session_directories(session_id, user_id=user_id)
         relative = _safe_relative_path(relative_path)
         target = workspace.joinpath(*relative.parts)
         _reject_symlink_chain(target, workspace, allow_leaf=True)
@@ -177,8 +219,10 @@ class WorkspaceService:
             return
         raise WorkspaceError("Unsupported workspace entry type.")
 
-    def build_workspace_zip(self, session_id: str) -> Path:
-        workspace, _ = self.ensure_session_directories(session_id)
+    def build_workspace_zip(
+        self, session_id: str, *, user_id: str | None = None
+    ) -> Path:
+        workspace, _ = self.ensure_session_directories(session_id, user_id=user_id)
         self.stats(workspace)
         download_dir = self.session_dir(session_id) / ".downloads"
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -219,9 +263,11 @@ class WorkspaceService:
                 self._require_limits(count, total)
         return WorkspaceStats(count, total)
 
-    def _extract_zip(self, workspace: Path, archive_path: Path) -> None:
+    def _extract_zip(
+        self, workspace: Path, archive_path: Path, session_id: str
+    ) -> None:
         existing = self.stats(workspace)
-        stage = Path(tempfile.mkdtemp(dir=self.session_dir(workspace.parent.name)))
+        stage = Path(tempfile.mkdtemp(dir=self.session_dir(session_id)))
         extracted: dict[PurePosixPath, int] = {}
         overwritten_size = 0
         try:

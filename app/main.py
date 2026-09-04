@@ -43,7 +43,11 @@ def create_app(
     workspace = WorkspaceService(effective_settings)
     console = ConsoleRecorder(database)
     events = EventHub(console=console)
-    watcher = WorkspaceWatchManager(workspace, events)
+    watcher = WorkspaceWatchManager(
+        workspace,
+        events,
+        session_owner_resolver=database.get_session_owner_id,
+    )
     relay_tokens = RuntimeTokenRegistry()
 
     terminal_holder: list[TerminalManager] = []

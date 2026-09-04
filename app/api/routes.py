@@ -87,7 +87,7 @@ def create_session(
 ) -> SessionResponse:
     app_services = services(request)
     session = app_services.database.create_session(user.id)
-    app_services.workspace.ensure_session_directories(session.id)
+    app_services.workspace.ensure_session_directories(session.id, user_id=user.id)
     return _session_response(request, session)
 
 
@@ -325,6 +325,7 @@ async def upload_file(
             upload.file,
             archive=archive,
             relative_path=relative_path,
+            user_id=context.user.id,
         )
     except WorkspaceLimitError as error:
         raise HTTPException(status_code=413, detail=str(error)) from error
@@ -345,7 +346,9 @@ async def file_tree(
 ) -> dict[str, object]:
     try:
         tree = await run_in_threadpool(
-            services(request).workspace.tree, context.session.id
+            services(request).workspace.tree,
+            context.session.id,
+            user_id=context.user.id,
         )
     except WorkspaceError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
@@ -360,7 +363,10 @@ async def file_content(
 ) -> dict[str, str]:
     try:
         content = await run_in_threadpool(
-            services(request).workspace.read_text, context.session.id, path
+            services(request).workspace.read_text,
+            context.session.id,
+            path,
+            user_id=context.user.id,
         )
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="File not found.") from error
@@ -379,7 +385,10 @@ async def delete_path(
 ) -> dict[str, str]:
     try:
         await run_in_threadpool(
-            services(request).workspace.delete_path, context.session.id, path
+            services(request).workspace.delete_path,
+            context.session.id,
+            path,
+            user_id=context.user.id,
         )
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="File not found.") from error
@@ -399,7 +408,7 @@ async def download_file(
 ) -> FileResponse:
     try:
         target = services(request).workspace.resolve_file(
-            context.session.id, path
+            context.session.id, path, user_id=context.user.id
         )
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="File not found.") from error
@@ -417,6 +426,7 @@ async def download_workspace(
         archive = await run_in_threadpool(
             services(request).workspace.build_workspace_zip,
             context.session.id,
+            user_id=context.user.id,
         )
     except WorkspaceError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

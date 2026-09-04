@@ -647,8 +647,13 @@ class RuntimeManager:
         self, session_id: str, state: _RuntimeSession, stdin_content: str | None
     ) -> None:
         try:
+            owner_id = (
+                self._session_owner_resolver(session_id)
+                if self._session_owner_resolver is not None
+                else None
+            )
             workspace, mycode_state = self.workspace_service.ensure_session_directories(
-                session_id
+                session_id, user_id=owner_id
             )
             await self.events.publish(
                 session_id, "runtime_status", status="starting",

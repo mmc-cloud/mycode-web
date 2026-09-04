@@ -27,10 +27,12 @@ class WorkspaceWatchManager:
         events: EventHub,
         *,
         watch_factory: WatchFactory = awatch,
+        session_owner_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self.workspace = workspace
         self.events = events
         self._watch_factory = watch_factory
+        self._session_owner_resolver = session_owner_resolver
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop_events: dict[str, asyncio.Event] = {}
         self._lock = asyncio.Lock()
@@ -40,8 +42,13 @@ class WorkspaceWatchManager:
             existing = self._tasks.get(session_id)
             if existing is not None and not existing.done():
                 return
+            owner_id = (
+                self._session_owner_resolver(session_id)
+                if self._session_owner_resolver is not None
+                else None
+            )
             workspace_root, _state_root = self.workspace.ensure_session_directories(
-                session_id
+                session_id, user_id=owner_id
             )
             stop_event = asyncio.Event()
             task = asyncio.create_task(

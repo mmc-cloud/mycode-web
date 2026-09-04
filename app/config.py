@@ -171,5 +171,10 @@ class ServerSettings:
     def sessions_dir(self) -> Path:
         return self.data_dir / "sessions"
 
+    @property
+    def users_dir(self) -> Path:
+        return self.data_dir / "users"
+
     def ensure_directories(self) -> None:
+        self.users_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)

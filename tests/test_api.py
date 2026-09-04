@@ -164,7 +164,7 @@ def test_zip_upload_extracts_safe_project(tmp_path: Path) -> None:
     assert content.json()["content"] == "hello"
 
 
-def test_session_ownership_and_workspace_are_isolated(tmp_path: Path) -> None:
+def test_session_ownership_and_user_workspace_sharing(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as owner, TestClient(app) as stranger:
         session_a = owner.post(f"{API_BASE_PATH}/sessions").json()["id"]
@@ -181,10 +181,12 @@ def test_session_ownership_and_workspace_are_isolated(tmp_path: Path) -> None:
             f"{API_BASE_PATH}/sessions/{session_a}/files/content",
             params={"path": "only-a.txt"},
         ).json()["content"] == "A"
-        assert owner.get(
+        shared_file = owner.get(
             f"{API_BASE_PATH}/sessions/{session_b}/files/content",
             params={"path": "only-a.txt"},
-        ).status_code == 404
+        )
+        assert shared_file.status_code == 200
+        assert shared_file.json()["content"] == "A"
         assert stranger.get(
             f"{API_BASE_PATH}/sessions/{session_a}"
         ).status_code == 404
@@ -209,8 +211,13 @@ def test_delete_file_directory_and_session_data(tmp_path: Path) -> None:
         assert client.delete(base + "/files", params={"path": "folder"}).status_code == 200
         assert client.delete(base + "/files", params={"path": "../outside"}).status_code == 400
         session_root = app.state.services.workspace.session_dir(session_id)
+        user_id = client.cookies.get("mycode_user")
+        assert user_id is not None
+        user_workspace = app.state.services.workspace.workspace_dir(user_id)
         assert client.delete(base).status_code == 204
         assert not session_root.exists()
+        assert user_workspace.exists()
+        assert client.post(f"{API_BASE_PATH}/sessions").status_code == 201
         assert client.get(base).status_code == 404
 
 

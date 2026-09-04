@@ -7,7 +7,7 @@
 ## 核心能力
 
 - Multi-session：一个 Web User 可以创建、列出、切换和删除多个 Session。
-- Session isolation：Workspace、MyCode state、Runtime、Permission、SSE 和 Console history 按 `session_id` 隔离。
+- Session isolation：每个 Session 独立拥有 MyCode state、Runtime、Permission、SSE 和 Console history；同一 Web User 的 Session 共享一个 Workspace。
 - Warm Runtime：进入 Session 后后台预热 Sandbox 与长期运行的 `mycode agent --continue`。
 - Workspace：支持上传、文件树、文本预览、文件/目录删除以及文件和完整 Workspace 下载。
 - Workspace 自动刷新：Agent 修改文件后，页面自动刷新文件树和当前 Preview。
@@ -28,14 +28,14 @@ Browser /web/
   -> Provider
 ```
 
-每个 Session 的持久数据位于：
+用户 Workspace 与 Session 私有数据分别位于：
 
 ```text
-data/sessions/<session_id>/workspace/
+data/users/<user_id>/workspace/
 data/sessions/<session_id>/mycode_state/
 ```
 
-Sandbox 只挂载对应 Session 的这两个目录。
+Sandbox 挂载当前 Web User 的 Workspace 和当前 Session 的 `mycode_state`。不同 User 的 Workspace 路径彼此隔离；删除 Session 只删除该 Session 的私有数据，不删除 User Workspace。
 
 ## Session 与 Runtime 生命周期
 
@@ -138,7 +138,7 @@ SESSION_RETENTION_SECONDS=1209600
 SESSION_CLEANUP_INTERVAL_SECONDS=3600
 ```
 
-`SANDBOX_IDLE_TTL_SECONDS` 只回收 Runtime 进程/容器；`SESSION_RETENTION_SECONDS` 根据 SQLite `last_active_at` 删除真正过期的 Session 数据和 metadata。不要提交 `.env`。
+`SANDBOX_IDLE_TTL_SECONDS` 只回收 Runtime 进程/容器；`SESSION_RETENTION_SECONDS` 根据 User/Session 的 SQLite `last_active_at` 清理过期 Session 数据和 metadata，并仅在 User 已无 Session 且达到 retention 时删除其 Workspace。不要提交 `.env`。
 
 Runtime Pool、FIFO Queue、Runtime locks 和 SSE replay state 都是单 FastAPI 进程内状态，因此当前部署要求 `--workers 1`：
 
@@ -255,23 +255,26 @@ MYCODE_RELAY_BASE_URL_FOR_SANDBOX=http://host.docker.internal:8000/web/api/relay
 
 ```sh
 cd /opt/mycode-web
-uv run --env-file .env python -c 'from app.config import ServerSettings; s=ServerSettings(); print("data_dir=", s.data_dir); print("database=", s.database_path); print("sessions=", s.sessions_dir)'
+uv run --env-file .env python -c 'from app.config import ServerSettings; s=ServerSettings(); print("data_dir=", s.data_dir); print("database=", s.database_path); print("users=", s.users_dir); print("sessions=", s.sessions_dir)'
 ```
 
-当前代码语义是 `MYCODE_SERVER_DATA_DIR`（未设置时为服务工作目录下的 `./data`）、数据库 `<data_dir>/web-v2.sqlite3`，以及 Session 数据 `<data_dir>/sessions/<session_id>/{workspace,mycode_state}`。确认打印路径确实是旧 Web 数据后，再在服务器执行：
+当前代码语义是 `MYCODE_SERVER_DATA_DIR`（未设置时为服务工作目录下的 `./data`）、数据库 `<data_dir>/web-v2.sqlite3`、用户 Workspace `<data_dir>/users/<user_id>/workspace`，以及 Session 私有数据 `<data_dir>/sessions/<session_id>/mycode_state`。Session 删除只删除私有数据，不删除用户 Workspace；Workspace retention 也按 User 维度处理。确认打印路径确实是旧 Web 数据后，再在服务器执行：
 
 ```sh
 # 将下面两项替换为上一步确认过的真实输出路径。
 DATA_DIR=/path/from-the-command
 DB="$DATA_DIR/web-v2.sqlite3"
+USERS="$DATA_DIR/users"
 SESSIONS="$DATA_DIR/sessions"
-test -f "$DB" && test -d "$SESSIONS"
+test -f "$DB" && test -d "$SESSIONS" && test -d "$USERS"
 
 sudo systemctl stop mycode-web
-# 可选但建议：先备份 "$DB" 和 "$SESSIONS"。
+# 可选但建议：先备份 "$DB"、"$SESSIONS" 和 "$USERS"。
 sudo cp -a "$DB" "$DB.phase2-backup"
+sudo cp -a "$USERS" "$USERS.phase2-backup"
 sudo rm -f "$DB"
 sudo rm -rf "$SESSIONS"
+sudo rm -rf "$USERS"
 sudo systemctl start mycode-web
 ```
 

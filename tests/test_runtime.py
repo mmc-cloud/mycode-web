@@ -181,6 +181,38 @@ def test_runtime_writes_multiline_browser_message_once(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_same_user_runtimes_share_workspace_but_keep_state_private(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), sandbox_max_active=2)
+        owners = {"session-a": "user-a", "session-b": "user-a"}
+        launch_paths: list[tuple[Path, Path]] = []
+
+        class RecordingLauncher(FakeLauncher):
+            async def launch(
+                self, session_id: str, workspace: Path, mycode_state: Path
+            ):
+                launch_paths.append((workspace, mycode_state))
+                return await super().launch(session_id, workspace, mycode_state)
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=RecordingLauncher(),
+            session_owner_resolver=owners.get,
+        )
+
+        assert await manager.send_message("session-a", "one") == "running"
+        assert await manager.send_message("session-b", "two") == "running"
+        assert launch_paths[0][0] == launch_paths[1][0]
+        assert launch_paths[0][1] != launch_paths[1][1]
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_activate_is_async_idempotent_and_message_waits_same_runtime(
     tmp_path: Path,
 ) -> None:

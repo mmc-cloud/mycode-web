@@ -49,6 +49,10 @@ class SessionLifecycleService:
         for session_id in session_ids:
             if await self.delete_session(session_id):
                 removed.append(session_id)
+        for user_id in self.database.inactive_user_ids(cutoff.isoformat()):
+            if self.database.list_sessions(user_id):
+                continue
+            await asyncio.to_thread(self.workspace.delete_user_workspace, user_id)
         return tuple(removed)
 
     async def run_cleanup_loop(self) -> None:

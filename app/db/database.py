@@ -128,6 +128,10 @@ class WebDatabase:
                 "VALUES (?, ?, NULL, ?, ?)",
                 (session_id, user_id, now, now),
             )
+            connection.execute(
+                "UPDATE web_users SET last_active_at = ? WHERE id = ?",
+                (now, user_id),
+            )
         return WebSession(session_id, user_id, None, now, now)
 
     def update_session_name(
@@ -149,6 +153,10 @@ class WebDatabase:
                 "SELECT * FROM web_sessions WHERE id = ? AND user_id = ?",
                 (session_id, user_id),
             ).fetchone()
+            connection.execute(
+                "UPDATE web_users SET last_active_at = ? WHERE id = ?",
+                (now, user_id),
+            )
         return _session_from_row(row)
 
     def list_sessions(self, user_id: str) -> tuple[WebSession, ...]:
@@ -199,11 +207,25 @@ class WebDatabase:
                 "UPDATE web_sessions SET last_active_at = ? WHERE id = ?",
                 (timestamp, session_id),
             )
+            connection.execute(
+                "UPDATE web_users SET last_active_at = ? "
+                "WHERE id = (SELECT user_id FROM web_sessions WHERE id = ?)",
+                (timestamp, session_id),
+            )
 
     def inactive_session_ids(self, cutoff: str) -> tuple[str, ...]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 "SELECT id FROM web_sessions "
+                "WHERE last_active_at < ? ORDER BY last_active_at, id",
+                (cutoff,),
+            ).fetchall()
+        return tuple(row["id"] for row in rows)
+
+    def inactive_user_ids(self, cutoff: str) -> tuple[str, ...]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM web_users "
                 "WHERE last_active_at < ? ORDER BY last_active_at, id",
                 (cutoff,),
             ).fetchall()
