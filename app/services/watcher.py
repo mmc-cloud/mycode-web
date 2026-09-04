@@ -47,6 +47,8 @@ class WorkspaceWatchManager:
                 if self._session_owner_resolver is not None
                 else None
             )
+            if self._session_owner_resolver is not None and owner_id is None:
+                raise RuntimeError("Session owner no longer exists.")
             workspace_root, _state_root = self.workspace.ensure_session_directories(
                 session_id, user_id=owner_id
             )

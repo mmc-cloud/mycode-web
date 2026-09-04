@@ -57,9 +57,16 @@ def test_sessions_for_one_user_share_workspace_but_not_mycode_state(
     assert workspace_a == workspace_b == workspace_service.workspace_dir("user-a")
     assert state_a != state_b
     (workspace_a / "shared.txt").write_text("shared", encoding="utf-8")
+    (workspace_a / ".mycode").mkdir()
+    (workspace_a / ".mycode" / "mcp.json").write_text(
+        '{"shared": true}', encoding="utf-8"
+    )
     assert workspace_service.read_text(
         "session-b", "shared.txt", user_id="user-a"
     ) == "shared"
+    assert workspace_service.read_text(
+        "session-b", ".mycode/mcp.json", user_id="user-a"
+    ) == '{"shared": true}'
 
 
 def test_different_users_have_isolated_workspaces(tmp_path: Path) -> None:

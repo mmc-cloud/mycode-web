@@ -206,6 +206,11 @@ def test_delete_file_directory_and_session_data(tmp_path: Path) -> None:
                 data={"archive": "false", "relative_path": path},
                 files={"upload": (Path(path).name, b"content", "text/plain")},
             )
+        client.post(
+            base + "/files/upload",
+            data={"archive": "false", "relative_path": "persistent.txt"},
+            files={"upload": ("persistent.txt", b"persist", "text/plain")},
+        )
 
         assert client.delete(base + "/files", params={"path": "one.txt"}).status_code == 200
         assert client.delete(base + "/files", params={"path": "folder"}).status_code == 200
@@ -217,7 +222,11 @@ def test_delete_file_directory_and_session_data(tmp_path: Path) -> None:
         assert client.delete(base).status_code == 204
         assert not session_root.exists()
         assert user_workspace.exists()
-        assert client.post(f"{API_BASE_PATH}/sessions").status_code == 201
+        new_session = client.post(f"{API_BASE_PATH}/sessions").json()
+        assert client.get(
+            f"{API_BASE_PATH}/sessions/{new_session['id']}/files/content",
+            params={"path": "persistent.txt"},
+        ).json()["content"] == "persist"
         assert client.get(base).status_code == 404
 
 

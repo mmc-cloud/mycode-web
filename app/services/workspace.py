@@ -51,7 +51,11 @@ class WorkspaceService:
         return path
 
     def user_dir(self, user_id: str) -> Path:
-        if not user_id or any(character in user_id for character in "/\\"):
+        if (
+            not user_id
+            or user_id in {".", ".."}
+            or any(character in user_id for character in "/\\")
+        ):
             raise WorkspaceError("Invalid user identifier.")
         path = (self.settings.users_dir / user_id).resolve()
         _require_within(path, self.settings.users_dir.resolve())

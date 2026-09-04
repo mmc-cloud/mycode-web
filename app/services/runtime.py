@@ -652,6 +652,8 @@ class RuntimeManager:
                 if self._session_owner_resolver is not None
                 else None
             )
+            if self._session_owner_resolver is not None and owner_id is None:
+                raise RuntimeUnavailableError("Session owner no longer exists.")
             workspace, mycode_state = self.workspace_service.ensure_session_directories(
                 session_id, user_id=owner_id
             )
