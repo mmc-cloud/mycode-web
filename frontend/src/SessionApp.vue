@@ -116,11 +116,38 @@ async function initialize() {
     const result = await request("/sessions")
     displayName.value = result.display_name || ""
     sessions.value = result.sessions
-    if (!sessions.value.length) sessions.value = [await request("/sessions", { method: "POST" })]
+    if (!sessions.value.length && !result.has_created_session) {
+      sessions.value = [await request("/sessions", { method: "POST" })]
+    }
+    if (!sessions.value.length) {
+      clearCurrentSession()
+      return
+    }
     const requested = new URLSearchParams(window.location.search).get("session")
     const target = sessions.value.find((item) => item.id === requested) || sessions.value[0]
     await openSession(target.id, true)
   } catch (reason) { showError(reason) }
+}
+
+function clearCurrentSession(replace = true) {
+  generation += 1
+  eventSource?.close()
+  eventSource = null
+  if (workspaceTimer) window.clearTimeout(workspaceTimer)
+  workspaceTimer = null
+  currentSession.value = null
+  entries.value = []
+  selectedPath.value = ""
+  fileContent.value = ""
+  consoleEvents.value = []
+  liveConsole.value = null
+  permission.value = null
+  turnStates.value = {}
+  expandedGroups.value = {}
+  sessionMenuId.value = null
+  const url = new URL(window.location.href)
+  url.searchParams.delete("session")
+  window.history[replace ? "replaceState" : "pushState"]({}, "", url)
 }
 
 async function openSession(sessionId, replace = false) {
@@ -201,12 +228,16 @@ async function renameSession(session) {
 
 async function removeSession(session) {
   sessionMenuId.value = null
-  if (!window.confirm("确认删除这个会话？Workspace、MyCode state 和 Console history 将一并删除。")) return
+  const title = sessionLabel(session)
+  if (!window.confirm(`确认删除会话“${title}”吗？\n该会话的聊天记录、运行状态和 Terminal 状态将被删除。\n项目 Workspace 文件不会受到影响。`)) return
   try {
     await request(scoped("", session.id), { method: "DELETE" })
     sessions.value = sessions.value.filter((item) => item.id !== session.id)
     if (currentSession.value?.id !== session.id) return
-    if (!sessions.value.length) sessions.value = [await request("/sessions", { method: "POST" })]
+    if (!sessions.value.length) {
+      clearCurrentSession()
+      return
+    }
     await openSession(sessions.value[0].id, true)
   } catch (reason) { showError(reason) }
 }
@@ -406,9 +437,7 @@ function showError(reason) {
 }
 
 function sessionLabel(session) {
-  if (session.name) return session.name
-  const index = sessions.value.findIndex((item) => item.id === session.id)
-  return `Session ${index < 0 ? "" : sessions.value.length - index}`
+  return session.name || "Session"
 }
 
 function handleHistoryNavigation() {
@@ -658,6 +687,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
           <div class="panel-actions"><button v-if="!layout.workspaceCollapsed" class="secondary compact-button" @click="refreshTree()">↻</button><button class="icon-button" :title="layout.workspaceCollapsed ? '展开 Workspace' : '折叠 Workspace'" @click="togglePanel('workspace')">{{ layout.workspaceCollapsed ? '›' : '‹' }}</button></div>
         </div>
         <template v-if="!layout.workspaceCollapsed">
+          <template v-if="currentSession">
           <div class="workspace-toolbar">
             <label class="button-label">Upload<input type="file" @change="upload($event, false)" /></label>
             <label class="button-label secondary">ZIP<input type="file" accept=".zip" @change="upload($event, true)" /></label>
@@ -668,13 +698,18 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
             <div class="splitter horizontal inner workspace-splitter" title="拖动调整 File Tree 高度" @pointerdown="startResize('workspaceTree', $event)" />
             <article class="preview"><div class="preview-title"><span>{{ selectedPath || "选择一个文本文件" }}</span><a v-if="selectedPath" :href="`${API_BASE}${scoped('/files/download')}?path=${encodeURIComponent(selectedPath)}`">Download</a></div><pre>{{ fileContent }}</pre></article>
           </div>
+          </template>
+          <div v-else class="workspace-empty-state">
+            <strong>No session selected</strong>
+            <p>创建一个 Session 后即可开始使用 Workspace。</p>
+          </div>
         </template>
       </section>
       <div class="splitter vertical" title="拖动调整 Workspace 宽度" @pointerdown="startResize('workspace', $event)" />
 
       <section class="panel agent-panel">
         <div class="panel-heading agent-heading"><div><p class="eyebrow">AGENT</p><h2>Agent</h2><small>{{ currentSession ? sessionLabel(currentSession) : "" }} · {{ currentSession?.runtime_status || "stopped" }}</small></div></div>
-        <div ref="outputElement" class="console-history">
+        <div v-if="currentSession" ref="outputElement" class="console-history">
           <section v-for="group in executionGroups" :key="group.key" class="execution-group">
             <article v-if="group.user" class="console-card user-card"><strong>You</strong><pre>{{ group.user.content }}</pre></article>
             <button class="execution-header" @click="toggleGroup(group)"><span>{{ group.expanded ? '▼' : '▶' }} 执行过程</span><span>{{ group.summary }}</span></button>
@@ -689,15 +724,20 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
           </section>
           <p v-if="!executionGroups.length" class="muted">等待 Agent 输出…</p>
         </div>
+        <div v-else class="session-empty-state">
+          <strong>No session selected</strong>
+          <p>Create a session to start working with MyCode.</p>
+          <button @click="createSession">New Session</button>
+        </div>
         <p v-if="currentSession?.runtime_status === 'queued'" class="queue-notice">当前 Sandbox 已满，正在排队</p>
-        <form class="composer" @submit.prevent="sendMessage"><textarea v-model="message" rows="3" placeholder="告诉 MyCode 要完成什么…" @keydown.ctrl.enter="sendMessage" /><button type="submit" :disabled="sendDisabled">Send</button></form>
+        <form v-if="currentSession" class="composer" @submit.prevent="sendMessage"><textarea v-model="message" rows="3" placeholder="告诉 MyCode 要完成什么…" @keydown.ctrl.enter="sendMessage" /><button type="submit" :disabled="sendDisabled">Send</button></form>
       </section>
     </section>
 
     <div class="splitter horizontal terminal-splitter" title="拖动调整 Terminal 高度" @pointerdown="startResize('terminal', $event)" />
     <section class="panel terminal-drawer" :class="{ collapsed: layout.terminalCollapsed }">
       <div class="panel-heading terminal-heading" @click="layout.terminalCollapsed && togglePanel('terminal')"><div><p class="eyebrow">TERMINAL</p><h2>Terminal <small>{{ layout.terminalCollapsed ? '▲' : '▼' }}</small></h2></div><button class="icon-button" :title="layout.terminalCollapsed ? '展开 Terminal' : '折叠 Terminal'" @click.stop="togglePanel('terminal')">{{ layout.terminalCollapsed ? '▲' : '▼' }}</button></div>
-      <TerminalPanel v-if="!layout.terminalCollapsed" :session-id="currentSession?.id || ''" :collapsed="layout.terminalCollapsed" />
+      <TerminalPanel v-if="!layout.terminalCollapsed && currentSession" :session-id="currentSession.id" :collapsed="layout.terminalCollapsed" />
     </section>
   </main>
 </template>

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 from threading import RLock
@@ -15,6 +16,7 @@ class WebUser:
     display_name: str | None
     created_at: str
     last_active_at: str
+    has_created_session: bool
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class ConsoleEvent:
 
 CONSOLE_HISTORY_LIMIT = 500
 CONSOLE_EVENT_MAX_CHARS = 64_000
+DEFAULT_SESSION_NAME_PATTERN = re.compile(r"^Session ([1-9][0-9]*)$")
 
 
 class WebDatabase:
@@ -56,7 +59,8 @@ class WebDatabase:
                     id TEXT PRIMARY KEY,
                     display_name TEXT,
                     created_at TEXT NOT NULL,
-                    last_active_at TEXT NOT NULL
+                    last_active_at TEXT NOT NULL,
+                    has_created_session INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS web_sessions (
                     id TEXT PRIMARY KEY,
@@ -81,12 +85,28 @@ class WebDatabase:
                     ON console_events(session_id, id DESC);
                 """
             )
+            user_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(web_users)")
+            }
+            if "has_created_session" not in user_columns:
+                connection.execute(
+                    "ALTER TABLE web_users ADD COLUMN "
+                    "has_created_session INTEGER NOT NULL DEFAULT 0"
+                )
             columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(web_sessions)")
             }
             if "name" not in columns:
                 connection.execute("ALTER TABLE web_sessions ADD COLUMN name TEXT")
+            connection.execute(
+                "UPDATE web_users SET has_created_session = 1 "
+                "WHERE EXISTS ("
+                "SELECT 1 FROM web_sessions WHERE web_sessions.user_id = web_users.id"
+                ")"
+            )
+            _backfill_default_session_names(connection)
 
     def get_user(self, user_id: str | None) -> WebUser | None:
         if not user_id:
@@ -113,26 +133,38 @@ class WebDatabase:
 
             user_id = secrets.token_urlsafe(32)
             connection.execute(
-                "INSERT INTO web_users VALUES (?, NULL, ?, ?)",
+                "INSERT INTO web_users "
+                "(id, display_name, created_at, last_active_at, has_created_session) "
+                "VALUES (?, NULL, ?, ?, 0)",
                 (user_id, now, now),
             )
-            return WebUser(user_id, None, now, now), True
+            return WebUser(user_id, None, now, now, False), True
 
     def create_session(self, user_id: str) -> WebSession:
         now = _utc_now()
         with self._lock, self._connect() as connection:
             session_id = secrets.token_urlsafe(24)
+            names = connection.execute(
+                "SELECT name FROM web_sessions WHERE user_id = ?", (user_id,)
+            ).fetchall()
+            used_numbers = {
+                number
+                for row in names
+                if (number := _default_session_number(row["name"])) is not None
+            }
+            session_name = _next_default_session_name(used_numbers)
             connection.execute(
                 "INSERT INTO web_sessions "
                 "(id, user_id, name, created_at, last_active_at) "
-                "VALUES (?, ?, NULL, ?, ?)",
-                (session_id, user_id, now, now),
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, user_id, session_name, now, now),
             )
             connection.execute(
-                "UPDATE web_users SET last_active_at = ? WHERE id = ?",
+                "UPDATE web_users SET last_active_at = ?, has_created_session = 1 "
+                "WHERE id = ?",
                 (now, user_id),
             )
-        return WebSession(session_id, user_id, None, now, now)
+        return WebSession(session_id, user_id, session_name, now, now)
 
     def update_session_name(
         self, session_id: str, user_id: str, name: str
@@ -359,6 +391,11 @@ def _user_from_row(
         display_name=row["display_name"],
         created_at=row["created_at"],
         last_active_at=last_active_at or row["last_active_at"],
+        has_created_session=(
+            bool(row["has_created_session"])
+            if "has_created_session" in row.keys()
+            else False
+        ),
     )
 
 
@@ -383,3 +420,39 @@ def _console_event_from_row(row: sqlite3.Row) -> ConsoleEvent:
         data=json.loads(row["data_json"]),
         created_at=row["created_at"],
     )
+
+
+def _default_session_number(name: str | None) -> int | None:
+    if not name:
+        return None
+    match = DEFAULT_SESSION_NAME_PATTERN.fullmatch(name)
+    return None if match is None else int(match.group(1))
+
+
+def _next_default_session_name(used_numbers: set[int]) -> str:
+    number = 1
+    while number in used_numbers:
+        number += 1
+    return f"Session {number}"
+
+
+def _backfill_default_session_names(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT id, user_id, name FROM web_sessions "
+        "ORDER BY user_id, created_at, id"
+    ).fetchall()
+    used_by_user: dict[str, set[int]] = {}
+    for row in rows:
+        number = _default_session_number(row["name"])
+        if number is not None:
+            used_by_user.setdefault(row["user_id"], set()).add(number)
+    for row in rows:
+        if row["name"] is not None:
+            continue
+        used_numbers = used_by_user.setdefault(row["user_id"], set())
+        session_name = _next_default_session_name(used_numbers)
+        used_numbers.add(_default_session_number(session_name) or 0)
+        connection.execute(
+            "UPDATE web_sessions SET name = ? WHERE id = ?",
+            (session_name, row["id"]),
+        )

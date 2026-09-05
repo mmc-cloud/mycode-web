@@ -64,6 +64,84 @@ def test_cookie_user_can_create_and_list_multiple_sessions(tmp_path: Path) -> No
         assert "Path=/web" in cookie
 
 
+def test_session_names_are_persistent_and_reuse_smallest_available_number(
+    tmp_path: Path,
+) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        first = client.post(f"{API_BASE_PATH}/sessions").json()
+        second = client.post(f"{API_BASE_PATH}/sessions").json()
+        third = client.post(f"{API_BASE_PATH}/sessions").json()
+        assert [first["name"], second["name"], third["name"]] == [
+            "Session 1", "Session 2", "Session 3"
+        ]
+
+        assert client.delete(
+            f"{API_BASE_PATH}/sessions/{first['id']}"
+        ).status_code == 204
+        listed = client.get(f"{API_BASE_PATH}/sessions").json()["sessions"]
+        assert {item["id"]: item["name"] for item in listed} == {
+            second["id"]: "Session 2",
+            third["id"]: "Session 3",
+        }
+
+        reused = client.post(f"{API_BASE_PATH}/sessions").json()
+
+    assert reused["name"] == "Session 1"
+
+
+def test_session_name_allocator_respects_renames_and_strict_default_pattern(
+    tmp_path: Path,
+) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        first = client.post(f"{API_BASE_PATH}/sessions").json()
+        review = client.post(f"{API_BASE_PATH}/sessions").json()
+        renamed = client.patch(
+            f"{API_BASE_PATH}/sessions/{review['id']}",
+            json={"name": "Review"},
+        ).json()
+        assert renamed["name"] == "Review"
+
+        second = client.post(f"{API_BASE_PATH}/sessions").json()
+        assert second["name"] == "Session 2"
+        client.patch(
+            f"{API_BASE_PATH}/sessions/{review['id']}",
+            json={"name": "Session 2"},
+        )
+        third = client.post(f"{API_BASE_PATH}/sessions").json()
+        assert third["name"] == "Session 3"
+
+        client.patch(
+            f"{API_BASE_PATH}/sessions/{first['id']}",
+            json={"name": "Session 01"},
+        )
+        fourth = client.post(f"{API_BASE_PATH}/sessions").json()
+
+    assert fourth["name"] == "Session 1"
+
+
+def test_session_list_distinguishes_new_user_from_deleted_sessions(
+    tmp_path: Path,
+) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        initial = client.get(f"{API_BASE_PATH}/sessions").json()
+        session_id = initial["sessions"][0]["id"] if initial["sessions"] else None
+        assert initial["has_created_session"] is False
+
+        created = client.post(f"{API_BASE_PATH}/sessions").json()
+        session_id = created["id"]
+        assert client.delete(
+            f"{API_BASE_PATH}/sessions/{session_id}"
+        ).status_code == 204
+        after_delete = client.get(f"{API_BASE_PATH}/sessions").json()
+
+    assert session_id == created["id"]
+    assert after_delete["sessions"] == []
+    assert after_delete["has_created_session"] is True
+
+
 def test_legacy_mycode_api_path_is_not_registered(tmp_path: Path) -> None:
     app = create_test_app(tmp_path)
     with TestClient(app) as client:

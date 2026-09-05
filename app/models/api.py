@@ -34,6 +34,7 @@ class SessionResponse(BaseModel):
 class SessionListResponse(BaseModel):
     display_name: str | None
     sessions: list[SessionResponse]
+    has_created_session: bool = False
 
 
 class ConsoleEventResponse(BaseModel):

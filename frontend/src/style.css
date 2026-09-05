@@ -128,6 +128,8 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 .button-label, .button-link { padding: 0.35rem 0.55rem; font-size: 0.72rem; }
 .button-label input { display: none; }
 .workspace-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(120px, var(--workspace-tree-height)) 8px minmax(120px, 1fr); min-height: 0; flex: 1; }
+.workspace-empty-state, .session-empty-state { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.35rem; padding: 1.2rem; text-align: center; color: #536257; }
+.workspace-empty-state p, .session-empty-state p { margin: 0; font-size: 0.78rem; }
 .tree-pane { grid-column: 1; grid-row: 1; }
 .workspace-splitter { grid-column: 1; grid-row: 2; }
 .preview { grid-column: 1; grid-row: 3; }

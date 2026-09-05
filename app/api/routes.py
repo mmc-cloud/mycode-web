@@ -73,6 +73,7 @@ def list_sessions(
 ) -> SessionListResponse:
     return SessionListResponse(
         display_name=user.display_name,
+        has_created_session=user.has_created_session,
         sessions=[
             _session_response(request, session)
             for session in services(request).database.list_sessions(user.id)
