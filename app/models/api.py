@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -13,8 +15,11 @@ class MessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=100_000)
 
 
+PermissionChoice = Literal["deny", "once", "task", "session"]
+
+
 class PermissionDecisionRequest(BaseModel):
-    allow: bool
+    decision: PermissionChoice
 
 
 class UserResponse(BaseModel):

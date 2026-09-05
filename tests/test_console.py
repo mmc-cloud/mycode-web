@@ -28,7 +28,13 @@ def test_console_history_is_bounded_filtered_and_session_isolated(
     assert recorder.record_event(
         session_a,
         "agent_output",
-        {"content": "permission> write_file 需要确认\n是否批准？[y/N] "},
+        {
+            "content": (
+                "permission> write_file 需要确认\n"
+                "是否批准？[y/yes 本次 | t/task 当前任务 | "
+                "s/session 当前会话 | N 拒绝] "
+            )
+        },
     ) == ()
     recorder.record_event(
         session_a, "agent_output", {"content": "assistant> after permission\n"}
@@ -78,6 +84,21 @@ def test_live_output_precedes_newline_without_token_rows(tmp_path: Path) -> None
     history = database.console_history(session_id, user_id)
     assert len(history) == 1
     assert history[0].content == "hello world"
+
+
+def test_console_permission_resolution_keeps_decision_scope(tmp_path: Path) -> None:
+    database, session_id, user_id = make_database(tmp_path)
+    recorder = ConsoleRecorder(database)
+
+    recorded = recorder.record_event(
+        session_id,
+        "permission_resolved",
+        {"decision": "task", "allowed": True},
+    )
+
+    assert recorded[0].content == "已允许（当前任务）"
+    history = database.console_history(session_id, user_id)
+    assert history[0].data == {"decision": "task", "allowed": True}
 
 
 def test_event_hub_sends_live_console_before_persisting_line(tmp_path: Path) -> None:

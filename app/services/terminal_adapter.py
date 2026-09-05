@@ -2,7 +2,10 @@ from dataclasses import dataclass
 
 
 USER_PROMPT = "you> "
-PERMISSION_PROMPT = "是否批准？[y/N] "
+PERMISSION_PROMPT = (
+    "是否批准？[y/yes 本次 | t/task 当前任务 | "
+    "s/session 当前会话 | N 拒绝] "
+)
 
 
 @dataclass(frozen=True)

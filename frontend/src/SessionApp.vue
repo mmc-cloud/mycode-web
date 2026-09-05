@@ -417,12 +417,12 @@ async function sendMessage() {
   } catch (reason) { showError(reason) }
 }
 
-async function resolvePermission(allow) {
+async function resolvePermission(decision) {
   try {
     await request(scoped("/permission"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allow }),
+      body: JSON.stringify({ decision }),
     })
   } catch (reason) { showError(reason) }
 }
@@ -715,7 +715,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
             <button class="execution-header" @click="toggleGroup(group)"><span>{{ group.expanded ? '▼' : '▶' }} 执行过程</span><span>{{ group.summary }}</span></button>
             <div v-show="group.expanded" class="execution-content">
               <details v-for="step in group.tools" :key="step.id" class="execution-step"><summary><span class="step-icon">✓</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></summary><pre>{{ step.detail }}</pre><pre v-if="Object.keys(step.data).length" class="step-data">{{ JSON.stringify(step.data, null, 2) }}</pre></details>
-              <div v-for="step in group.permissions" :key="step.id" class="permission-step" :data-status="step.status"><div><span class="step-icon">{{ step.status === 'waiting' ? '●' : step.status === 'allowed' ? '✓' : '!' }}</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></div><p>{{ step.detail }}</p><dl v-if="Object.keys(step.data).length"><template v-for="(value, key) in step.data" :key="key"><template v-if="key !== 'turn_id'"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></template></dl><div v-if="step.status === 'waiting' && group.pendingPermission" class="permission-actions"><button class="danger" @click="resolvePermission(false)">拒绝</button><button @click="resolvePermission(true)">允许</button></div></div>
+              <div v-for="step in group.permissions" :key="step.id" class="permission-step" :data-status="step.status"><div><span class="step-icon">{{ step.status === 'waiting' ? '●' : step.status === 'allowed' ? '✓' : '!' }}</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></div><p>{{ step.detail }}</p><dl v-if="Object.keys(step.data).length"><template v-for="(value, key) in step.data" :key="key"><template v-if="key !== 'turn_id'"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></template></dl><div v-if="step.status === 'waiting' && group.pendingPermission" class="permission-actions"><button class="danger" title="拒绝此次操作" @click="resolvePermission('deny')">拒绝</button><button title="仅批准当前这一次操作" @click="resolvePermission('once')">仅本次</button><button title="本次 Agent 任务内后续需要确认的操作自动批准" @click="resolvePermission('task')">当前任务</button><button title="当前运行会话内后续需要确认的操作自动批准；Runtime 重启后失效" @click="resolvePermission('session')">当前会话</button></div></div>
               <article v-for="event in group.errors" :key="`error-${event.id}`" class="console-card error-card"><strong>Error</strong><pre>{{ event.content }}</pre></article>
               <article v-if="group.live && group.live.kind !== 'assistant'" class="console-card live-card" :data-kind="group.live.kind"><strong>{{ group.live.kind }}</strong><pre>{{ group.live.content }}</pre></article>
             </div>

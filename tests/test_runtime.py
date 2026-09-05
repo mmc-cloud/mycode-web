@@ -20,6 +20,12 @@ from app.services.runtime import (
 from app.services.workspace import WorkspaceService
 
 
+SCOPED_PERMISSION_PROMPT = (
+    "是否批准？[y/yes 本次 | t/task 当前任务 | "
+    "s/session 当前会话 | N 拒绝] "
+)
+
+
 class FakeStdout:
     def __init__(self) -> None:
         self.queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -320,30 +326,72 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         assert launcher.calls == 1
 
         await launcher.process.stdout.feed(
-            "permission> run_command 需要确认\nreason> risky\n是否批准？[y/N] ".encode()
+            f"permission> run_command 需要确认\nreason> risky\n{SCOPED_PERMISSION_PROMPT}".encode()
         )
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        await manager.resolve_permission("session", True)
+        await manager.resolve_permission("session", "once")
         assert launcher.process.stdin.writes[-1] == b"y\n"
         assert manager.status("session") == "running"
+        resolved = [
+            event
+            for event in events.history("session")
+            if event.type == "permission_resolved"
+        ][-1]
+        assert resolved.data["decision"] == "once"
+        assert resolved.data["allowed"] is True
         assert [event.type for event in events.history("session")][-2:] == [
             "permission_resolved",
             "runtime_status",
         ]
         assert events.history("session")[-1].data == {"status": "running"}
         await launcher.process.stdout.feed(
-            "permission> write_file 需要确认\nreason> write\n是否批准？[y/N] ".encode()
+            f"permission> write_file 需要确认\nreason> write\n{SCOPED_PERMISSION_PROMPT}".encode()
         )
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        await manager.resolve_permission("session", False)
+        await manager.resolve_permission("session", "deny")
         assert launcher.process.stdin.writes[-1] == b"n\n"
         assert manager.status("session") == "running"
+        resolved = [
+            event
+            for event in events.history("session")
+            if event.type == "permission_resolved"
+        ][-1]
+        assert resolved.data["decision"] == "deny"
+        assert resolved.data["allowed"] is False
         assert [event.type for event in events.history("session")][-2:] == [
             "permission_resolved",
             "runtime_status",
         ]
+        await launcher.process.stdout.feed(
+            f"permission> run_command 需要确认\nreason> task\n{SCOPED_PERMISSION_PROMPT}".encode()
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await manager.resolve_permission("session", "task")
+        assert launcher.process.stdin.writes[-1] == b"t\n"
+        resolved = [
+            event
+            for event in events.history("session")
+            if event.type == "permission_resolved"
+        ][-1]
+        assert resolved.data["decision"] == "task"
+        assert resolved.data["allowed"] is True
+        await launcher.process.stdout.feed(
+            f"permission> run_command 需要确认\nreason> session\n{SCOPED_PERMISSION_PROMPT}".encode()
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await manager.resolve_permission("session", "session")
+        assert launcher.process.stdin.writes[-1] == b"s\n"
+        resolved = [
+            event
+            for event in events.history("session")
+            if event.type == "permission_resolved"
+        ][-1]
+        assert resolved.data["decision"] == "session"
+        assert resolved.data["allowed"] is True
         assert any(event.type == "permission_request" for event in events.history("session"))
         assert any(event.type == "permission_resolved" for event in events.history("session"))
         await manager.shutdown()
@@ -361,15 +409,15 @@ def test_permission_is_strictly_bound_to_its_session(tmp_path: Path) -> None:
         await manager.send_message("a", "task a")
         await manager.send_message("b", "task b")
         await launcher.by_session["a"][0].stdout.feed(
-            "permission> write_file 需要确认\n是否批准？[y/N] ".encode()
+            f"permission> write_file 需要确认\n{SCOPED_PERMISSION_PROMPT}".encode()
         )
         await wait_for_status(manager, "a", "waiting_permission")
         assert manager.pending_permission("a") is not None
         assert manager.pending_permission("b") is None
         with pytest.raises(RuntimeConflictError, match="no pending permission"):
-            await manager.resolve_permission("b", True)
+            await manager.resolve_permission("b", "once")
         assert launcher.by_session["b"][0].stdin.writes == [b"task b\n"]
-        await manager.resolve_permission("a", False)
+        await manager.resolve_permission("a", "deny")
         assert launcher.by_session["a"][0].stdin.writes[-1] == b"n\n"
         await manager.shutdown()
 
@@ -1152,7 +1200,7 @@ def test_waiting_permission_expires_and_clears_pending_state(
         )
         await manager.send_message("session", "task")
         await launcher.process.stdout.feed(
-            "permission> run_command 需要确认\n是否批准？[y/N] ".encode()
+            f"permission> run_command 需要确认\n{SCOPED_PERMISSION_PROMPT}".encode()
         )
         await wait_for_status(manager, "session", "waiting_permission")
         clock.advance(10)
@@ -1164,7 +1212,7 @@ def test_waiting_permission_expires_and_clears_pending_state(
             for event in events.history("session")
         )
         with pytest.raises(RuntimeConflictError):
-            await manager.resolve_permission("session", True)
+            await manager.resolve_permission("session", "once")
         await manager.shutdown()
 
     asyncio.run(scenario())

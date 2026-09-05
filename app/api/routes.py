@@ -300,7 +300,7 @@ async def permission(
 ) -> dict[str, str]:
     try:
         await services(request).runtime.resolve_permission(
-            context.session.id, payload.allow
+            context.session.id, payload.decision
         )
     except RuntimeConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error

@@ -19,7 +19,10 @@ _PERMISSION_PREFIXES = (
     "path_scope> ", "cwd_scope> ", "command_risk_category> ",
     "command_risk_reason> ",
 )
-_PERMISSION_PROMPT = "是否批准？[y/N] "
+_PERMISSION_PROMPT = (
+    "是否批准？[y/yes 本次 | t/task 当前任务 | "
+    "s/session 当前会话 | N 拒绝] "
+)
 
 
 class ConsoleRecorder:
@@ -52,7 +55,16 @@ class ConsoleRecorder:
                 data=_metadata(data, turn_id),
             )
         if event_type == "permission_resolved":
-            decision = "已允许" if data.get("allowed") else "已拒绝"
+            decision_labels = {
+                "deny": "已拒绝",
+                "once": "已允许（仅本次）",
+                "task": "已允许（当前任务）",
+                "session": "已允许（当前会话）",
+            }
+            decision = decision_labels.get(
+                data.get("decision"),
+                "已允许" if data.get("allowed") else "已拒绝",
+            )
             if data.get("expired"):
                 decision = "权限请求已过期"
             return self._append(

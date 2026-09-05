@@ -64,6 +64,40 @@ def test_cookie_user_can_create_and_list_multiple_sessions(tmp_path: Path) -> No
         assert "Path=/web" in cookie
 
 
+@pytest.mark.parametrize("decision", ["deny", "once", "task", "session"])
+def test_permission_api_accepts_each_scoped_decision(
+    tmp_path: Path, decision: str
+) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        response = client.post(
+            f"{API_BASE_PATH}/sessions/{session_id}/permission",
+            json={"decision": decision},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "There is no pending permission request."
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"decision": "all"}, {"decision": "yes"}, {"allow": True}],
+)
+def test_permission_api_rejects_legacy_or_unknown_decisions(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        response = client.post(
+            f"{API_BASE_PATH}/sessions/{session_id}/permission",
+            json=payload,
+        )
+
+    assert response.status_code == 422
+
+
 def test_session_names_are_persistent_and_reuse_smallest_available_number(
     tmp_path: Path,
 ) -> None:

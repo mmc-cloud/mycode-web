@@ -130,3 +130,19 @@ def test_execution_group_completed_turns_keep_user_toggle_state() -> None:
     assert "if (ACTIVE_TURN_STATUSES.includes(previous) && status === \"idle\")" in source
     assert "expandedGroups.value[turnId] = false" in source
     assert "expandedGroups.value = {}" in source
+
+
+def test_permission_frontend_uses_scoped_decisions_and_runtime_session_hint() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "async function resolvePermission(decision)" in source
+    assert "body: JSON.stringify({ decision })" in source
+    assert "resolvePermission('deny')" in source
+    assert "resolvePermission('once')" in source
+    assert "resolvePermission('task')" in source
+    assert "resolvePermission('session')" in source
+    assert "Runtime 重启后失效" in source
+    assert "resolvePermission(false)" not in source
+    assert "resolvePermission(true)" not in source

@@ -8,7 +8,7 @@ from pathlib import Path
 import logging
 import re
 import time
-from typing import Coroutine, Protocol
+from typing import Coroutine, Literal, Protocol
 
 from app.config import ServerSettings
 from app.services.events import EventHub
@@ -20,6 +20,13 @@ from app.services.workspace import WorkspaceService
 logger = logging.getLogger(__name__)
 MANAGED_SANDBOX_LABEL = "mycode-web.managed=true"
 AGENT_USER = "mycode-agent"
+PermissionDecision = Literal["deny", "once", "task", "session"]
+PERMISSION_INPUTS: dict[PermissionDecision, str] = {
+    "deny": "n\n",
+    "once": "y\n",
+    "task": "t\n",
+    "session": "s\n",
+}
 
 
 class RuntimeConflictError(RuntimeError):
@@ -532,7 +539,13 @@ class RuntimeManager:
         await self._start_runtime(session_id, start_state, stdin_content)
         return "running"
 
-    async def resolve_permission(self, session_id: str, allow: bool) -> None:
+    async def resolve_permission(
+        self, session_id: str, decision: PermissionDecision
+    ) -> None:
+        try:
+            stdin_input = PERMISSION_INPUTS[decision]
+        except KeyError as error:
+            raise ValueError("Unsupported permission decision.") from error
         async with self._lock:
             state = self._sessions.get(session_id)
             if state is None or not state.adapter.awaiting_permission:
@@ -541,10 +554,13 @@ class RuntimeManager:
             turn_id = state.active_turn_id
             state.status = "running"
             self._touch(session_id, state)
-        await self._write(state, "y\n" if allow else "n\n")
+        await self._write(state, stdin_input)
         state.adapter.resolve_permission()
         await self.events.publish(
-            session_id, "permission_resolved", allowed=allow,
+            session_id,
+            "permission_resolved",
+            decision=decision,
+            allowed=decision != "deny",
             **permission_data,
             **_turn_payload(turn_id),
         )
@@ -574,7 +590,11 @@ class RuntimeManager:
                 permission_data = dict(state.adapter.pending_permission or {})
                 state.adapter.resolve_permission()
                 await self.events.publish(
-                    session_id, "permission_resolved", allowed=False, expired=True,
+                    session_id,
+                    "permission_resolved",
+                    decision="deny",
+                    allowed=False,
+                    expired=True,
                     **permission_data,
                     **_turn_payload(state.active_turn_id),
                 )
