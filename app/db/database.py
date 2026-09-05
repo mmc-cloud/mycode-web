@@ -231,6 +231,21 @@ class WebDatabase:
             ).fetchall()
         return tuple(row["id"] for row in rows)
 
+    def delete_user_if_inactive_without_sessions(
+        self, user_id: str, cutoff: str
+    ) -> bool:
+        """Delete only a retained user with no sessions, atomically."""
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM web_users "
+                "WHERE id = ? AND last_active_at < ? "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM web_sessions WHERE user_id = ?"
+                ")",
+                (user_id, cutoff, user_id),
+            )
+        return cursor.rowcount == 1
+
     def delete_session(self, session_id: str, *, user_id: str | None = None) -> bool:
         with self._lock, self._connect() as connection:
             if user_id is None:

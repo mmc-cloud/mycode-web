@@ -1,6 +1,7 @@
 from io import BytesIO
 from pathlib import Path
 import asyncio
+from datetime import datetime, timedelta, timezone
 import time
 import zipfile
 
@@ -228,6 +229,38 @@ def test_delete_file_directory_and_session_data(tmp_path: Path) -> None:
             params={"path": "persistent.txt"},
         ).json()["content"] == "persist"
         assert client.get(base).status_code == 404
+
+
+def test_stale_cookie_recreates_anonymous_user_after_user_cleanup(
+    tmp_path: Path,
+) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        old_user_id = client.cookies.get("mycode_user")
+        assert old_user_id is not None
+        old_workspace = app.state.services.workspace.workspace_dir(old_user_id)
+        app.state.services.database.touch_session(
+            session_id,
+            at=(datetime.now(timezone.utc) - timedelta(days=15)).isoformat(),
+        )
+
+        asyncio.run(
+            app.state.services.lifecycle.cleanup_expired_once(
+                now=datetime.now(timezone.utc)
+            )
+        )
+
+        assert app.state.services.database.get_user(old_user_id) is None
+        assert not old_workspace.exists()
+        restored = client.get(f"{API_BASE_PATH}/sessions")
+        new_user_id = client.cookies.get("mycode_user")
+        created = client.post(f"{API_BASE_PATH}/sessions")
+
+    assert restored.status_code == 200
+    assert new_user_id is not None
+    assert new_user_id != old_user_id
+    assert created.status_code == 201
 
 
 def test_console_history_api_is_owned_and_session_scoped(tmp_path: Path) -> None:

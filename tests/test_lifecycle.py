@@ -70,7 +70,31 @@ def test_expired_session_data_and_metadata_are_removed(tmp_path: Path) -> None:
         assert await lifecycle.cleanup_expired_once(now=now) == (session.id,)
         assert not workspace.session_dir(session.id).exists()
         assert not workspace.workspace_dir(user.id).exists()
+        assert database.get_user(user.id) is None
         assert database.inactive_session_ids(now.isoformat()) == ()
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_expired_user_without_sessions_loses_workspace_and_row(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        _settings, database, workspace, runtime, lifecycle = make_services(tmp_path)
+        user, _ = database.get_or_create_user(None)
+        session = database.create_session(user.id)
+        workspace_root, _ = workspace.ensure_session_directories(
+            session.id, user_id=user.id
+        )
+        (workspace_root / "expired.txt").write_text("remove", encoding="utf-8")
+        now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+        database.touch_session(session.id, at=(now - timedelta(days=15)).isoformat())
+        assert database.delete_session(session.id, user_id=user.id) is True
+
+        assert await lifecycle.cleanup_expired_once(now=now) == ()
+        assert database.get_user(user.id) is None
+        assert not workspace_root.exists()
         await runtime.shutdown()
 
     asyncio.run(scenario())
@@ -96,6 +120,25 @@ def test_recent_session_is_retained(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_user_without_sessions_and_within_retention_is_retained(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        _settings, database, workspace, runtime, lifecycle = make_services(tmp_path)
+        user, _ = database.get_or_create_user(None)
+        workspace_root = workspace.workspace_dir(user.id)
+        workspace_root.mkdir(parents=True)
+        (workspace_root / "keep.txt").write_text("keep", encoding="utf-8")
+        now = datetime.now(timezone.utc)
+
+        assert await lifecycle.cleanup_expired_once(now=now) == ()
+        assert database.get_user(user.id) is not None
+        assert workspace_root.exists()
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_expired_session_does_not_remove_workspace_with_recent_sibling(
     tmp_path: Path,
 ) -> None:
@@ -115,6 +158,7 @@ def test_expired_session_does_not_remove_workspace_with_recent_sibling(
 
         assert await lifecycle.cleanup_expired_once(now=now) == (expired.id,)
         assert database.get_session(recent.id, user.id) is not None
+        assert database.get_user(user.id) is not None
         assert workspace.workspace_dir(user.id).exists()
         assert (workspace.workspace_dir(user.id) / "shared.txt").read_text(
             encoding="utf-8"
@@ -158,6 +202,9 @@ def test_delete_session_stops_only_its_runtime_and_removes_its_state(
         assert root_a.exists()
         assert root_b.exists() and state_b.exists()
         assert database.get_session(session_b.id, user.id) == session_b
+        assert await lifecycle.delete_session(session_b.id, user_id=user.id) is True
+        assert root_b.exists()
+        assert database.get_user(user.id) is not None
         await runtime.shutdown()
 
     asyncio.run(scenario())
