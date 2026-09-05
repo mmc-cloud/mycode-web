@@ -279,7 +279,7 @@ class WorkspaceService:
                 for info in archive.infolist():
                     if _is_zip_symlink(info):
                         raise WorkspaceError("ZIP symbolic links are not allowed.")
-                    relative = _safe_zip_path(info.filename)
+                    relative = _safe_zip_path(_decode_zip_entry_filename(info))
                     if relative is None:
                         continue
                     if relative in extracted:
@@ -406,6 +406,29 @@ def _safe_zip_path(value: str) -> PurePosixPath | None:
         _safe_relative_path(normalized)
         return None
     return _safe_relative_path(normalized)
+
+
+def _decode_zip_entry_filename(info: zipfile.ZipInfo) -> str:
+    filename = info.filename
+    if info.flag_bits & 0x800:
+        return filename
+    try:
+        raw = filename.encode("cp437")
+        candidate = raw.decode("gbk")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return filename
+    if _contains_cjk(candidate) and not _contains_cjk(filename):
+        return candidate
+    return filename
+
+
+def _contains_cjk(value: str) -> bool:
+    return any(
+        "\u3400" <= character <= "\u4dbf"
+        or "\u4e00" <= character <= "\u9fff"
+        or "\uf900" <= character <= "\ufaff"
+        for character in value
+    )
 
 
 def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:

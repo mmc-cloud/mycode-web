@@ -108,6 +108,60 @@ def zip_bytes(entries: list[tuple[zipfile.ZipInfo | str, bytes]]) -> BytesIO:
     return result
 
 
+def legacy_gbk_zip_bytes(name: str, content: bytes) -> BytesIO:
+    placeholder = "legacy11.txt"
+    encoded_name = name.encode("gbk")
+    assert len(encoded_name) == len(placeholder)
+    archive = bytearray(zip_bytes([(placeholder, content)]).getvalue())
+    archive = bytearray(
+        bytes(archive).replace(placeholder.encode("ascii"), encoded_name)
+    )
+    result = BytesIO(archive)
+    result.seek(0)
+    return result
+
+
+def test_zip_upload_preserves_utf8_ascii_nested_names_and_content(
+    tmp_path: Path,
+) -> None:
+    workspace = service(tmp_path)
+    workspace.save_upload(
+        "session",
+        "names.zip",
+        zip_bytes(
+            [
+                ("src/main.py", b"print('ascii')\n"),
+                ("源码/测试.py", "print('你好')\n".encode("utf-8")),
+                ("测试1111.txt", "中文内容\n".encode("utf-8")),
+            ]
+        ),
+        archive=True,
+    )
+
+    root = workspace.workspace_dir("session")
+    assert (root / "src/main.py").read_bytes() == b"print('ascii')\n"
+    assert (root / "源码" / "测试.py").read_bytes() == "print('你好')\n".encode(
+        "utf-8"
+    )
+    assert (root / "测试1111.txt").read_bytes() == "中文内容\n".encode("utf-8")
+
+
+def test_zip_upload_decodes_legacy_gbk_filename_without_reencoding_content(
+    tmp_path: Path,
+) -> None:
+    content = "原始 UTF-8 内容\n".encode("utf-8")
+    archive = legacy_gbk_zip_bytes("测试1111.txt", content)
+    with zipfile.ZipFile(archive) as readable:
+        assert readable.infolist()[0].flag_bits & 0x800 == 0
+    archive.seek(0)
+
+    workspace = service(tmp_path)
+    workspace.save_upload("session", "legacy.zip", archive, archive=True)
+
+    extracted = workspace.workspace_dir("session") / "测试1111.txt"
+    assert extracted.read_bytes() == content
+
+
 @pytest.mark.parametrize(
     "name",
     ["../escape.txt", "/absolute.txt", "C:/windows.txt", "safe/../../escape.txt"],

@@ -81,6 +81,16 @@ def test_frontend_uses_web_base_and_protocol_aware_websocket_builder() -> None:
     assert "ws: true" in vite
 
 
+def test_workspace_zip_upload_label_explains_extraction_destination() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "Extract ZIP" in source
+    assert 'title="Upload ZIP and extract into Workspace root (/)"' in source
+    assert 'accept=".zip"' in source
+
+
 def test_terminal_clipboard_ux_uses_xterm_paste_and_cleans_listeners() -> None:
     terminal = (
         Path(__file__).resolve().parents[1] / "frontend/src/TerminalPanel.vue"

@@ -690,7 +690,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
           <template v-if="currentSession">
           <div class="workspace-toolbar">
             <label class="button-label">Upload<input type="file" @change="upload($event, false)" /></label>
-            <label class="button-label secondary">ZIP<input type="file" accept=".zip" @change="upload($event, true)" /></label>
+            <label class="button-label secondary" title="Upload ZIP and extract into Workspace root (/)" aria-label="Upload ZIP and extract into Workspace root (/)">Extract ZIP<input type="file" accept=".zip" @change="upload($event, true)" /></label>
             <a v-if="currentSession" class="button-link" :href="API_BASE + scoped('/workspace/download')">Download</a>
           </div>
           <div class="workspace-body">
