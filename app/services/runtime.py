@@ -400,17 +400,12 @@ class RuntimeManager:
                 self._prepare_start_locked(session_id, state)
                 start_state = state
             else:
-                idle = self._oldest_idle_locked()
-                if idle is not None:
-                    victim_id, victim_state = idle
-                    if not self._user_has_capacity_locked(
-                        session_id, releasing_session_id=victim_id
-                    ):
-                        return "stopped"
+                victim = self._oldest_evictable_idle_locked(session_id)
+                if victim is not None:
+                    victim_id, victim_state = victim
                     self._set_status_locked(victim_state, "stopping")
                     victim_state.stopping = True
                     self._prepare_start_locked(session_id, state)
-                    victim = (victim_id, victim_state)
                     start_state = state
                 else:
                     return "stopped"
@@ -461,21 +456,15 @@ class RuntimeManager:
                 state.active_turn_id = turn_id
                 start_state = state
             elif waiting_start_state is None:
-                idle = self._oldest_idle_locked()
-                if idle is not None:
-                    victim_id, victim_state = idle
-                    if not self._user_has_capacity_locked(
-                        session_id, releasing_session_id=victim_id
-                    ):
-                        idle = None
-                    else:
-                        self._set_status_locked(victim_state, "stopping")
-                        victim_state.stopping = True
-                        self._prepare_start_locked(session_id, state)
-                        state.active_turn_id = turn_id
-                        victim = (victim_id, victim_state)
-                        start_state = state
-                if idle is None:
+                victim = self._oldest_evictable_idle_locked(session_id)
+                if victim is not None:
+                    victim_id, victim_state = victim
+                    self._set_status_locked(victim_state, "stopping")
+                    victim_state.stopping = True
+                    self._prepare_start_locked(session_id, state)
+                    state.active_turn_id = turn_id
+                    start_state = state
+                if victim is None:
                     if len(self._queue) >= self.settings.sandbox_queue_max:
                         raise RuntimeCapacityError("The Sandbox queue is full.")
                     self._set_status_locked(state, "queued")
@@ -1118,14 +1107,21 @@ class RuntimeManager:
             cls._is_live(state) and state.status != "stopping"
         )
 
-    def _oldest_idle_locked(self) -> tuple[str, _RuntimeSession] | None:
+    def _oldest_evictable_idle_locked(
+        self, target_session_id: str
+    ) -> tuple[str, _RuntimeSession] | None:
+        """Return the oldest idle runtime whose slot can admit this session."""
         candidates = [
-            (session_id, state)
-            for session_id, state in self._sessions.items()
+            (candidate_session_id, state)
+            for candidate_session_id, state in self._sessions.items()
             if (
                 state.status == "idle"
                 and self._is_live(state)
                 and state.terminal_clients == 0
+                and self._user_has_capacity_locked(
+                    target_session_id,
+                    releasing_session_id=candidate_session_id,
+                )
             )
         ]
         return min(candidates, key=lambda item: item[1].last_activity, default=None)

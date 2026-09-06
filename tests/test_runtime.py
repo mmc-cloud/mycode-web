@@ -344,6 +344,47 @@ def test_activate_handoffs_same_user_idle_victim_immediately(
     asyncio.run(scenario())
 
 
+def test_activate_selects_oldest_eligible_idle_victim_for_target_user(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = replace(
+            settings(tmp_path), sandbox_max_active=10, sandbox_max_active_per_user=2
+        )
+        owners = {
+            "a1": "user-a", "a2": "user-a", "a3": "user-a", "b1": "user-b"
+        }
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            clock=clock,
+            session_owner_resolver=owners.get,
+        )
+
+        await manager.send_message("b1", "one")
+        await launcher.by_session["b1"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "b1", "idle")
+        clock.advance(1)
+        await manager.send_message("a1", "one")
+        await launcher.by_session["a1"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "a1", "idle")
+        await manager.send_message("a2", "two")
+
+        assert await manager.activate("a3") == "starting"
+        await wait_for_status(manager, "a3", "idle")
+        assert manager.status("a1") == "stopped"
+        assert manager.status("b1") == "idle"
+        assert manager.queued_count == 0
+
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_activate_does_not_evict_idle_victim_with_terminal_lease(
     tmp_path: Path,
 ) -> None:
@@ -759,6 +800,83 @@ def test_per_user_active_quota_does_not_block_another_user(tmp_path: Path) -> No
         assert await manager.send_message("b1", "one") == "running"
         assert manager.active_count == 3
         assert manager.queued_count == 1
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_send_message_selects_oldest_eligible_idle_victim_for_target_user(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = replace(
+            settings(tmp_path), sandbox_max_active=10, sandbox_max_active_per_user=2
+        )
+        owners = {
+            "a1": "user-a", "a2": "user-a", "a3": "user-a", "b1": "user-b"
+        }
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            clock=clock,
+            session_owner_resolver=owners.get,
+        )
+
+        await manager.send_message("b1", "one")
+        await launcher.by_session["b1"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "b1", "idle")
+        clock.advance(1)
+        await manager.send_message("a1", "one")
+        await launcher.by_session["a1"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "a1", "idle")
+        await manager.send_message("a2", "two")
+
+        assert await manager.send_message("a3", "task") == "running"
+        assert manager.status("a1") == "stopped"
+        assert manager.status("b1") == "idle"
+        assert manager.queued_count == 0
+        assert launcher.by_session["a3"][0].stdin.writes == [b"task\n"]
+
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_cross_user_idle_victim_cannot_bypass_target_user_quota(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(
+            settings(tmp_path), sandbox_max_active=10, sandbox_max_active_per_user=2
+        )
+        owners = {
+            "a1": "user-a", "a2": "user-a", "a3": "user-a", "b1": "user-b"
+        }
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            session_owner_resolver=owners.get,
+        )
+
+        await manager.send_message("a1", "one")
+        await manager.send_message("a2", "two")
+        await manager.send_message("b1", "one")
+        await launcher.by_session["b1"][0].stdout.feed(b"done\nyou> ")
+        await wait_for_status(manager, "b1", "idle")
+
+        assert await manager.activate("a3") == "stopped"
+        assert manager.status("b1") == "idle"
+        assert await manager.send_message("a3", "task") == "queued"
+        assert manager.status("b1") == "idle"
+        assert manager.queued_count == 1
+
         await manager.shutdown()
 
     asyncio.run(scenario())
