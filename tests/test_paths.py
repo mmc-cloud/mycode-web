@@ -91,6 +91,18 @@ def test_workspace_zip_upload_label_explains_extraction_destination() -> None:
     assert 'accept=".zip"' in source
 
 
+def test_frontend_send_is_disabled_only_for_an_active_agent_turn() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "Boolean(currentSession.value?.active_turn_id)" in source
+    assert (
+        "currentSession?.runtime_status === 'queued' && "
+        "currentSession?.active_turn_id"
+    ) in source
+
+
 def test_terminal_clipboard_ux_uses_xterm_paste_and_cleans_listeners() -> None:
     terminal = (
         Path(__file__).resolve().parents[1] / "frontend/src/TerminalPanel.vue"

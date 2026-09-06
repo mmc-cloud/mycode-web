@@ -90,6 +90,25 @@ class FakeRuntime:
         self.leases = max(0, self.leases - 1)
 
 
+class CapacityWaitingRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ready = asyncio.Event()
+
+    async def activate(self, session_id: str) -> str:
+        self.activations += 1
+        return self.states[session_id]
+
+    async def wait_until_ready(self, session_id: str) -> str:
+        await self.ready.wait()
+        return self.states[session_id]
+
+
+class StartupTimeoutRuntime(FakeRuntime):
+    async def wait_until_ready(self, session_id: str) -> str:
+        raise RuntimeError("Runtime did not become ready.")
+
+
 async def wait_for_status(connection, status: str) -> None:
     for _ in range(100):
         message = await asyncio.wait_for(connection.messages.get(), timeout=1)
@@ -125,6 +144,59 @@ def test_terminal_start_failure_releases_attach_reservation(tmp_path: Path) -> N
         manager = TerminalManager(
             runtime, settings, backend=FailingTerminalBackend()
         )
+
+        connection = await manager.attach("session")
+        await wait_for_status(connection, "error")
+        assert runtime.leases == 0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_capacity_wait_stays_pending_until_runtime_is_ready(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime = CapacityWaitingRuntime()
+        backend = FakeTerminalBackend()
+        settings = ServerSettings(data_dir=tmp_path / "data")
+        manager = TerminalManager(runtime, settings, backend=backend)
+
+        connection = await manager.attach("session")
+        initial = await asyncio.wait_for(connection.messages.get(), timeout=1)
+        waiting = await asyncio.wait_for(connection.messages.get(), timeout=1)
+        assert initial == {"type": "status", "status": "starting"}
+        assert waiting == {
+            "type": "status",
+            "status": "starting",
+            "message": "Waiting for Sandbox capacity.",
+        }
+        await asyncio.sleep(0.05)
+        assert not any(
+            message.get("status") == "error"
+            for message in (initial, waiting)
+            if message.get("type") == "status"
+        )
+        start_task = manager._sessions["session"].start_task
+        assert start_task is not None and not start_task.done()
+
+        runtime.states["session"] = "idle"
+        runtime.ready.set()
+        await wait_for_status(connection, "ready")
+        assert len(backend.processes) == 1
+
+        await manager.detach(connection)
+        assert runtime.leases == 0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_startup_timeout_still_reports_error(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = StartupTimeoutRuntime()
+        settings = ServerSettings(data_dir=tmp_path / "data")
+        manager = TerminalManager(runtime, settings, backend=FakeTerminalBackend())
 
         connection = await manager.attach("session")
         await wait_for_status(connection, "error")

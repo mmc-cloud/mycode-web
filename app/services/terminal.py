@@ -335,9 +335,19 @@ class TerminalManager:
         started = False
         try:
             runtime_status = await self.runtime.activate(session_id)
+            status_message = (
+                "Waiting for Sandbox capacity."
+                if runtime_status == "stopped"
+                else None
+            )
+            status_payload = {
+                "type": "status",
+                "status": _initial_terminal_status(runtime_status),
+            }
+            if status_message is not None:
+                status_payload["message"] = status_message
             await self._broadcast(
-                session_id,
-                {"type": "status", "status": _initial_terminal_status(runtime_status)},
+                session_id, status_payload,
             )
             await self.runtime.wait_until_ready(session_id)
             container_ref = self.runtime.container_ref(session_id)

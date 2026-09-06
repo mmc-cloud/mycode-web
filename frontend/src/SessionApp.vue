@@ -79,9 +79,8 @@ let generation = 0
 let resizeState = null
 
 const sendDisabled = computed(() =>
-  ["starting", "queued", "running", "waiting_permission"].includes(
-    currentSession.value?.runtime_status,
-  ),
+  Boolean(currentSession.value?.active_turn_id) &&
+  ACTIVE_TURN_STATUSES.includes(currentSession.value?.runtime_status),
 )
 const executionGroups = computed(() => buildExecutionGroups(
   consoleEvents.value,
@@ -729,7 +728,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
           <p>Create a session to start working with MyCode.</p>
           <button @click="createSession">New Session</button>
         </div>
-        <p v-if="currentSession?.runtime_status === 'queued'" class="queue-notice">当前 Sandbox 已满，正在排队</p>
+        <p v-if="currentSession?.runtime_status === 'queued' && currentSession?.active_turn_id" class="queue-notice">当前 Sandbox 已满，正在排队</p>
         <form v-if="currentSession" class="composer" @submit.prevent="sendMessage"><textarea v-model="message" rows="3" placeholder="告诉 MyCode 要完成什么…" @keydown.ctrl.enter="sendMessage" /><button type="submit" :disabled="sendDisabled">Send</button></form>
       </section>
     </section>
