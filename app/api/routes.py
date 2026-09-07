@@ -447,7 +447,7 @@ async def relay(
 ):
     app_services = services(request)
     try:
-        app_services.relay.authenticate(authorization)
+        runtime_record = app_services.relay.authenticate(authorization)
     except RelayAuthenticationError:
         raise HTTPException(status_code=401, detail="Relay authentication failed.")
     if relay_path != "chat/completions":
@@ -457,6 +457,7 @@ async def relay(
             relay_path,
             await request.body(),
             request.headers.get("content-type"),
+            session_id=runtime_record.session_id,
         )
     except RelayConfigurationError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import secrets
 from threading import RLock
 from typing import Callable
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -88,6 +89,26 @@ class RuntimeTokenRegistry:
             return len(self._tokens)
 
 
+def _is_opencode_go_provider(base_url: str) -> bool:
+    try:
+        parsed = urlsplit(base_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and hostname is not None
+        and hostname.lower() == "opencode.ai"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path.rstrip("/") in {"/zen/go", "/zen/go/v1"}
+    )
+
+
 class LLMRelay:
     def __init__(
         self,
@@ -123,7 +144,12 @@ class LLMRelay:
         return record
 
     async def forward(
-        self, path: str, body: bytes, content_type: str | None
+        self,
+        path: str,
+        body: bytes,
+        content_type: str | None,
+        *,
+        session_id: str,
     ) -> tuple[int, dict[str, str], AsyncIterator[bytes]]:
         if not self.settings.provider_api_key:
             raise RelayConfigurationError(
@@ -138,11 +164,19 @@ class LLMRelay:
             "Content-Type": content_type or "application/json",
             "Accept": "text/event-stream, application/json",
         }
+        if _is_opencode_go_provider(self.settings.provider_base_url):
+            headers["User-Agent"] = "mycode-agent"
+            headers["x-opencode-session"] = session_id
         request = client.build_request("POST", url, headers=headers, content=body)
         response = await client.send(request, stream=True)
 
         response_headers = {}
-        for name in ("content-type", "cache-control", "x-request-id"):
+        for name in (
+            "content-type",
+            "cache-control",
+            "x-request-id",
+            "retry-after",
+        ):
             value = response.headers.get(name)
             if value:
                 response_headers[name] = value

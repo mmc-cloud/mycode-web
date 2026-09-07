@@ -639,7 +639,10 @@ def test_docker_command_mounts_only_session_and_hides_provider_key(tmp_path: Pat
     )
     rendered = " ".join(str(part) for part in command)
     assert "target=/workspace" in rendered
-    assert "target=/home/mycode/.mycode" in rendered
+    assert (
+        f"type=bind,source={tmp_path / 'mycode_state'},target=/home/mycode/.mycode"
+        in rendered
+    )
     assert "MYCODE_API_KEY=runtime-token" in rendered
     assert "MYCODE_API_KEY=relay-token" not in rendered
     assert "MYCODE_BASE_URL=" in rendered
