@@ -92,7 +92,7 @@ def test_adapter_maps_web_permission_decision_to_core(
     }
 
 
-def test_adapter_encodes_mcp_trust_and_close_messages() -> None:
+def test_adapter_encodes_mcp_trust_response() -> None:
     adapter = JsonlRuntimeAdapter()
     assert json.loads(adapter.encode_mcp_trust_response("trust-1", True)) == {
         "version": 1,
@@ -100,4 +100,3 @@ def test_adapter_encodes_mcp_trust_and_close_messages() -> None:
         "request_id": "trust-1",
         "approved": True,
     }
-    assert json.loads(adapter.encode_close()) == {"version": 1, "type": "close"}

@@ -16,7 +16,7 @@ from app.services.runtime import (
     RuntimeConflictError,
     RuntimeManager,
     RuntimeUnavailableError,
-    _normalize_cli_message,
+    _validate_message_content,
 )
 from app.services.workspace import WorkspaceService
 
@@ -234,8 +234,10 @@ def settings(tmp_path: Path) -> ServerSettings:
         ),
     ],
 )
-def test_cli_message_normalization(message: str, expected: str) -> None:
-    assert _normalize_cli_message(message) == expected
+def test_message_content_validation_preserves_multiline_content(
+    message: str, expected: str
+) -> None:
+    assert _validate_message_content(message) == expected
 
 
 def test_runtime_writes_multiline_browser_message_once(tmp_path: Path) -> None:
@@ -377,8 +379,7 @@ def test_send_message_queue_keeps_real_turn_payload(tmp_path: Path) -> None:
 
         item = manager._queue[0]
         assert item.session_id == "queued"
-        assert item.original_content == content
-        assert item.stdin_content == content
+        assert item.content == content
         assert item.turn_id == "turn-queued"
         assert manager.queued_count == 1
         await manager.shutdown()
@@ -585,9 +586,9 @@ def test_process_exit_semantics(
     asyncio.run(scenario())
 
 
-def test_cli_message_normalization_rejects_whitespace_only() -> None:
+def test_message_content_validation_rejects_whitespace_only() -> None:
     with pytest.raises(ValueError, match="must not be empty"):
-        _normalize_cli_message(" \t\r\n  \n")
+        _validate_message_content(" \t\r\n  \n")
 
 
 def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> None:
@@ -630,7 +631,7 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         await launcher.process.stdout.feed(permission_wire("write_file", "write"))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        await manager.resolve_permission("session", "deny")
+        await manager.resolve_permission("session", "deny", request_id="permission-1")
         assert launcher.process.stdin.writes[-1] == b"n\n"
         assert manager.status("session") == "running"
         resolved = [
@@ -647,7 +648,7 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         await launcher.process.stdout.feed(permission_wire("run_command", "task"))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        await manager.resolve_permission("session", "task")
+        await manager.resolve_permission("session", "task", request_id="permission-1")
         assert launcher.process.stdin.writes[-1] == b"t\n"
         resolved = [
             event
@@ -659,7 +660,7 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         await launcher.process.stdout.feed(permission_wire("run_command", "session"))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        await manager.resolve_permission("session", "session")
+        await manager.resolve_permission("session", "session", request_id="permission-1")
         assert launcher.process.stdin.writes[-1] == b"s\n"
         resolved = [
             event
@@ -670,6 +671,86 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         assert resolved.data["allowed"] is True
         assert any(event.type == "permission_request" for event in events.history("session"))
         assert any(event.type == "permission_resolved" for event in events.history("session"))
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_permission_resolution_is_atomic_under_concurrency(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.send_message("session", "task")
+        await launcher.process.stdout.feed(permission_wire())
+        await wait_for_status(manager, "session", "waiting_permission")
+
+        results = await asyncio.gather(
+            manager.resolve_permission("session", "once", request_id="permission-1"),
+            manager.resolve_permission("session", "once", request_id="permission-1"),
+            return_exceptions=True,
+        )
+        assert sum(result is None for result in results) == 1
+        assert sum(isinstance(result, RuntimeConflictError) for result in results) == 1
+        writes = [
+            json.loads(payload)
+            for payload in launcher.process.stdin.raw_writes
+            if json.loads(payload).get("type") == "permission_response"
+        ]
+        assert writes == [
+            {
+                "version": 1,
+                "type": "permission_response",
+                "request_id": "permission-1",
+                "decision": "once",
+            }
+        ]
+        assert manager.pending_permission("session") is None
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_permission_resolution_does_not_publish_stale_running_after_turn_finish(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        events = EventHub()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher
+        )
+        await manager.send_message("session", "task")
+        await launcher.process.stdout.feed(permission_wire())
+        await wait_for_status(manager, "session", "waiting_permission")
+
+        original_write = manager._write_bytes
+
+        async def write_and_finish(state, payload) -> None:
+            await original_write(state, payload)
+            await launcher.process.stdout.feed(FINISH_WIRE)
+            await wait_for_status(manager, "session", "idle")
+
+        manager._write_bytes = write_and_finish
+        await manager.resolve_permission(
+            "session", "once", request_id="permission-1"
+        )
+
+        history = events.history("session")
+        resolved_index = max(
+            index
+            for index, event in enumerate(history)
+            if event.type == "permission_resolved"
+        )
+        assert manager.status("session") == "idle"
+        assert not any(
+            event.type == "runtime_status"
+            and event.data.get("status") == "running"
+            for event in history[resolved_index + 1 :]
+        )
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -689,9 +770,9 @@ def test_permission_is_strictly_bound_to_its_session(tmp_path: Path) -> None:
         assert manager.pending_permission("a") is not None
         assert manager.pending_permission("b") is None
         with pytest.raises(RuntimeConflictError, match="no pending permission"):
-            await manager.resolve_permission("b", "once")
+            await manager.resolve_permission("b", "once", request_id="permission-1")
         assert launcher.by_session["b"][0].stdin.writes == [b"task b\n"]
-        await manager.resolve_permission("a", "deny")
+        await manager.resolve_permission("a", "deny", request_id="permission-1")
         assert launcher.by_session["a"][0].stdin.writes[-1] == b"n\n"
         await manager.shutdown()
 
@@ -1560,7 +1641,7 @@ def test_waiting_permission_expires_and_clears_pending_state(
             for event in events.history("session")
         )
         with pytest.raises(RuntimeConflictError):
-            await manager.resolve_permission("session", "once")
+            await manager.resolve_permission("session", "once", request_id="permission-1")
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -1595,6 +1676,14 @@ def test_mcp_trust_can_pause_startup_and_resume_with_safe_projection(
             await manager.resolve_mcp_trust("session", True, request_id="wrong")
 
         await manager.resolve_mcp_trust("session", True, request_id="trust-1")
+        statuses_before_ready = [
+            event.data["status"]
+            for event in events.history("session")
+            if event.type == "runtime_status"
+        ]
+        trust_status_index = len(statuses_before_ready) - 1
+        assert statuses_before_ready[trust_status_index] == "starting"
+        assert "running" not in statuses_before_ready[trust_status_index:]
         assert json.loads(launcher.process.stdin.raw_writes[-1]) == {
             "version": 1,
             "type": "mcp_trust_response",
@@ -1605,6 +1694,46 @@ def test_mcp_trust_can_pause_startup_and_resume_with_safe_projection(
         assert await asyncio.wait_for(sending, timeout=1) == "running"
         assert manager.status("session") == "running"
         assert any(event.type == "mcp_trust_request" for event in events.history("session"))
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_trust_resolution_is_atomic_under_concurrency(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = ManualPromptLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        sending = asyncio.create_task(manager.send_message("session", "task"))
+        await asyncio.sleep(0)
+        await launcher.process.stdout.feed(trust_wire())
+        await wait_for_status(manager, "session", "waiting_mcp_trust")
+
+        results = await asyncio.gather(
+            manager.resolve_mcp_trust("session", True, request_id="trust-1"),
+            manager.resolve_mcp_trust("session", True, request_id="trust-1"),
+            return_exceptions=True,
+        )
+        assert sum(result is None for result in results) == 1
+        assert sum(isinstance(result, RuntimeConflictError) for result in results) == 1
+        writes = [
+            json.loads(payload)
+            for payload in launcher.process.stdin.raw_writes
+            if json.loads(payload).get("type") == "mcp_trust_response"
+        ]
+        assert writes == [
+            {
+                "version": 1,
+                "type": "mcp_trust_response",
+                "request_id": "trust-1",
+                "approved": True,
+            }
+        ]
+        assert manager.pending_mcp_trust("session") is None
+        await launcher.process.stdout.feed(READY_WIRE)
+        assert await asyncio.wait_for(sending, timeout=1) == "running"
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -1623,7 +1752,7 @@ def test_mcp_trust_reject_response_is_structured_and_does_not_deadlock(
         await asyncio.sleep(0)
         await launcher.process.stdout.feed(trust_wire("trust-reject"))
         await wait_for_status(manager, "session", "waiting_mcp_trust")
-        await manager.resolve_mcp_trust("session", False)
+        await manager.resolve_mcp_trust("session", False, request_id="trust-reject")
         assert json.loads(launcher.process.stdin.raw_writes[-1])["approved"] is False
         await launcher.process.stdout.feed(READY_WIRE)
         assert await asyncio.wait_for(sending, timeout=1) == "running"
@@ -1655,6 +1784,55 @@ def test_waiting_mcp_trust_is_not_an_eviction_victim(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_waiting_mcp_trust_expires_releases_slot_and_starts_queue(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = replace(
+            settings(tmp_path),
+            sandbox_max_active=1,
+            sandbox_idle_ttl_seconds=10,
+        )
+        events = EventHub()
+        launcher = ManualPromptLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher, clock=clock
+        )
+        starting = asyncio.create_task(manager.send_message("trusted", "task"))
+        await asyncio.sleep(0)
+        await launcher.process.stdout.feed(trust_wire())
+        await wait_for_status(manager, "trusted", "waiting_mcp_trust")
+        assert await manager.send_message("queued", "other task") == "queued"
+
+        clock.advance(10)
+        assert await manager.sweep_expired() == ("trusted",)
+        assert manager.status("trusted") == "stopped"
+        assert manager.pending_mcp_trust("trusted") is None
+        assert manager.status("queued") == "starting"
+        assert any(
+            event.type == "mcp_trust_resolved"
+            and event.data.get("expired") is True
+            and event.data.get("approved") is False
+            for event in events.history("trusted")
+        )
+
+        for _ in range(20):
+            if launcher.calls >= 2:
+                break
+            await asyncio.sleep(0)
+        assert launcher.calls >= 2
+        await launcher.processes[-1].stdout.feed(READY_WIRE)
+        await wait_for_status(manager, "queued", "running")
+        with pytest.raises(RuntimeUnavailableError):
+            await asyncio.wait_for(starting, timeout=1)
+        with pytest.raises(RuntimeConflictError):
+            await manager.resolve_mcp_trust("trusted", True, request_id="trust-1")
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_agent_projection_bounds_tool_result_and_stderr_is_not_protocol(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1666,6 +1844,9 @@ def test_agent_projection_bounds_tool_result_and_stderr_is_not_protocol(
             config, WorkspaceService(config), events, launcher=launcher
         )
         await manager.send_message("session", "task")
+        stream = events.stream("session", events.latest_id("session"))
+        pending_agent_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
         caplog.set_level("WARNING")
         await launcher.process.stderr.feed(b"debug token=super-secret\n")
         await asyncio.sleep(0)
@@ -1684,17 +1865,15 @@ def test_agent_projection_bounds_tool_result_and_stderr_is_not_protocol(
         await launcher.process.stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "session", "idle")
 
-        agent_events = [
-            event for event in events.history("session") if event.type == "agent_event"
-        ]
-        projected = next(
-            event.data["event"]["tool_result"]
-            for event in agent_events
-            if event.data["event"].get("type") == "tool_result"
-        )
+        live_event = await asyncio.wait_for(pending_agent_event, timeout=1)
+        projected = live_event.data["event"]["tool_result"]
+        assert live_event.type == "agent_event"
+        assert events.history("session")
+        assert not any(event.type == "agent_event" for event in events.history("session"))
         assert len(projected["content"]) == 16_000
         assert "super-secret" not in caplog.text
         assert "debug token=[redacted]" in caplog.text
+        await stream.aclose()
         await manager.shutdown()
 
     asyncio.run(scenario())

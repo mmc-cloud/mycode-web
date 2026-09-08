@@ -1,5 +1,7 @@
 # ADR-0001：Web Demo 使用 CLI Adapter、Session Sandbox 与宿主 LLM Relay
 
+> Historical / superseded：本 ADR 记录早期 CLI 文本协议方案，不代表当前实现。当前 Web 使用 `mycode runtime --jsonl --continue`；结构化 runtime、Permission、MCP Trust 和 Console projection 以根目录 README 及现行源码为准。
+
 ## 状态
 
 已接受，适用于 Web Demo 的 CLI Adapter、Session Sandbox 与宿主 Relay 设计；公开部署路径由 Phase 2 部署配置定义。

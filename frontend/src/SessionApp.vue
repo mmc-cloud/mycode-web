@@ -245,9 +245,17 @@ async function removeSession(session) {
   } catch (reason) { showError(reason) }
 }
 
+function clearPendingInteractions() {
+  permission.value = null
+  pendingMcpTrust.value = null
+}
+
 function applyRuntimeStatus(data) {
   if (!currentSession.value) return
   currentSession.value.runtime_status = data.status
+  if (data.status === "error" || data.status === "stopped") {
+    clearPendingInteractions()
+  }
   if (!data.turn_id) return
   updateTurnStatus(data.turn_id, data.status)
   if (ACTIVE_TURN_STATUSES.includes(data.status)) {
@@ -307,15 +315,20 @@ function connectEvents(sessionId, token, after) {
   })
   eventSource.addEventListener("runtime_expired", (event) => {
     if (generation !== token) return
+    clearPendingInteractions()
     currentSession.value.runtime_status = "stopped"
     lifecycleNotice.value = JSON.parse(event.data).message || "Sandbox 已停止，会话数据已保留"
     window.setTimeout(() => { lifecycleNotice.value = "" }, 8000)
   })
   eventSource.addEventListener("error", (event) => {
-    if (generation === token && event.data) showError(JSON.parse(event.data).message || "运行时错误")
+    if (generation === token && event.data) {
+      clearPendingInteractions()
+      showError(JSON.parse(event.data).message || "运行时错误")
+    }
   })
   eventSource.addEventListener("runtime_error", (event) => {
     if (generation === token) {
+      clearPendingInteractions()
       const data = JSON.parse(event.data)
       showError(data.message || "运行时协议错误")
     }

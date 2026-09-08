@@ -43,7 +43,7 @@ class EventHub:
     async def publish(
         self, session_id: str, event_type: str, **data: object
     ) -> WebEvent:
-        replayable = event_type != "console_live"
+        replayable = event_type not in {"agent_event", "console_live"}
         event = await self._publish(
             session_id, event_type, dict(data), replayable=replayable
         )

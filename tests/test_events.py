@@ -60,7 +60,7 @@ def test_fresh_cursor_skips_history_but_reconnect_replays_missed_events() -> Non
     asyncio.run(scenario())
 
 
-def test_structured_agent_event_is_replayable() -> None:
+def test_structured_agent_event_is_live_only_not_replayed() -> None:
     async def scenario() -> None:
         hub = EventHub()
         stream = hub.stream("session", hub.latest_id("session"))
@@ -73,7 +73,7 @@ def test_structured_agent_event_is_replayable() -> None:
             event={"type": "text_delta", "content": "chunk"},
         )
         assert await asyncio.wait_for(pending, timeout=1) == published
-        assert hub.history("session") == (published,)
+        assert hub.history("session") == ()
         await stream.aclose()
 
     asyncio.run(scenario())

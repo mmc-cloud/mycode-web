@@ -10,7 +10,6 @@ from typing import Literal
 
 JSONL_PROTOCOL_VERSION = 1
 PermissionDecision = Literal["deny", "once", "task", "session"]
-_WIRE_PERMISSION_DECISIONS = {"reject", "once", "task", "session"}
 
 
 class JsonlProtocolError(ValueError):
@@ -78,9 +77,6 @@ class JsonlRuntimeAdapter:
                 "approved": approved,
             }
         )
-
-    def encode_close(self) -> bytes:
-        return self._encode({"type": "close"})
 
     def _feed_text(self, text: str) -> tuple[dict[str, object], ...]:
         self._buffer += text

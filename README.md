@@ -1,6 +1,6 @@
 # MyCode Web
 
-`mycode-web` 是独立于 MyCode Core 的 Web 与 deployment layer。它不 import、复制或修改 MyCode Python package，而是通过公开 CLI `mycode agent --continue` 驱动 Core。Web repo 与 MyCode Core repo 独立维护。
+`mycode-web` 是独立于 MyCode Core 的 Web 与 deployment layer。它不 import、复制或修改 MyCode Python package，而是通过 Core 14.5 的 machine runtime `mycode runtime --jsonl --continue` 驱动 Core。Web repo 与 MyCode Core repo 独立维护。
 
 真实 Provider API Key 只由 Host/FastAPI 持有。Docker Sandbox 仅获得内部 Relay token、Relay URL、模型名，以及 Host 明确传入的 MyCode Runtime 参数；Provider 凭据不会进入 Sandbox。
 
@@ -8,13 +8,14 @@
 
 - Multi-session：一个 Web User 可以创建、列出、切换和删除多个 Session。
 - Session isolation：每个 Session 独立拥有 MyCode state、Runtime、Permission、SSE 和 Console history；同一 Web User 的 Session 共享一个 Workspace。
-- Warm Runtime：进入 Session 后后台预热 Sandbox 与长期运行的 `mycode agent --continue`。
+- Warm Runtime：进入 Session 后后台预热 Sandbox 与长期运行的 `mycode runtime --jsonl --continue`。
 - Workspace：支持上传、文件树、文本预览、文件/目录删除以及文件和完整 Workspace 下载。
 - Workspace 自动刷新：Agent 修改文件后，页面自动刷新文件树和当前 Preview。
 - Agent Console：同时提供实时增量输出和可持久化、可恢复的聚合历史。
-- Permission interaction：Browser 提供独立的 Allow/Reject UI，并映射到 CLI 权限输入。
+- Permission interaction：Browser 提供独立的 Allow/Reject UI，并通过结构化 `permission_request` / `permission_response` 完成同步决策。
 - Runtime Pool / FIFO Queue：在受控资源上管理并发 Session Runtime。
-- Session persistence：Runtime 回收后保留 Session 数据，后续通过 `--continue` 恢复。
+- Project MCP Trust：Sandbox 启动期间通过 `mcp_trust_request` / `mcp_trust_response` 请求项目级 MCP 信任，不展示 secret value。
+- Session persistence：Runtime 回收后保留 Session 数据，后续通过 `mycode runtime --jsonl --continue` 恢复。
 
 ## 架构
 
@@ -22,8 +23,8 @@
 Browser /web/
   -> Vue 3 + Vite
   -> FastAPI /web/api/*
-  -> Docker Sandbox
-  -> long-lived `mycode agent --continue`
+  -> RuntimeManager -> JsonlRuntimeAdapter
+  -> Docker Sandbox: `mycode runtime --jsonl --continue`
   -> FastAPI OpenAI-compatible Relay
   -> Provider
 ```
@@ -41,9 +42,9 @@ Sandbox 挂载当前 Web User 的 Workspace 和当前 Session 的 `mycode_state`
 
 HttpOnly Cookie 只标识 Web User。一个 User 可以拥有多个 Session，并通过 `/web/?session=<session_id>` 选择当前 Session。首次访问没有 Session 时，前端自动创建一个；URL 未指定 Session 时进入最近活跃的 Session。
 
-Session 支持 create、list、switch 和 delete。进入或切换 Session 后，前端立即调用 activate，并在后台启动或复用 Sandbox 与 `mycode agent --continue`。浏览器刷新不会停止 Runtime，也不会创建重复 Agent process。
+Session 支持 create、list、switch 和 delete。进入或切换 Session 后，前端立即调用 activate，并在后台启动或复用 Sandbox 与 `mycode runtime --jsonl --continue`。浏览器刷新不会停止 Runtime，也不会创建重复 Agent process。
 
-Runtime 状态包括：`starting`、`idle`、`running`、`waiting_permission`、`queued`、`stopped` 和 `error`。
+Runtime 状态包括：`starting`、`idle`、`running`、`waiting_permission`、`waiting_mcp_trust`、`queued`、`stopped` 和 `error`。
 
 Runtime Pool、FIFO Queue 和调度锁都位于单个 FastAPI 进程内。最大 active Sandbox、单个 Web User 的 active Sandbox 配额、Queue 上限和 idle TTL 由配置决定，admission 遵循以下规则：
 
@@ -51,7 +52,7 @@ Runtime Pool、FIFO Queue 和调度锁都位于单个 FastAPI 进程内。最大
 2. 全局 capacity 已满但存在 idle Runtime，且用户配额允许时，驱逐最久未活动的 idle Runtime；
 3. 没有可立即启动的 Runtime 时，新请求进入有界 FIFO Queue；队列 handoff 会跳过当前用户配额已满的候选，避免队首阻塞。
 
-`starting`、`running` 和 `waiting_permission` 都可能占用 active capacity。Runtime 可因 idle TTL、capacity eviction、explicit stop、process exit 或 lifecycle cleanup 停止，但这些操作不会删除 Workspace、`mycode_state` 或 SQLite Session metadata。再次 activate 时会启动新 Sandbox，并通过 `mycode agent --continue` 恢复 Session。
+`starting`、`running`、`waiting_permission` 和 `waiting_mcp_trust` 都可能占用 active capacity。`idle`、等待 Permission 和等待 MCP Trust 都受 inactivity TTL 约束；等待交互超时会清除 pending request、停止 Runtime 并释放 slot。Runtime 也可因 capacity eviction、explicit stop、process exit 或 lifecycle cleanup 停止，但这些操作不会删除 Workspace、`mycode_state` 或 SQLite Session metadata。再次 activate 时会启动新 Sandbox，并通过 `mycode runtime --jsonl --continue` 恢复 Session。
 
 Workspace watcher 跟随 active Runtime 生命周期，而不是永久附着在保留的 Session 上。Runtime starting/active 时 watcher 启动；Runtime 被回收或停止时 watcher 停止；Session 再次 activate 时 watcher 重启；Session delete 和 application shutdown 会清理 watcher。
 
@@ -81,18 +82,18 @@ Symlink/junction 安全语义：
 - read、preview 和 download 拒绝通过 symlink 访问 target；
 - ZIP upload 拒绝 archive 中的 symlink entry。
 
-## Console、Permission 与 SSE
+## JSONL Runtime、Console 与 SSE
 
-CLI 仍是面向人的文本协议，不是 PTY，也不是 JSONL 或正式的跨进程 machine protocol。Web adapter 识别现有 `you> ` 和 Permission prompt；Browser 多行消息只在写入 CLI stdin 前折叠为单行，原始消息仍用于 Web 展示和持久化。
+Web 与 Core 之间使用正式的 JSONL machine protocol：
 
-Console 分为两层：
+- Turn 输入为 `{"version":1,"type":"turn","turn_id":"...","content":"..."}`。`content` 保留原始多行消息，不再折叠成 CLI 单行输入。
+- Permission 使用 `permission_request` ↔ `permission_response`；Web 的 `deny` 映射为 wire decision `reject`，`once`、`task`、`session` 保持同名。
+- Project MCP Trust 使用 `mcp_trust_request` ↔ `mcp_trust_response`。请求在 runtime ready 之前也可能出现，Web 会保持 `waiting_mcp_trust` 并等待 Browser Allow/Reject；展示时只使用 Core 提供的 alias、transport、command/args、env_keys、url_template、destination 和 header_keys 等安全字段。
+- Core stdout 只由 JSONL adapter 解析；Core stderr 由独立 reader 记录为 bounded diagnostic，不作为 protocol event。
 
-- Live output：CLI stdout chunk 可产生 live-only 的 `console_live` SSE，浏览器在 newline/prompt 前即可看到增量内容。该数据只用于瞬态 UI，不写 SQLite，也不进入长期 replay history。
-- Stable history：ConsoleRecorder 在 newline/prompt 等稳定边界聚合输出并形成 `console_event`，再写入 SQLite。它不会为每个 token 创建数据库记录；每个 Session 只保留有限数量的最近历史。页面刷新后通过 `/console` 恢复，稳定事件到达时前端会替换或清理 transient live card，避免重复显示。
+Core `agent_event` 由 RuntimeManager 投影为 Browser 使用的结构化事件：`text_delta` 用于 assistant streaming，`tool_call` / `tool_result` 用于 execution group，其他支持事件保留结构化字段。`console_live` 与 raw `agent_event` 都是 live-only，不进入 EventHub replay history；稳定的 `console_event` 由 ConsoleRecorder 写入 SQLite，负责刷新后的历史恢复。过大的 tool result 在 Web projection 层做有界摘要，不改变 Core wire message。
 
-Browser 使用独立的 Allow/Reject UI 处理 Permission，并分别向 CLI stdin 写入 `y\n` 或 `n\n`。
-
-SSE replay buffer 位于 FastAPI 进程内。Replayable stable events 可以进入 buffer；raw `agent_output` 和 `console_live` 是 live-only，不长期保留。Fresh connection 使用 snapshot `event_cursor`，reconnect 使用 `Last-Event-ID`，且 `Last-Event-ID` 优先于 `after`。服务重启后 replay buffer 不恢复；Console 历史恢复依赖 SQLite，而不是 SSE history。
+SSE replay buffer 位于 FastAPI 进程内。`runtime_status`、Permission/MCP Trust 生命周期事件、`runtime_warning`、`runtime_error` 和 `console_event` 等稳定事件可以 replay；raw `agent_event` 和 `console_live` 只发送给当前 live subscriber。Fresh connection 使用 snapshot `event_cursor`，reconnect 使用 `Last-Event-ID`，且 `Last-Event-ID` 优先于 `after`。服务重启后 replay buffer 不恢复；Console 历史恢复依赖 SQLite，而不是 SSE history。
 
 ## 环境要求
 
@@ -200,7 +201,7 @@ Browser
   -> Nginx /web/
   -> Vue static assets / FastAPI /web/api/*
   -> Docker Sandbox
-  -> mycode agent --continue
+  -> mycode runtime --jsonl --continue
   -> FastAPI internal Relay
   -> Provider
 ```
@@ -296,8 +297,8 @@ Server tests 使用临时 SQLite/Workspace 和 fake Sandbox，不访问真实 Pr
 - 身份只有随机 HttpOnly Cookie，没有正式账号或登录系统。
 - Runtime Pool、FIFO Queue、scheduler locks 和 SSE replay buffer 是单 FastAPI 进程内状态。
 - 服务重启后 Queue 和 SSE replay history 不恢复；Console history 由 SQLite 恢复。
-- CLI 是面向人的文本协议，不是正式的结构化 machine protocol。
+- Core runtime 使用正式的结构化 JSONL machine protocol；stdout 是 protocol，stderr 是 diagnostic。
 - FastAPI 不接管 crash 前遗留的旧 Sandbox process；startup 只按 `mycode-web.managed=true` label 清理 orphan Sandbox。
-- Orphan cleanup 不删除 Workspace、`mycode_state` 或 SQLite Session；后续可通过 `mycode agent --continue` 恢复。
+- Orphan cleanup 不删除 Workspace、`mycode_state` 或 SQLite Session；后续可通过 `mycode runtime --jsonl --continue` 恢复。
 
 设计原因见 `docs/adr/0001-web-demo-cli-sandbox-relay.md`，实现和验证记录见 `docs/实施记录.md`。

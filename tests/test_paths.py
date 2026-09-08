@@ -160,3 +160,16 @@ def test_permission_frontend_uses_scoped_decisions_and_runtime_session_hint() ->
     assert "request_id: pendingMcpTrust.value.request_id" in source
     assert "resolvePermission(false)" not in source
     assert "resolvePermission(true)" not in source
+
+
+def test_frontend_clears_pending_interactions_on_terminal_runtime_events() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "function clearPendingInteractions()" in source
+    assert 'data.status === "error" || data.status === "stopped"' in source
+    assert 'eventSource.addEventListener("runtime_expired"' in source
+    assert "clearPendingInteractions()" in source
+    assert "permission.value = null" in source
+    assert "pendingMcpTrust.value = null" in source
