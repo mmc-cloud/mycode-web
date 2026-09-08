@@ -16,32 +16,28 @@ def make_database(tmp_path: Path) -> tuple[WebDatabase, str, str]:
     return database, database.create_session(user.id).id, user.id
 
 
-def test_console_history_is_bounded_filtered_and_session_isolated(
+def test_console_history_is_bounded_structured_and_session_isolated(
     tmp_path: Path,
 ) -> None:
     database, session_a, user_id = make_database(tmp_path)
     session_b = database.create_session(user_id).id
     recorder = ConsoleRecorder(database)
-    assert recorder.record_event(
-        session_a, "agent_output", {"content": "输入 /exit 或 /quit 退出。\nyou> "}
-    ) == ()
-    assert recorder.record_event(
-        session_a,
-        "agent_output",
-        {
-            "content": (
-                "permission> write_file 需要确认\n"
-                "是否批准？[y/yes 本次 | t/task 当前任务 | "
-                "s/session 当前会话 | N 拒绝] "
-            )
-        },
-    ) == ()
     recorder.record_event(
-        session_a, "agent_output", {"content": "assistant> after permission\n"}
+        session_a,
+        "agent_event",
+        {"turn_id": "turn-1", "event": {"type": "text_delta", "content": "hello"}},
+    )
+    recorder.record_event(session_a, "turn_finished", {"turn_id": "turn-1"})
+    recorder.record_event(
+        session_a,
+        "permission_request",
+        {"tool_name": "write_file", "action": "write", "target": "a.txt"},
     )
     recorder.record_event(session_a, "user_message", {"content": "hello"})
     recorder.record_event(
-        session_a, "agent_output", {"content": "assistant> answer\n"}
+        session_a,
+        "agent_event",
+        {"turn_id": "turn-2", "event": {"type": "error", "error": "failed"}},
     )
     recorder.record_event(session_b, "user_message", {"content": "only b"})
     for index in range(CONSOLE_HISTORY_LIMIT + 20):
@@ -52,38 +48,36 @@ def test_console_history_is_bounded_filtered_and_session_isolated(
     assert len(history_a) == CONSOLE_HISTORY_LIMIT
     assert history_a[-1].content == f"event {CONSOLE_HISTORY_LIMIT + 19}"
     assert [event.content for event in history_b] == ["only b"]
-    assert all("输入 /exit" not in event.content for event in history_a)
-    assert all("是否批准" not in event.content for event in history_a)
+    assert all(event.kind in {"assistant", "permission", "user", "error", "tool"} for event in history_a)
 
 
-def test_live_output_precedes_newline_without_token_rows(tmp_path: Path) -> None:
+def test_live_output_is_structured_and_flushes_on_turn_finished(tmp_path: Path) -> None:
     database, session_id, user_id = make_database(tmp_path)
     recorder = ConsoleRecorder(database)
 
     assert recorder.record_event(
-        session_id, "agent_output", {"content": "assistant> hello"}
+        session_id,
+        "agent_event",
+        {"turn_id": "turn-1", "event": {"type": "text_delta", "content": "hello"}},
     ) == ()
     assert recorder.live_output(session_id) == {
         "active": True,
         "kind": "assistant",
         "content": "hello",
+        "turn_id": "turn-1",
     }
-    assert database.console_history(session_id, user_id) == ()
-
-    assert recorder.record_event(
-        session_id, "agent_output", {"content": " world"}
-    ) == ()
-    assert recorder.live_output(session_id)["content"] == "hello world"
-    assert database.console_history(session_id, user_id) == ()
-
-    recorded = recorder.record_event(
-        session_id, "agent_output", {"content": "\nyou> "}
+    recorder.record_event(
+        session_id,
+        "agent_event",
+        {"turn_id": "turn-1", "event": {"type": "text_delta", "content": " world"}},
     )
+    recorded = recorder.record_event(session_id, "turn_finished", {"turn_id": "turn-1"})
     assert len(recorded) == 1
     assert recorder.live_output(session_id)["active"] is False
     history = database.console_history(session_id, user_id)
     assert len(history) == 1
     assert history[0].content == "hello world"
+    assert history[0].data == {"turn_id": "turn-1", "event_type": "text_delta"}
 
 
 def test_console_permission_resolution_keeps_decision_scope(tmp_path: Path) -> None:
@@ -101,7 +95,9 @@ def test_console_permission_resolution_keeps_decision_scope(tmp_path: Path) -> N
     assert history[0].data == {"decision": "task", "allowed": True}
 
 
-def test_event_hub_sends_live_console_before_persisting_line(tmp_path: Path) -> None:
+def test_event_hub_sends_structured_live_console_before_persisting_line(
+    tmp_path: Path,
+) -> None:
     async def scenario() -> None:
         database, session_id, user_id = make_database(tmp_path)
         hub = EventHub(console=ConsoleRecorder(database))
@@ -109,22 +105,32 @@ def test_event_hub_sends_live_console_before_persisting_line(tmp_path: Path) -> 
 
         first = asyncio.create_task(anext(stream))
         await asyncio.sleep(0)
-        await hub.publish(session_id, "agent_output", content="assistant> hello")
-        assert (await first).type == "agent_output"
+        await hub.publish(
+            session_id,
+            "agent_event",
+            turn_id="turn-1",
+            event={"type": "text_delta", "content": "hello"},
+        )
+        assert (await first).type == "agent_event"
         live = await anext(stream)
         assert live.type == "console_live"
         assert live.data["content"] == "hello"
         assert database.console_history(session_id, user_id) == ()
 
-        await hub.publish(session_id, "agent_output", content=" world")
-        assert (await anext(stream)).type == "agent_output"
+        await hub.publish(
+            session_id,
+            "agent_event",
+            turn_id="turn-1",
+            event={"type": "text_delta", "content": " world"},
+        )
+        assert (await anext(stream)).type == "agent_event"
         live = await anext(stream)
         assert live.type == "console_live"
         assert live.data["content"] == "hello world"
         assert database.console_history(session_id, user_id) == ()
 
-        await hub.publish(session_id, "agent_output", content="\nyou> ")
-        assert (await anext(stream)).type == "agent_output"
+        await hub.publish(session_id, "turn_finished", turn_id="turn-1")
+        assert (await anext(stream)).type == "turn_finished"
         cleared = await anext(stream)
         persisted = await anext(stream)
         assert cleared.type == "console_live"

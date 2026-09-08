@@ -73,7 +73,7 @@ def test_permission_api_accepts_each_scoped_decision(
         session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
         response = client.post(
             f"{API_BASE_PATH}/sessions/{session_id}/permission",
-            json={"decision": decision},
+            json={"decision": decision, "request_id": "pending-1"},
         )
 
     assert response.status_code == 409

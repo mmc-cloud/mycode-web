@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, call
 
@@ -20,10 +21,69 @@ from app.services.runtime import (
 from app.services.workspace import WorkspaceService
 
 
-SCOPED_PERMISSION_PROMPT = (
-    "是否批准？[y/yes 本次 | t/task 当前任务 | "
-    "s/session 当前会话 | N 拒绝] "
+def jsonl(*messages: dict[str, object]) -> bytes:
+    return b"".join(
+        (
+            json.dumps(
+                {"version": 1, **message},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        for message in messages
+    )
+
+
+READY_WIRE = jsonl({"type": "runtime_ready", "session_id": "session"})
+FINISH_WIRE = jsonl(
+    {"type": "agent_event", "event": {"type": "text_delta", "content": "done"}},
+    {"type": "turn_finished", "status": "completed", "stop_reason": "final_answer"},
 )
+
+
+def permission_wire(summary: str = "run_command", reason: str = "risky") -> bytes:
+    return jsonl(
+        {
+            "type": "permission_request",
+            "request_id": "permission-1",
+            "tool_name": summary.split()[0],
+            "capability": "command",
+            "action": "run",
+            "target": summary,
+            "reason": reason,
+            "prompt": "Confirm",
+            "arguments": {},
+            "metadata": {},
+        }
+    )
+
+
+def trust_wire(request_id: str = "trust-1") -> bytes:
+    return jsonl(
+        {
+            "type": "mcp_trust_request",
+            "request_id": request_id,
+            "servers": [
+                {
+                    "alias": "safe-tools",
+                    "transport": "stdio",
+                    "command": "node",
+                    "args": ["server.js"],
+                    "env_keys": ["MCP_SECRET"],
+                    "env": {"MCP_SECRET": "must-not-leak"},
+                },
+                {
+                    "alias": "remote-tools",
+                    "transport": "http",
+                    "url_template": "https://mcp.example.test/{project}",
+                    "destination": "mcp.example.test",
+                    "header_keys": ["Authorization"],
+                    "headers": {"Authorization": "secret-value"},
+                },
+            ],
+        }
+    )
 
 
 class FakeStdout:
@@ -39,10 +99,25 @@ class FakeStdout:
 
 class FakeStdin:
     def __init__(self) -> None:
+        self.raw_writes: list[bytes] = []
         self.writes: list[bytes] = []
 
     def write(self, data: bytes) -> None:
-        self.writes.append(data)
+        self.raw_writes.append(data)
+        try:
+            message = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.writes.append(data)
+            return
+        if message.get("type") == "permission_response":
+            legacy = {"reject": b"n\n", "once": b"y\n", "task": b"t\n", "session": b"s\n"}
+            self.writes.append(legacy.get(message.get("decision"), data))
+        elif message.get("type") == "turn":
+            self.writes.append(
+                f"{message.get('content', '')}\n".encode("utf-8")
+            )
+        else:
+            self.writes.append(data)
 
     async def drain(self) -> None:
         return None
@@ -52,6 +127,7 @@ class FakeProcess:
     def __init__(self) -> None:
         self.stdin = FakeStdin()
         self.stdout = FakeStdout()
+        self.stderr = FakeStdout()
         self.returncode = None
         self.done = asyncio.Event()
 
@@ -63,6 +139,7 @@ class FakeProcess:
         self.returncode = 0
         self.done.set()
         self.stdout.queue.put_nowait(b"")
+        self.stderr.queue.put_nowait(b"")
 
     def kill(self) -> None:
         self.terminate()
@@ -88,9 +165,7 @@ class FakeLauncher:
             self.max_live_seen,
             sum(candidate.returncode is None for candidate in self.processes),
         )
-        asyncio.get_running_loop().call_soon(
-            process.stdout.queue.put_nowait, b"started\nyou> "
-        )
+        asyncio.get_running_loop().call_soon(process.stdout.queue.put_nowait, READY_WIRE)
         return process
 
 
@@ -151,11 +226,11 @@ def settings(tmp_path: Path) -> ServerSettings:
     ("message", "expected"),
     [
         ("check app.py", "check app.py"),
-        ("check app.py\nthen run pytest", "check app.py then run pytest"),
-        ("check app.py\r\nthen run pytest", "check app.py then run pytest"),
+        ("check app.py\nthen run pytest", "check app.py\nthen run pytest"),
+        ("check app.py\r\nthen run pytest", "check app.py\r\nthen run pytest"),
         (
             "check app.py\n\n  \n\tthen run pytest",
-            "check app.py then run pytest",
+            "check app.py\n\n  \n\tthen run pytest",
         ),
     ],
 )
@@ -180,7 +255,7 @@ def test_runtime_writes_multiline_browser_message_once(tmp_path: Path) -> None:
         )
 
         assert launcher.process.stdin.writes == [
-            b"check app.py then run pytest\n"
+            b"check app.py\r\n\r\n  then run pytest\n"
         ]
         await manager.shutdown()
 
@@ -236,7 +311,7 @@ def test_activate_is_async_idempotent_and_message_waits_same_runtime(
         send = asyncio.create_task(manager.send_message("session", "hello"))
         await asyncio.sleep(0)
         assert not send.done()
-        await launcher.process.stdout.feed(b"started\nyou> ")
+        await launcher.process.stdout.feed(READY_WIRE)
         assert await asyncio.wait_for(send, timeout=1) == "running"
         assert launcher.calls == 1
         assert launcher.process.stdin.writes == [b"hello\n"]
@@ -303,7 +378,7 @@ def test_send_message_queue_keeps_real_turn_payload(tmp_path: Path) -> None:
         item = manager._queue[0]
         assert item.session_id == "queued"
         assert item.original_content == content
-        assert item.stdin_content == "echo hello pwd"
+        assert item.stdin_content == content
         assert item.turn_id == "turn-queued"
         assert manager.queued_count == 1
         await manager.shutdown()
@@ -330,7 +405,7 @@ def test_activate_handoffs_same_user_idle_victim_immediately(
 
         await manager.send_message("a1", "one")
         await manager.send_message("a2", "two")
-        await launcher.by_session["a1"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a1", "idle")
 
         assert await manager.activate("a3") == "starting"
@@ -366,11 +441,11 @@ def test_activate_selects_oldest_eligible_idle_victim_for_target_user(
         )
 
         await manager.send_message("b1", "one")
-        await launcher.by_session["b1"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["b1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "b1", "idle")
         clock.advance(1)
         await manager.send_message("a1", "one")
-        await launcher.by_session["a1"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a1", "idle")
         await manager.send_message("a2", "two")
 
@@ -404,7 +479,7 @@ def test_activate_does_not_evict_idle_victim_with_terminal_lease(
 
         await manager.send_message("a1", "one")
         await manager.send_message("a2", "two")
-        await launcher.by_session["a1"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a1", "idle")
         await manager.acquire_terminal_lease("a1")
 
@@ -442,7 +517,7 @@ def test_wait_until_ready_survives_capacity_queue_until_handoff(
         await asyncio.sleep(0.05)
         assert not waiter.done()
 
-        await launcher.by_session["blocker"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["blocker"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "waiting", "running")
         assert await asyncio.wait_for(waiter, timeout=1) == "running"
         await manager.release_terminal_lease("waiting")
@@ -501,6 +576,7 @@ def test_process_exit_semantics(
         launcher.process.returncode = return_code
         launcher.process.done.set()
         await launcher.process.stdout.feed(b"")
+        await launcher.process.stderr.feed(b"")
         await wait_for_status(manager, "session", expected_status)
         errors = [event for event in events.history("session") if event.type == "error"]
         assert bool(errors) is expects_error
@@ -526,17 +602,17 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         assert launcher.process.stdin.writes == [b"first task\n"]
         with pytest.raises(RuntimeConflictError):
             await manager.send_message("session", "overlapping task")
-        await launcher.process.stdout.feed(b"answer\nyou> ")
+        await launcher.process.stdout.feed(FINISH_WIRE)
         await asyncio.sleep(0)
         await manager.send_message("session", "second task")
         assert launcher.calls == 1
 
-        await launcher.process.stdout.feed(
-            f"permission> run_command 需要确认\nreason> risky\n{SCOPED_PERMISSION_PROMPT}".encode()
-        )
+        await launcher.process.stdout.feed(permission_wire("run_command", "risky"))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        await manager.resolve_permission("session", "once")
+        with pytest.raises(RuntimeConflictError, match="stale"):
+            await manager.resolve_permission("session", "once", request_id="wrong")
+        await manager.resolve_permission("session", "once", request_id="permission-1")
         assert launcher.process.stdin.writes[-1] == b"y\n"
         assert manager.status("session") == "running"
         resolved = [
@@ -550,10 +626,8 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
             "permission_resolved",
             "runtime_status",
         ]
-        assert events.history("session")[-1].data == {"status": "running"}
-        await launcher.process.stdout.feed(
-            f"permission> write_file 需要确认\nreason> write\n{SCOPED_PERMISSION_PROMPT}".encode()
-        )
+        assert events.history("session")[-1].data["status"] == "running"
+        await launcher.process.stdout.feed(permission_wire("write_file", "write"))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         await manager.resolve_permission("session", "deny")
@@ -570,9 +644,7 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
             "permission_resolved",
             "runtime_status",
         ]
-        await launcher.process.stdout.feed(
-            f"permission> run_command 需要确认\nreason> task\n{SCOPED_PERMISSION_PROMPT}".encode()
-        )
+        await launcher.process.stdout.feed(permission_wire("run_command", "task"))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         await manager.resolve_permission("session", "task")
@@ -584,9 +656,7 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         ][-1]
         assert resolved.data["decision"] == "task"
         assert resolved.data["allowed"] is True
-        await launcher.process.stdout.feed(
-            f"permission> run_command 需要确认\nreason> session\n{SCOPED_PERMISSION_PROMPT}".encode()
-        )
+        await launcher.process.stdout.feed(permission_wire("run_command", "session"))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         await manager.resolve_permission("session", "session")
@@ -614,9 +684,7 @@ def test_permission_is_strictly_bound_to_its_session(tmp_path: Path) -> None:
         )
         await manager.send_message("a", "task a")
         await manager.send_message("b", "task b")
-        await launcher.by_session["a"][0].stdout.feed(
-            f"permission> write_file 需要确认\n{SCOPED_PERMISSION_PROMPT}".encode()
-        )
+        await launcher.by_session["a"][0].stdout.feed(permission_wire("write_file"))
         await wait_for_status(manager, "a", "waiting_permission")
         assert manager.pending_permission("a") is not None
         assert manager.pending_permission("b") is None
@@ -762,10 +830,10 @@ def test_two_running_sessions_admit_and_third_queues_fifo(tmp_path: Path) -> Non
         assert manager.active_count == 2
         assert manager.queued_count == 2
 
-        await launcher.by_session["one"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["one"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "three", "running")
         assert manager.status("four") == "queued"
-        assert launcher.by_session["three"][0].stdin.writes == [b"third line\n"]
+        assert launcher.by_session["three"][0].stdin.writes == [b"third\nline\n"]
         three_statuses = [
             event.data["status"]
             for event in events.history("three")
@@ -773,7 +841,7 @@ def test_two_running_sessions_admit_and_third_queues_fifo(tmp_path: Path) -> Non
         ]
         assert three_statuses == ["queued", "starting", "running"]
 
-        await launcher.by_session["two"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["two"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "four", "running")
         assert launcher.by_session["four"][0].stdin.writes == [b"fourth\n"]
         assert manager.active_count <= config.sandbox_max_active
@@ -830,11 +898,11 @@ def test_send_message_selects_oldest_eligible_idle_victim_for_target_user(
         )
 
         await manager.send_message("b1", "one")
-        await launcher.by_session["b1"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["b1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "b1", "idle")
         clock.advance(1)
         await manager.send_message("a1", "one")
-        await launcher.by_session["a1"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a1", "idle")
         await manager.send_message("a2", "two")
 
@@ -871,7 +939,7 @@ def test_cross_user_idle_victim_cannot_bypass_target_user_quota(
         await manager.send_message("a1", "one")
         await manager.send_message("a2", "two")
         await manager.send_message("b1", "one")
-        await launcher.by_session["b1"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["b1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "b1", "idle")
 
         assert await manager.activate("a3") == "stopped"
@@ -933,7 +1001,7 @@ def test_idle_handoff_releases_victim_user_slot_before_eligibility_check(
         await manager.send_message("a2", "two")
         assert await manager.send_message("a3", "three") == "queued"
 
-        await launcher.by_session["a1"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a3", "running")
         assert manager.status("a1") == "stopped"
         assert manager.status("a2") == "running"
@@ -1083,7 +1151,7 @@ def test_idle_runtime_is_replaced_before_ttl_for_queued_session(tmp_path: Path) 
         )
 
         await manager.send_message("a1", "one")
-        await launcher.process.stdout.feed(b"done\nyou> ")
+        await launcher.process.stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a1", "idle")
         assert await manager.send_message("a2", "two") == "running"
         assert manager.status("a1") == "stopped"
@@ -1117,7 +1185,7 @@ def test_oldest_idle_is_evicted_instead_of_queueing(tmp_path: Path) -> None:
         )
         (marker_workspace / "keep.txt").write_text("workspace", encoding="utf-8")
         (marker_state / "keep.txt").write_text("state", encoding="utf-8")
-        await launcher.by_session["old-idle"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["old-idle"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "old-idle", "idle")
         clock.advance(10)
         await manager.send_message("busy", "second")
@@ -1185,7 +1253,7 @@ def test_idle_ttl_only_reclaims_expired_runtime_and_preserves_data(
         root, state_root = workspace.ensure_session_directories("session")
         (root / "keep.txt").write_text("keep", encoding="utf-8")
         (state_root / "keep.txt").write_text("keep", encoding="utf-8")
-        await launcher.process.stdout.feed(b"done\nyou> ")
+        await launcher.process.stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "session", "idle")
 
         clock.advance(7199)
@@ -1224,7 +1292,7 @@ def test_connected_terminal_lease_protects_idle_runtime_from_ttl(
             clock=clock,
         )
         await manager.send_message("session", "task")
-        await launcher.process.stdout.feed(b"done\nyou> ")
+        await launcher.process.stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "session", "idle")
 
         await manager.acquire_terminal_lease("session")
@@ -1255,8 +1323,8 @@ def test_connected_terminal_runtime_is_not_an_idle_eviction_victim(
         )
         await manager.send_message("protected", "one")
         await manager.send_message("other", "two")
-        await launcher.by_session["protected"][0].stdout.feed(b"done\nyou> ")
-        await launcher.by_session["other"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["protected"][0].stdout.feed(FINISH_WIRE)
+        await launcher.by_session["other"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "protected", "idle")
         await wait_for_status(manager, "other", "idle")
         await manager.acquire_terminal_lease("protected")
@@ -1279,7 +1347,7 @@ def test_terminal_lease_blocks_queue_handoff_until_disconnect(
             config, WorkspaceService(config), EventHub(), launcher=launcher
         )
         await manager.send_message("a", "first")
-        await launcher.by_session["a"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["a"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a", "idle")
         await manager.acquire_terminal_lease("a")
 
@@ -1308,7 +1376,7 @@ def test_last_terminal_disconnect_releases_multi_client_protection(
             config, WorkspaceService(config), EventHub(), launcher=launcher
         )
         await manager.send_message("a", "first")
-        await launcher.by_session["a"][0].stdout.feed(b"done\nyou> ")
+        await launcher.by_session["a"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a", "idle")
         await manager.acquire_terminal_lease("a")
         await manager.acquire_terminal_lease("a")
@@ -1339,12 +1407,12 @@ def test_runtime_events_carry_web_turn_id_to_completion(tmp_path: Path) -> None:
             config, WorkspaceService(config), events, launcher=launcher
         )
         await manager.send_message("session", "task", turn_id="turn-1")
-        await launcher.process.stdout.feed(b"assistant> answer\nyou> ")
+        await launcher.process.stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "session", "idle")
 
         relevant = [
             event for event in events.history("session")
-            if event.type in {"user_message", "agent_output", "runtime_status"}
+            if event.type in {"user_message", "agent_event", "runtime_status"}
         ]
         assert relevant[0].type == "user_message"
         assert relevant[0].data["turn_id"] == "turn-1"
@@ -1481,9 +1549,7 @@ def test_waiting_permission_expires_and_clears_pending_state(
             config, WorkspaceService(config), events, launcher=launcher, clock=clock
         )
         await manager.send_message("session", "task")
-        await launcher.process.stdout.feed(
-            f"permission> run_command 需要确认\n{SCOPED_PERMISSION_PROMPT}".encode()
-        )
+        await launcher.process.stdout.feed(permission_wire("run_command"))
         await wait_for_status(manager, "session", "waiting_permission")
         clock.advance(10)
 
@@ -1495,6 +1561,140 @@ def test_waiting_permission_expires_and_clears_pending_state(
         )
         with pytest.raises(RuntimeConflictError):
             await manager.resolve_permission("session", "once")
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_trust_can_pause_startup_and_resume_with_safe_projection(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = ManualPromptLauncher()
+        events = EventHub()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher
+        )
+        sending = asyncio.create_task(manager.send_message("session", "task"))
+        for _ in range(20):
+            if launcher.calls:
+                break
+            await asyncio.sleep(0)
+        await launcher.process.stdout.feed(trust_wire())
+        await wait_for_status(manager, "session", "waiting_mcp_trust")
+
+        pending = manager.pending_mcp_trust("session")
+        assert pending is not None
+        serialized = json.dumps(pending, ensure_ascii=False)
+        assert "must-not-leak" not in serialized
+        assert "secret-value" not in serialized
+        assert pending["servers"][0]["env_keys"] == ["MCP_SECRET"]
+        assert pending["servers"][1]["header_keys"] == ["Authorization"]
+        with pytest.raises(RuntimeConflictError, match="stale"):
+            await manager.resolve_mcp_trust("session", True, request_id="wrong")
+
+        await manager.resolve_mcp_trust("session", True, request_id="trust-1")
+        assert json.loads(launcher.process.stdin.raw_writes[-1]) == {
+            "version": 1,
+            "type": "mcp_trust_response",
+            "request_id": "trust-1",
+            "approved": True,
+        }
+        await launcher.process.stdout.feed(READY_WIRE)
+        assert await asyncio.wait_for(sending, timeout=1) == "running"
+        assert manager.status("session") == "running"
+        assert any(event.type == "mcp_trust_request" for event in events.history("session"))
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_trust_reject_response_is_structured_and_does_not_deadlock(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = ManualPromptLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        sending = asyncio.create_task(manager.send_message("session", "task"))
+        await asyncio.sleep(0)
+        await launcher.process.stdout.feed(trust_wire("trust-reject"))
+        await wait_for_status(manager, "session", "waiting_mcp_trust")
+        await manager.resolve_mcp_trust("session", False)
+        assert json.loads(launcher.process.stdin.raw_writes[-1])["approved"] is False
+        await launcher.process.stdout.feed(READY_WIRE)
+        assert await asyncio.wait_for(sending, timeout=1) == "running"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_waiting_mcp_trust_is_not_an_eviction_victim(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), sandbox_max_active=1)
+        launcher = ManualPromptLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        sending = asyncio.create_task(manager.send_message("trusted", "task"))
+        await asyncio.sleep(0)
+        await launcher.process.stdout.feed(trust_wire())
+        await wait_for_status(manager, "trusted", "waiting_mcp_trust")
+
+        assert await manager.send_message("queued", "other task") == "queued"
+        assert manager.status("trusted") == "waiting_mcp_trust"
+        assert manager.status("queued") == "queued"
+        await manager.resolve_mcp_trust("trusted", True, request_id="trust-1")
+        await launcher.process.stdout.feed(READY_WIRE)
+        assert await asyncio.wait_for(sending, timeout=1) == "running"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_agent_projection_bounds_tool_result_and_stderr_is_not_protocol(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        events = EventHub()
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher
+        )
+        await manager.send_message("session", "task")
+        caplog.set_level("WARNING")
+        await launcher.process.stderr.feed(b"debug token=super-secret\n")
+        await asyncio.sleep(0)
+        await launcher.process.stdout.feed(
+            jsonl(
+                {
+                    "type": "agent_event",
+                    "turn_id": "turn-large",
+                    "event": {
+                        "type": "tool_result",
+                        "tool_result": {"ok": True, "content": "x" * 20_000},
+                    },
+                }
+            )
+        )
+        await launcher.process.stdout.feed(FINISH_WIRE)
+        await wait_for_status(manager, "session", "idle")
+
+        agent_events = [
+            event for event in events.history("session") if event.type == "agent_event"
+        ]
+        projected = next(
+            event.data["event"]["tool_result"]
+            for event in agent_events
+            if event.data["event"].get("type") == "tool_result"
+        )
+        assert len(projected["content"]) == 16_000
+        assert "super-secret" not in caplog.text
+        assert "debug token=[redacted]" in caplog.text
         await manager.shutdown()
 
     asyncio.run(scenario())

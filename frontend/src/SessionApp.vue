@@ -15,7 +15,7 @@ const layoutDefaults = {
   workspaceCollapsed: false,
   terminalCollapsed: false,
 }
-const ACTIVE_TURN_STATUSES = ["starting", "queued", "running", "waiting_permission"]
+const ACTIVE_TURN_STATUSES = ["starting", "queued", "running", "waiting_permission", "waiting_mcp_trust"]
 
 function defaultLayout() {
   return { ...layoutDefaults }
@@ -67,6 +67,7 @@ const fileContent = ref("")
 const consoleEvents = ref([])
 const liveConsole = ref(null)
 const permission = ref(null)
+const pendingMcpTrust = ref(null)
 const turnStates = ref({})
 const expandedGroups = ref({})
 const message = ref("")
@@ -141,6 +142,7 @@ function clearCurrentSession(replace = true) {
   consoleEvents.value = []
   liveConsole.value = null
   permission.value = null
+  pendingMcpTrust.value = null
   turnStates.value = {}
   expandedGroups.value = {}
   sessionMenuId.value = null
@@ -162,6 +164,7 @@ async function openSession(sessionId, replace = false) {
   consoleEvents.value = []
   liveConsole.value = null
   permission.value = null
+  pendingMcpTrust.value = null
   turnStates.value = {}
   expandedGroups.value = {}
   const url = new URL(window.location.href)
@@ -185,6 +188,7 @@ async function loadMetadata(sessionId, token) {
   if (generation !== token) return
   currentSession.value = result
   permission.value = result.pending_permission
+  pendingMcpTrust.value = result.pending_mcp_trust
   if (result.active_turn_id) {
     updateTurnStatus(result.active_turn_id, result.runtime_status)
   }
@@ -288,6 +292,14 @@ function connectEvents(sessionId, token, after) {
       updateTurnStatus(data.turn_id, status)
     }
   })
+  eventSource.addEventListener("mcp_trust_request", (event) => {
+    if (generation !== token) return
+    pendingMcpTrust.value = JSON.parse(event.data)
+  })
+  eventSource.addEventListener("mcp_trust_resolved", (event) => {
+    if (generation !== token) return
+    pendingMcpTrust.value = null
+  })
   eventSource.addEventListener("workspace_changed", () => {
     if (generation !== token) return
     if (workspaceTimer) window.clearTimeout(workspaceTimer)
@@ -301,6 +313,12 @@ function connectEvents(sessionId, token, after) {
   })
   eventSource.addEventListener("error", (event) => {
     if (generation === token && event.data) showError(JSON.parse(event.data).message || "运行时错误")
+  })
+  eventSource.addEventListener("runtime_error", (event) => {
+    if (generation === token) {
+      const data = JSON.parse(event.data)
+      showError(data.message || "运行时协议错误")
+    }
   })
 }
 
@@ -421,7 +439,21 @@ async function resolvePermission(decision) {
     await request(scoped("/permission"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision }),
+      body: JSON.stringify({ decision, request_id: permission.value?.request_id }),
+    })
+  } catch (reason) { showError(reason) }
+}
+
+async function resolveMcpTrust(approved) {
+  if (!pendingMcpTrust.value) return
+  try {
+    await request(scoped("/mcp-trust"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        approved,
+        request_id: pendingMcpTrust.value.request_id,
+      }),
     })
   } catch (reason) { showError(reason) }
 }
@@ -505,48 +537,60 @@ onBeforeUnmount(() => {
   if (workspaceTimer) window.clearTimeout(workspaceTimer)
 })
 
-const toolPrefixes = [
-  "活动> ", "轮次> ", "提醒> ", "警告> ", "提示> ", "tool_call> ",
-  "tool_result> ", "artifact> ", "context> ", "progress> ", "stop> ", "instructions> ",
-]
-const knownTools = new Set([
-  "run_command", "read_file", "write_file", "apply_patch", "list_dir",
-  "delete_file", "move_file", "copy_file", "search", "artifact",
-])
-
 function clip(value, limit = 120) {
   const text = String(value || "").trim()
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text
 }
 
-function toolLabel(line) {
-  let cleaned = line.trim()
-  for (const prefix of toolPrefixes) {
-    if (cleaned.startsWith(prefix)) {
-      cleaned = cleaned.slice(prefix.length).trim()
-      break
-    }
-  }
-  const match = cleaned.match(/^([a-z][a-z0-9_.-]*)\s*(?:[:：]\s*|\s+)(.*)$/i)
-  if (match && knownTools.has(match[1])) return `${match[1]} · ${clip(match[2])}`
-  return clip(cleaned)
-}
-
 function turnKeyForEvent(event, fallback) {
   return typeof event.data?.turn_id === "string" && event.data.turn_id
     ? event.data.turn_id
-    : fallback || `legacy-${event.id}`
+    : fallback || "runtime"
 }
 
 function permissionStepFor(event, turnId) {
   const data = event.data || {}
-  const detail = data.command || data.command_display || data.summary || event.content
+  const detail = data.target || data.action || data.tool_name || event.content
+  const resolved = event.data?.decision
   return {
     id: `permission-${event.id}`,
-    key: `${turnId}:${data.command || data.command_display || data.summary || "permission"}`,
+    key: `${turnId}:${data.request_id || data.tool_name || data.action || "permission"}`,
     label: clip(detail),
-    status: /已允许/.test(event.content) ? "allowed" : /已拒绝/.test(event.content) ? "denied" : "waiting",
-    statusLabel: /已允许/.test(event.content) ? "Allowed" : /已拒绝/.test(event.content) ? "Denied" : "Waiting for permission",
+    status: resolved && resolved !== "deny" ? "allowed" : resolved === "deny" ? "denied" : "waiting",
+    statusLabel: resolved && resolved !== "deny" ? "Allowed" : resolved === "deny" ? "Denied" : "Waiting for permission",
+    detail: event.content,
+    data,
+  }
+}
+
+function structuredToolStep(event, index) {
+  const data = event.data || {}
+  const payload = data.event || {}
+  const type = data.event_type || payload.type || "runtime_event"
+  if (type === "tool_call") {
+    const call = payload.tool_call || {}
+    return {
+      id: `tool-${event.id}-${index}`,
+      label: `${call.name || "tool"} · call`,
+      statusLabel: "Started",
+      detail: JSON.stringify(call.arguments || {}, null, 2),
+      data,
+    }
+  }
+  if (type === "tool_result") {
+    const result = payload.tool_result || {}
+    return {
+      id: `tool-${event.id}-${index}`,
+      label: `${result.ok ? "✓" : "!"} ${type}`,
+      statusLabel: result.ok ? "Completed" : "Failed",
+      detail: result.content || result.error || event.content,
+      data,
+    }
+  }
+  return {
+    id: `tool-${event.id}-${index}`,
+    label: type,
+    statusLabel: type === "error" ? "Failed" : "Info",
     detail: event.content,
     data,
   }
@@ -577,15 +621,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
     const errors = []
     for (const event of group.events) {
       if (event.kind === "tool") {
-        for (const [index, line] of event.content.split("\n").entries()) {
-          if (line.trim()) tools.push({
-            id: `tool-${event.id}-${index}`,
-            label: toolLabel(line),
-            statusLabel: "Completed",
-            detail: line,
-            data: event.data || {},
-          })
-        }
+        tools.push(structuredToolStep(event, 0))
       } else if (event.kind === "permission") {
         const step = permissionStepFor(event, group.key)
         const existing = permissions.find((item) => item.key === step.key && item.status === "waiting")
@@ -596,15 +632,15 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
     }
     const groupPending = pendingPermission && pendingTurn === group.key ? pendingPermission : null
     if (groupPending) {
-      const key = `${group.key}:${groupPending.command || groupPending.command_display || groupPending.summary || "permission"}`
+      const key = `${group.key}:${groupPending.request_id || groupPending.tool_name || groupPending.action || "permission"}`
       if (!permissions.some((item) => item.key === key && item.status === "waiting")) {
         permissions.push({
           id: `pending-${group.key}`,
           key,
-          label: clip(groupPending.command || groupPending.command_display || groupPending.summary),
+          label: clip(groupPending.target || groupPending.action || groupPending.tool_name),
           status: "waiting",
           statusLabel: "Waiting for permission",
-          detail: groupPending.summary || "Agent 请求权限",
+          detail: groupPending.prompt || groupPending.reason || "Agent 请求权限",
           data: groupPending,
         })
       }
@@ -612,10 +648,12 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
     const groupLive = live?.active && liveTurn === group.key ? live : null
     const state = states[group.key]?.status
     const hasError = errors.length > 0 || state === "error" || groupLive?.kind === "error"
-    const active = ["starting", "queued", "running", "waiting_permission"].includes(state) ||
+    const active = ["starting", "queued", "running", "waiting_permission", "waiting_mcp_trust"].includes(state) ||
       (group.key === activeTurn && !hasError && session?.runtime_status !== "idle" && session?.runtime_status !== "stopped")
-    const status = hasError ? "error" : active && (state === "waiting_permission" || groupPending) ? "waiting" : active ? (state === "queued" ? "queued" : "running") : "completed"
-    const statusLabel = { running: "Running", waiting: "Waiting for permission", queued: "Queued", error: "Error", completed: "Completed" }[status]
+    const status = hasError ? "error" : active && (state === "waiting_permission" || state === "waiting_mcp_trust" || groupPending) ? "waiting" : active ? (state === "queued" ? "queued" : "running") : "completed"
+    const statusLabel = status === "waiting" && state === "waiting_mcp_trust"
+      ? "Waiting for MCP trust"
+      : { running: "Running", waiting: "Waiting for permission", queued: "Queued", error: "Error", completed: "Completed" }[status]
     const stepCount = tools.length + permissions.length
     const explicitExpanded = expanded[group.key]
     const groupExpanded = explicitExpanded === undefined
@@ -656,6 +694,23 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
     <div class="notice-area">
       <p v-if="error" class="error-banner">{{ error }}</p>
       <p v-if="lifecycleNotice" class="queue-notice global-notice">{{ lifecycleNotice }}</p>
+      <section v-if="pendingMcpTrust" class="mcp-trust-card">
+        <strong>MCP Trust required</strong>
+        <p>该 Project 请求使用以下 MCP Server。只展示 Core 提供的安全摘要，不包含 secret value。</p>
+        <ul>
+          <li v-for="server in pendingMcpTrust.servers" :key="`${server.alias}-${server.transport}`">
+            <b>{{ server.alias }}</b> · {{ server.transport }}
+            <span v-if="server.command"> · {{ server.command }} {{ (server.args || []).join(' ') }}</span>
+            <span v-if="server.url_template"> · {{ server.url_template }}</span>
+            <small v-if="server.env_keys?.length"> · env: {{ server.env_keys.join(', ') }}</small>
+            <small v-if="server.header_keys?.length"> · headers: {{ server.header_keys.join(', ') }}</small>
+          </li>
+        </ul>
+        <div class="permission-actions">
+          <button class="danger" @click="resolveMcpTrust(false)">Reject</button>
+          <button @click="resolveMcpTrust(true)">Allow</button>
+        </div>
+      </section>
     </div>
 
     <section class="main-area">

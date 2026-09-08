@@ -1,5 +1,4 @@
 import asyncio
-import codecs
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -9,26 +8,22 @@ import logging
 import re
 import time
 from typing import Coroutine, Literal, Protocol
+from uuid import uuid4
 
 from app.config import ServerSettings
 from app.services.events import EventHub
 from app.services.relay import RuntimeTokenRegistry
-from app.services.terminal_adapter import TerminalOutputAdapter
+from app.services.jsonl_runtime import (
+    JsonlProtocolError,
+    JsonlRuntimeAdapter,
+    PermissionDecision,
+)
 from app.services.workspace import WorkspaceService
 
 
 logger = logging.getLogger(__name__)
 MANAGED_SANDBOX_LABEL = "mycode-web.managed=true"
 AGENT_USER = "mycode-agent"
-PermissionDecision = Literal["deny", "once", "task", "session"]
-PERMISSION_INPUTS: dict[PermissionDecision, str] = {
-    "deny": "n\n",
-    "once": "y\n",
-    "task": "t\n",
-    "session": "s\n",
-}
-
-
 class RuntimeConflictError(RuntimeError):
     pass
 
@@ -42,15 +37,10 @@ class RuntimeUnavailableError(RuntimeError):
 
 
 def _normalize_cli_message(content: str) -> str:
-    """Convert one browser message into exactly one line for CLI stdin."""
-    normalized = re.sub(
-        r"[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)+",
-        " ",
-        content.strip(),
-    )
-    if not normalized:
+    """Validate a non-empty browser message without changing its content."""
+    if not isinstance(content, str) or not content.strip():
         raise ValueError("Message must not be empty.")
-    return normalized
+    return content
 
 
 def _turn_payload(turn_id: str | None) -> dict[str, str]:
@@ -66,9 +56,14 @@ class ProcessStdout(Protocol):
     async def read(self, size: int = -1) -> bytes: ...
 
 
+class ProcessStderr(Protocol):
+    async def read(self, size: int = -1) -> bytes: ...
+
+
 class SandboxProcess(Protocol):
     stdin: ProcessStdin | None
     stdout: ProcessStdout | None
+    stderr: ProcessStderr | None
     returncode: int | None
 
     async def wait(self) -> int: ...
@@ -159,7 +154,9 @@ class DockerSandboxLauncher:
         ]
         for name, value in self.settings.sandbox_optional_env:
             command.extend(["-e", f"{name}={value}"])
-        command.extend([self.settings.sandbox_image, "mycode", "agent", "--continue"])
+        command.extend(
+            [self.settings.sandbox_image, "mycode", "runtime", "--jsonl", "--continue"]
+        )
         return command
 
     async def launch(
@@ -169,7 +166,7 @@ class DockerSandboxLauncher:
             *self.command(session_id, workspace, mycode_state),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
         )
 
     async def cleanup_orphans(self) -> tuple[str, ...]:
@@ -232,12 +229,8 @@ class _QueuedTurn:
 class _RuntimeSession:
     process: SandboxProcess | None = None
     reader_task: asyncio.Task[None] | None = None
-    adapter: TerminalOutputAdapter = field(default_factory=TerminalOutputAdapter)
-    decoder: object = field(
-        default_factory=lambda: codecs.getincrementaldecoder("utf-8")(
-            errors="replace"
-        )
-    )
+    stderr_task: asyncio.Task[None] | None = None
+    adapter: JsonlRuntimeAdapter = field(default_factory=JsonlRuntimeAdapter)
     status: str = "stopped"
     busy: bool = False
     stopping: bool = False
@@ -250,6 +243,11 @@ class _RuntimeSession:
     terminal_clients: int = 0
     runtime_generation: int = 0
     relay_token: str | None = None
+    pending_permission: dict[str, object] | None = None
+    pending_mcp_trust: dict[str, object] | None = None
+    mcp_trust_resume_status: str | None = None
+    runtime_ready_seen: bool = False
+    runtime_closed_seen: bool = False
 
 
 class RuntimeManager:
@@ -289,7 +287,11 @@ class RuntimeManager:
 
     def pending_permission(self, session_id: str) -> dict[str, object] | None:
         state = self._sessions.get(session_id)
-        return None if state is None else state.adapter.pending_permission
+        return None if state is None else _copy_projection(state.pending_permission)
+
+    def pending_mcp_trust(self, session_id: str) -> dict[str, object] | None:
+        state = self._sessions.get(session_id)
+        return None if state is None else _copy_projection(state.pending_mcp_trust)
 
     def active_turn_id(self, session_id: str) -> str | None:
         state = self._sessions.get(session_id)
@@ -317,7 +319,12 @@ class RuntimeManager:
                 if state is None:
                     raise RuntimeUnavailableError("Runtime is not active.")
                 status = state.status
-                if status in {"idle", "running", "waiting_permission"} and self._is_live(state):
+                if status in {
+                    "idle",
+                    "running",
+                    "waiting_permission",
+                    "waiting_mcp_trust",
+                } and self._is_live(state):
                     return status
                 if status == "error":
                     raise RuntimeUnavailableError(
@@ -391,7 +398,12 @@ class RuntimeManager:
             if state.status == "stopped":
                 state.startup_error = None
             if state.status in {
-                "starting", "idle", "running", "waiting_permission", "queued"
+                "starting",
+                "idle",
+                "running",
+                "waiting_permission",
+                "waiting_mcp_trust",
+                "queued",
             }:
                 return state.status
             if state.status == "stopping":
@@ -423,6 +435,7 @@ class RuntimeManager:
         self, session_id: str, content: str, *, turn_id: str | None = None
     ) -> str:
         stdin_content = _normalize_cli_message(content)
+        turn_id = turn_id or uuid4().hex
         victim: tuple[str, _RuntimeSession] | None = None
         start_state: _RuntimeSession | None = None
         reuse_state: _RuntimeSession | None = None
@@ -439,7 +452,11 @@ class RuntimeManager:
                 state.active_turn_id = turn_id
                 waiting_start_state = state
             elif state.status in {
-                "queued", "running", "waiting_permission", "stopping"
+                "queued",
+                "running",
+                "waiting_permission",
+                "waiting_mcp_trust",
+                "stopping",
             } or state.busy:
                 raise RuntimeConflictError(
                     "This Session already has an active or queued Agent turn."
@@ -510,7 +527,10 @@ class RuntimeManager:
                 **_turn_payload(turn_id),
             )
             try:
-                await self._write(reuse_state, stdin_content + "\n")
+                await self._write_bytes(
+                    reuse_state,
+                    reuse_state.adapter.encode_turn(turn_id, stdin_content),
+                )
             except Exception:
                 await self.stop_session(session_id)
                 raise
@@ -527,28 +547,93 @@ class RuntimeManager:
         return "running"
 
     async def resolve_permission(
-        self, session_id: str, decision: PermissionDecision
+        self,
+        session_id: str,
+        decision: PermissionDecision,
+        request_id: str | None = None,
     ) -> None:
-        try:
-            stdin_input = PERMISSION_INPUTS[decision]
-        except KeyError as error:
-            raise ValueError("Unsupported permission decision.") from error
+        if decision not in {"deny", "once", "task", "session"}:
+            raise ValueError("Unsupported permission decision.")
         async with self._lock:
             state = self._sessions.get(session_id)
-            if state is None or not state.adapter.awaiting_permission:
+            pending = None if state is None else state.pending_permission
+            if pending is None:
                 raise RuntimeConflictError("There is no pending permission request.")
-            permission_data = dict(state.adapter.pending_permission or {})
+            expected_request_id = pending.get("request_id")
+            if request_id is not None and request_id != expected_request_id:
+                raise RuntimeConflictError("Permission request_id is stale.")
+            if not isinstance(expected_request_id, str):
+                raise RuntimeConflictError("Permission request is invalid.")
+            permission_data = dict(pending)
             turn_id = state.active_turn_id
             self._set_status_locked(state, "running")
             self._touch(session_id, state)
-        await self._write(state, stdin_input)
-        state.adapter.resolve_permission()
+        try:
+            await self._write_bytes(
+                state, state.adapter.encode_permission_response(expected_request_id, decision)
+            )
+        except Exception:
+            await self.stop_session(session_id)
+            raise
+        async with self._lock:
+            state.pending_permission = None
         await self.events.publish(
             session_id,
             "permission_resolved",
             decision=decision,
             allowed=decision != "deny",
             **permission_data,
+            **_turn_payload(turn_id),
+        )
+        await self.events.publish(
+            session_id,
+            "runtime_status",
+            status="running",
+            **_turn_payload(turn_id),
+        )
+
+    async def resolve_mcp_trust(
+        self,
+        session_id: str,
+        approved: bool,
+        request_id: str | None = None,
+    ) -> None:
+        async with self._lock:
+            state = self._sessions.get(session_id)
+            pending = None if state is None else state.pending_mcp_trust
+            if pending is None:
+                raise RuntimeConflictError("There is no pending MCP trust request.")
+            expected_request_id = pending.get("request_id")
+            if request_id is not None and request_id != expected_request_id:
+                raise RuntimeConflictError("MCP trust request_id is stale.")
+            if not isinstance(expected_request_id, str):
+                raise RuntimeConflictError("MCP trust request is invalid.")
+            resume_status = state.mcp_trust_resume_status or "starting"
+            turn_id = state.active_turn_id
+            self._set_status_locked(state, resume_status)
+            self._touch(session_id, state)
+        try:
+            await self._write_bytes(
+                state,
+                state.adapter.encode_mcp_trust_response(expected_request_id, approved),
+            )
+        except Exception:
+            await self.stop_session(session_id)
+            raise
+        async with self._lock:
+            state.pending_mcp_trust = None
+            state.mcp_trust_resume_status = None
+        await self.events.publish(
+            session_id,
+            "mcp_trust_resolved",
+            request_id=expected_request_id,
+            approved=approved,
+            **_turn_payload(turn_id),
+        )
+        await self.events.publish(
+            session_id,
+            "runtime_status",
+            status=resume_status,
             **_turn_payload(turn_id),
         )
         await self.events.publish(
@@ -574,8 +659,8 @@ class RuntimeManager:
                     expired.append((session_id, state, previous))
         for session_id, state, previous in expired:
             if previous == "waiting_permission":
-                permission_data = dict(state.adapter.pending_permission or {})
-                state.adapter.resolve_permission()
+                permission_data = dict(state.pending_permission or {})
+                state.pending_permission = None
                 await self.events.publish(
                     session_id,
                     "permission_resolved",
@@ -710,6 +795,11 @@ class RuntimeManager:
                 state.reader_task = asyncio.create_task(
                     self._read_output(session_id, state, process)
                 )
+                stderr = getattr(process, "stderr", None)
+                if stderr is not None:
+                    state.stderr_task = asyncio.create_task(
+                        self._read_stderr(session_id, stderr)
+                    )
                 self._touch(session_id, state)
         if should_stop:
             process.terminate()
@@ -717,19 +807,40 @@ class RuntimeManager:
             async with self._lock:
                 self._revoke_runtime_token_locked(session_id, state)
             raise RuntimeUnavailableError("Runtime manager is shutting down.")
-        try:
-            await asyncio.wait_for(state.ready.wait(), timeout=30)
-        except TimeoutError as error:
+        startup_deadline = asyncio.get_running_loop().time() + 30
+        while True:
             async with self._lock:
-                state.startup_error = "MyCode prompt did not become ready."
+                if state.ready.is_set():
+                    break
+                if state.status in {"error", "stopped", "stopping"}:
+                    raise RuntimeUnavailableError(
+                        "MyCode process stopped during startup."
+                    )
+                status_changed = state.status_changed
+                status_changed.clear()
+                waiting_for_trust = state.status == "waiting_mcp_trust"
+            if waiting_for_trust:
+                await status_changed.wait()
+                continue
+            remaining = startup_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                error = TimeoutError("runtime readiness timeout")
+                break
+            try:
+                await asyncio.wait_for(status_changed.wait(), timeout=remaining)
+            except TimeoutError as error:
+                break
+        if not state.ready.is_set():
+            async with self._lock:
+                state.startup_error = "MyCode runtime did not become ready."
             await self.events.publish(
                 session_id,
                 "error",
-                message="Sandbox started but the MyCode prompt did not become ready.",
+                message="Sandbox started but the MyCode runtime did not become ready.",
                 **_turn_payload(state.active_turn_id),
             )
             await self.stop_session(session_id)
-            raise RuntimeUnavailableError("MyCode prompt did not become ready.") from error
+            raise RuntimeUnavailableError("MyCode runtime did not become ready.") from error
         async with self._lock:
             if state.status != "starting" or not self._is_live(state):
                 raise RuntimeUnavailableError("MyCode process stopped during startup.")
@@ -748,7 +859,11 @@ class RuntimeManager:
             self._spawn(self._dispatch_from_idle(session_id, state))
             return
         try:
-            await self._write(state, stdin_content + "\n")
+            if state.active_turn_id is None:
+                raise RuntimeUnavailableError("Runtime turn_id was not assigned.")
+            await self._write_bytes(
+                state, state.adapter.encode_turn(state.active_turn_id, stdin_content)
+            )
         except Exception:
             await self.stop_session(session_id)
             raise
@@ -763,34 +878,30 @@ class RuntimeManager:
                 chunk = await process.stdout.read(4096)
                 if not chunk:
                     break
-                text = state.decoder.decode(chunk)
-                if not text:
-                    continue
                 self._touch(session_id, state)
-                await self.events.publish(
-                    session_id, "agent_output", content=text,
-                    **_turn_payload(state.active_turn_id),
-                )
-                for signal in state.adapter.feed(text):
-                    await self._handle_signal(
-                        session_id, state, signal.type, signal.data
-                    )
-            final_text = state.decoder.decode(b"", final=True)
-            if final_text:
-                self._touch(session_id, state)
-                await self.events.publish(
-                    session_id, "agent_output", content=final_text,
-                    **_turn_payload(state.active_turn_id),
-                )
+                for message in state.adapter.feed(chunk):
+                    await self._handle_message(session_id, state, message)
+            for message in state.adapter.finish():
+                await self._handle_message(session_id, state, message)
             return_code = await process.wait()
+            stderr_task = state.stderr_task
+            if (
+                stderr_task is not None
+                and stderr_task is not asyncio.current_task()
+            ):
+                await asyncio.gather(stderr_task, return_exceptions=True)
             async with self._lock:
                 if state.process is not process:
                     return
                 completed_turn_id = state.active_turn_id
                 state.process = None
                 state.reader_task = None
+                state.stderr_task = None
                 state.busy = False
                 state.ready.clear()
+                state.pending_permission = None
+                state.pending_mcp_trust = None
+                state.mcp_trust_resume_status = None
                 self._revoke_runtime_token_locked(session_id, state)
                 state.active_turn_id = None
                 state.container_ref = None
@@ -817,6 +928,23 @@ class RuntimeManager:
                 await self._schedule_waiting()
         except asyncio.CancelledError:
             raise
+        except JsonlProtocolError as error:
+            async with self._lock:
+                if state.process is process:
+                    state.startup_error = str(error)
+                    self._set_status_locked(state, "stopping")
+                    state.stopping = True
+            await self.events.publish(
+                session_id,
+                "error",
+                code=error.code,
+                message=f"Runtime JSONL protocol error: {error}",
+                **_turn_payload(state.active_turn_id),
+            )
+            await self._terminate_state(
+                session_id, state, reason="protocol_error", final_status="error"
+            )
+            await self._schedule_waiting()
         except Exception as error:
             async with self._lock:
                 if state.process is process:
@@ -829,22 +957,95 @@ class RuntimeManager:
                 **_turn_payload(state.active_turn_id),
             )
             await self._terminate_state(
-                session_id, state, reason="reader_failure"
+                session_id, state, reason="reader_failure", final_status="error"
             )
             await self._schedule_waiting()
 
-    async def _handle_signal(
-        self, session_id: str, state: _RuntimeSession,
-        signal_type: str, data: dict[str, object],
+    async def _read_stderr(
+        self, session_id: str, stream: ProcessStderr
     ) -> None:
-        if signal_type == "permission_request":
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            diagnostic = chunk.decode("utf-8", errors="replace")
+            logger.warning(
+                "Sandbox runtime stderr session=%s bytes=%d: %s",
+                session_id,
+                len(chunk),
+                _redact_diagnostic(diagnostic),
+            )
+
+    async def _handle_message(
+        self,
+        session_id: str,
+        state: _RuntimeSession,
+        message: dict[str, object],
+    ) -> None:
+        message_type = message["type"]
+        if message_type == "runtime_ready":
+            ready_data = _without_protocol_fields(message)
+            ready_data.pop("session_id", None)
             async with self._lock:
-                if state.status != "running":
-                    return
+                state.runtime_ready_seen = True
+                state.ready.set()
+                state.status_changed.set()
+                self._touch(session_id, state)
+            await self.events.publish(
+                session_id,
+                "runtime_ready",
+                **ready_data,
+                **_turn_payload(state.active_turn_id),
+            )
+            return
+        if message_type == "mcp_status":
+            await self.events.publish(
+                session_id,
+                "mcp_status",
+                **_without_protocol_fields(message),
+                **_turn_payload(state.active_turn_id),
+            )
+            return
+        if message_type == "mcp_trust_request":
+            request_id = _required_string(message, "request_id", "mcp_trust_request")
+            servers = _safe_mcp_servers(message.get("servers"))
+            async with self._lock:
+                state.mcp_trust_resume_status = state.status
+                state.pending_mcp_trust = {
+                    "request_id": request_id,
+                    "servers": servers,
+                }
+                self._set_status_locked(state, "waiting_mcp_trust")
+                self._touch(session_id, state)
+            await self.events.publish(
+                session_id,
+                "mcp_trust_request",
+                request_id=request_id,
+                servers=servers,
+                **_turn_payload(state.active_turn_id),
+            )
+            await self.events.publish(
+                session_id,
+                "runtime_status",
+                status="waiting_mcp_trust",
+                **_turn_payload(state.active_turn_id),
+            )
+            return
+        if message_type == "permission_request":
+            request_id = _required_string(message, "request_id", "permission_request")
+            data = _without_protocol_fields(message)
+            data["request_id"] = request_id
+            bounded_data = _bounded_value(data)
+            if not isinstance(bounded_data, dict):
+                raise JsonlProtocolError(
+                    "invalid_permission_request", "Permission request projection is invalid."
+                )
+            async with self._lock:
+                state.pending_permission = bounded_data
                 self._set_status_locked(state, "waiting_permission")
                 self._touch(session_id, state)
             await self.events.publish(
-                session_id, "permission_request", **data,
+                session_id, "permission_request", **bounded_data,
                 **_turn_payload(state.active_turn_id),
             )
             await self.events.publish(
@@ -852,25 +1053,74 @@ class RuntimeManager:
                 **_turn_payload(state.active_turn_id),
             )
             return
-        if signal_type != "ready":
+        if message_type == "agent_event":
+            event = message.get("event")
+            if not isinstance(event, dict):
+                raise JsonlProtocolError(
+                    "invalid_agent_event", "agent_event requires an event object."
+                )
+            turn_id = message.get("turn_id")
+            projected = _project_agent_event(event)
+            await self.events.publish(
+                session_id,
+                "agent_event",
+                turn_id=turn_id if isinstance(turn_id, str) else state.active_turn_id,
+                event=projected,
+            )
             return
-        async with self._lock:
-            self._touch(session_id, state)
-            if state.status == "starting":
-                state.ready.set()
-                return
-            if state.status not in {"running", "waiting_permission"}:
-                return
-            state.busy = False
-            self._set_status_locked(state, "idle")
-            state.ready.set()
-            completed_turn_id = state.active_turn_id
-            state.active_turn_id = None
+        if message_type == "turn_finished":
+            turn_id = message.get("turn_id")
+            completed_turn_id = turn_id if isinstance(turn_id, str) else state.active_turn_id
+            await self.events.publish(
+                session_id,
+                "turn_finished",
+                status=message.get("status"),
+                stop_reason=message.get("stop_reason"),
+                **_turn_payload(completed_turn_id),
+            )
+            async with self._lock:
+                if state.active_turn_id == completed_turn_id or completed_turn_id is None:
+                    state.busy = False
+                    state.pending_permission = None
+                    self._set_status_locked(state, "idle")
+                    self._touch(session_id, state)
+                    state.active_turn_id = None
+            await self.events.publish(
+                session_id,
+                "runtime_status",
+                status="idle",
+                **_turn_payload(completed_turn_id),
+            )
+            self._spawn(self._dispatch_from_idle(session_id, state))
+            return
+        if message_type == "runtime_warning":
+            await self.events.publish(
+                session_id,
+                "runtime_warning",
+                **_without_protocol_fields(message),
+                **_turn_payload(state.active_turn_id),
+            )
+            return
+        if message_type == "runtime_error":
+            await self.events.publish(
+                session_id,
+                "runtime_error",
+                **_without_protocol_fields(message),
+                **_turn_payload(state.active_turn_id),
+            )
+            return
+        if message_type == "runtime_closed":
+            async with self._lock:
+                state.runtime_closed_seen = True
+                self._touch(session_id, state)
+            return
         await self.events.publish(
-            session_id, "runtime_status", status="idle",
-            **_turn_payload(completed_turn_id),
+            session_id,
+            "runtime_warning",
+            code="unexpected_output",
+            message=f"Ignored unknown runtime message type: {message_type}",
+            **_turn_payload(state.active_turn_id),
         )
-        self._spawn(self._dispatch_from_idle(session_id, state))
 
     async def _dispatch_from_idle(
         self, session_id: str, state: _RuntimeSession
@@ -948,10 +1198,7 @@ class RuntimeManager:
     async def _send_when_ready(
         self, session_id: str, state: _RuntimeSession, stdin_content: str
     ) -> None:
-        try:
-            await asyncio.wait_for(state.ready.wait(), timeout=30)
-        except TimeoutError as error:
-            raise RuntimeUnavailableError("MyCode prompt did not become ready.") from error
+        await self._wait_for_runtime_ready(state)
         while True:
             async with self._lock:
                 if state.status == "idle" and self._is_live(state):
@@ -970,23 +1217,61 @@ class RuntimeManager:
             **_turn_payload(state.active_turn_id),
         )
         try:
-            await self._write(state, stdin_content + "\n")
+            if state.active_turn_id is None:
+                raise RuntimeUnavailableError("Runtime turn_id was not assigned.")
+            await self._write_bytes(
+                state, state.adapter.encode_turn(state.active_turn_id, stdin_content)
+            )
         except Exception:
             await self.stop_session(session_id)
             raise
 
-    async def _write(self, state: _RuntimeSession, content: str) -> None:
+    async def _wait_for_runtime_ready(self, state: _RuntimeSession) -> None:
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            if state.ready.is_set():
+                return
+            async with self._lock:
+                if state.ready.is_set():
+                    return
+                if state.status in {"error", "stopped", "stopping"}:
+                    raise RuntimeUnavailableError(
+                        "MyCode process stopped during startup."
+                    )
+                changed = state.status_changed
+                changed.clear()
+                waiting_for_trust = state.status == "waiting_mcp_trust"
+            if waiting_for_trust:
+                await changed.wait()
+                continue
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RuntimeUnavailableError("MyCode runtime did not become ready.")
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=remaining)
+            except TimeoutError as error:
+                raise RuntimeUnavailableError(
+                    "MyCode runtime did not become ready."
+                ) from error
+
+    async def _write_bytes(self, state: _RuntimeSession, payload: bytes) -> None:
         process = state.process
         if process is None or process.returncode is not None or process.stdin is None:
             raise RuntimeUnavailableError("MyCode process is not running.")
-        process.stdin.write(content.encode("utf-8"))
+        process.stdin.write(payload)
         await process.stdin.drain()
 
     async def _terminate_state(
-        self, session_id: str, state: _RuntimeSession, *, reason: str
+        self,
+        session_id: str,
+        state: _RuntimeSession,
+        *,
+        reason: str,
+        final_status: str = "stopped",
     ) -> None:
         process = state.process
         reader_task = state.reader_task
+        stderr_task = state.stderr_task
         if process is not None and process.returncode is None:
             process.terminate()
             try:
@@ -1001,21 +1286,32 @@ class RuntimeManager:
         ):
             reader_task.cancel()
             await asyncio.gather(reader_task, return_exceptions=True)
+        if (
+            stderr_task is not None
+            and stderr_task is not asyncio.current_task()
+            and not stderr_task.done()
+        ):
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
         async with self._lock:
             if state.process is process:
                 state.process = None
                 state.reader_task = None
+                state.stderr_task = None
             state.busy = False
             state.ready.clear()
             state.stopping = False
             state.terminal_clients = 0
             completed_turn_id = state.active_turn_id
+            state.pending_permission = None
+            state.pending_mcp_trust = None
+            state.mcp_trust_resume_status = None
             self._revoke_runtime_token_locked(session_id, state)
             state.active_turn_id = None
             state.container_ref = None
-            self._set_status_locked(state, "stopped")
+            self._set_status_locked(state, final_status)
         await self.events.publish(
-            session_id, "runtime_status", status="stopped", reason=reason,
+            session_id, "runtime_status", status=final_status, reason=reason,
             **_turn_payload(completed_turn_id),
         )
         if self._runtime_stop_hook is not None:
@@ -1025,8 +1321,7 @@ class RuntimeManager:
         self, session_id: str, state: _RuntimeSession
     ) -> None:
         self._revoke_runtime_token_locked(session_id, state)
-        state.adapter = TerminalOutputAdapter()
-        state.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        state.adapter = JsonlRuntimeAdapter()
         state.ready.clear()
         state.stopping = False
         self._set_status_locked(state, "starting")
@@ -1038,6 +1333,11 @@ class RuntimeManager:
         state.relay_token = self.relay_tokens.issue(
             session_id, state.runtime_generation
         )
+        state.pending_permission = None
+        state.pending_mcp_trust = None
+        state.mcp_trust_resume_status = None
+        state.runtime_ready_seen = False
+        state.runtime_closed_seen = False
         self._touch(session_id, state)
 
     def _revoke_runtime_token_locked(
@@ -1163,3 +1463,110 @@ class RuntimeManager:
                 "Runtime background task failed",
                 exc_info=(type(error), error, error.__traceback__),
             )
+
+
+def _without_protocol_fields(message: dict[str, object]) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in message.items()
+        if key not in {"version", "type"}
+    }
+
+
+def _required_string(
+    message: dict[str, object], key: str, message_type: str
+) -> str:
+    value = message.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise JsonlProtocolError(
+            f"missing_{key}", f"{message_type} requires a non-empty {key}."
+        )
+    return value
+
+
+def _copy_projection(value: dict[str, object] | None) -> dict[str, object] | None:
+    return None if value is None else dict(value)
+
+
+def _bounded_value(value: object, *, depth: int = 0) -> object:
+    if depth > 4:
+        return "[nested value omitted]"
+    if isinstance(value, str):
+        return value if len(value) <= 16_000 else value[:15_997] + "..."
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:64]
+        }
+    if isinstance(value, (list, tuple)):
+        items = [_bounded_value(item, depth=depth + 1) for item in value[:64]]
+        if len(value) > 64:
+            items.append("[additional values omitted]")
+        return items
+    return str(value)[:16_000]
+
+
+def _project_agent_event(event: dict[str, object]) -> dict[str, object]:
+    event_type = event.get("type")
+    if not isinstance(event_type, str) or not event_type:
+        raise JsonlProtocolError("missing_agent_event_type", "Agent event requires a type.")
+    payload: dict[str, object] = {"type": event_type}
+    for key in (
+        "content",
+        "turn_number",
+        "max_turns",
+        "progress",
+        "model_retry",
+        "stop_reason",
+        "error",
+        "reasoning_state",
+    ):
+        if key in event:
+            payload[key] = _bounded_value(event[key])
+    for key in ("tool_call", "tool_result"):
+        if key in event:
+            payload[key] = _bounded_value(event[key])
+    return payload
+
+
+def _safe_mcp_servers(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise JsonlProtocolError(
+            "invalid_mcp_trust_request", "mcp_trust_request requires a servers list."
+        )
+    result: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise JsonlProtocolError(
+                "invalid_mcp_trust_request", "MCP trust server entries must be objects."
+            )
+        alias = item.get("alias")
+        transport = item.get("transport")
+        if not isinstance(alias, str) or not isinstance(transport, str):
+            raise JsonlProtocolError(
+                "invalid_mcp_trust_request", "MCP trust server metadata is invalid."
+            )
+        safe: dict[str, object] = {"alias": alias, "transport": transport}
+        if transport == "stdio":
+            safe["command"] = _bounded_value(item.get("command", ""))
+            safe["args"] = _bounded_value(item.get("args", []))
+            safe["env_keys"] = _bounded_value(item.get("env_keys", []))
+        else:
+            safe["url_template"] = _bounded_value(item.get("url_template", ""))
+            safe["destination"] = _bounded_value(item.get("destination", ""))
+            safe["header_keys"] = _bounded_value(item.get("header_keys", []))
+        result.append(safe)
+    return result
+
+
+def _redact_diagnostic(value: str) -> str:
+    value = re.sub(
+        r"(?i)(authorization|api[_-]?key|token|secret|password)(\s*[:=]\s*)\S+",
+        r"\1\2[redacted]",
+        value,
+    )
+    value = re.sub(r"\b(?:sk|rk)-[A-Za-z0-9_-]{10,}\b", "[redacted]", value)
+    compact = value.replace("\r", " ").replace("\n", " ")
+    return compact if len(compact) <= 2_000 else compact[:1_997] + "..."

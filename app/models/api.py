@@ -20,6 +20,12 @@ PermissionChoice = Literal["deny", "once", "task", "session"]
 
 class PermissionDecisionRequest(BaseModel):
     decision: PermissionChoice
+    request_id: str = Field(min_length=1, max_length=200)
+
+
+class MCPTrustDecisionRequest(BaseModel):
+    approved: bool
+    request_id: str = Field(min_length=1, max_length=200)
 
 
 class UserResponse(BaseModel):
@@ -34,6 +40,7 @@ class SessionResponse(BaseModel):
     runtime_status: str
     active_turn_id: str | None = None
     pending_permission: dict[str, object] | None = None
+    pending_mcp_trust: dict[str, object] | None = None
 
 
 class SessionListResponse(BaseModel):

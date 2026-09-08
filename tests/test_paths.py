@@ -150,11 +150,13 @@ def test_permission_frontend_uses_scoped_decisions_and_runtime_session_hint() ->
     ).read_text(encoding="utf-8")
 
     assert "async function resolvePermission(decision)" in source
-    assert "body: JSON.stringify({ decision })" in source
+    assert "body: JSON.stringify({ decision, request_id: permission.value?.request_id })" in source
     assert "resolvePermission('deny')" in source
     assert "resolvePermission('once')" in source
     assert "resolvePermission('task')" in source
     assert "resolvePermission('session')" in source
     assert "Runtime 重启后失效" in source
+    assert "async function resolveMcpTrust(approved)" in source
+    assert "request_id: pendingMcpTrust.value.request_id" in source
     assert "resolvePermission(false)" not in source
     assert "resolvePermission(true)" not in source

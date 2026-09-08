@@ -56,7 +56,7 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 .status, .terminal-status { border-radius: 999px; background: #d8ded5; padding: 0.28rem 0.6rem; font-size: 0.72rem; }
 .status[data-status="running"], .terminal-status[data-status="starting"], .terminal-status[data-status="reconnecting"] { background: #f4d790; }
 .status[data-status="idle"], .terminal-status[data-status="ready"] { background: #b8dfbd; }
-.status[data-status="waiting_permission"] { background: #f0b9a8; }
+.status[data-status="waiting_permission"], .status[data-status="waiting_mcp_trust"] { background: #f0b9a8; }
 .status[data-status="queued"], .terminal-status[data-status="queued"] { background: #c9d6f0; }
 .status[data-status="starting"] { background: #d9c8f0; }
 .status[data-status="error"], .terminal-status[data-status="error"] { background: #efb3ad; }
@@ -181,6 +181,11 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 .permission-step dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .permission-actions { display: flex; justify-content: flex-end; gap: 0.35rem; margin-top: 0.45rem; }
 .permission-actions button { padding: 0.3rem 0.55rem; font-size: 0.72rem; }
+.mcp-trust-card { margin: 0.6rem auto; max-width: 980px; border: 1px solid #806244; border-radius: 7px; background: #2b241a; color: #f0dfc4; padding: 0.65rem 0.8rem; }
+.mcp-trust-card p { margin: 0.3rem 0; font-size: 0.78rem; }
+.mcp-trust-card ul { margin: 0.35rem 0; padding-left: 1.2rem; font-size: 0.74rem; }
+.mcp-trust-card li { margin: 0.2rem 0; overflow-wrap: anywhere; }
+.mcp-trust-card small { color: #d2c1a8; }
 .composer { display: grid; grid-template-columns: 1fr auto; gap: 0.45rem; margin-top: 0.55rem; }
 .composer textarea { resize: vertical; min-height: 58px; border: 1px solid #cdd2c8; border-radius: 7px; padding: 0.55rem; }
 .composer button { align-self: end; height: 38px; }

@@ -25,6 +25,7 @@ from app.db.database import WebSession, WebUser
 from app.models.api import (
     ConsoleEventResponse,
     ConsoleSnapshotResponse,
+    MCPTrustDecisionRequest,
     MessageRequest,
     PermissionDecisionRequest,
     ProfileUpdate,
@@ -63,6 +64,7 @@ def _session_response(request: Request, session: WebSession) -> SessionResponse:
         runtime_status=runtime.status(session.id),
         active_turn_id=runtime.active_turn_id(session.id),
         pending_permission=runtime.pending_permission(session.id),
+        pending_mcp_trust=runtime.pending_mcp_trust(session.id),
     )
 
 
@@ -300,7 +302,26 @@ async def permission(
 ) -> dict[str, str]:
     try:
         await services(request).runtime.resolve_permission(
-            context.session.id, payload.decision
+            context.session.id, payload.decision, request_id=payload.request_id
+        )
+    except RuntimeConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except RuntimeUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"status": "resolved"}
+
+
+@router.post("/sessions/{session_id}/mcp-trust")
+async def mcp_trust(
+    payload: MCPTrustDecisionRequest,
+    request: Request,
+    context: WebContext = Depends(current_context),
+) -> dict[str, str]:
+    try:
+        await services(request).runtime.resolve_mcp_trust(
+            context.session.id,
+            payload.approved,
+            request_id=payload.request_id,
         )
     except RuntimeConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error

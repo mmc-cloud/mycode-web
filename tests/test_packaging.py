@@ -77,7 +77,7 @@ def test_sandbox_keeps_mycode_venv_private_from_user_projects() -> None:
     assert "chown -R mycode-agent:workspace /workspace /home/mycode" in dockerfile
     assert "chown -R workspace-user:workspace /home/workspace-user" in dockerfile
     assert "COPY docker/entrypoint-sandbox.sh /usr/local/bin/sandbox-entrypoint" in dockerfile
-    assert 'CMD ["mycode", "agent", "--continue"]' in dockerfile
+    assert 'CMD ["mycode", "runtime", "--jsonl", "--continue"]' in dockerfile
 
 
 def test_build_scripts_accept_external_mycode_source() -> None:

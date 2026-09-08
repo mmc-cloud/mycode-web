@@ -24,12 +24,23 @@ def test_console_events_persist_turn_id_and_do_not_coalesce_across_turns(
         session_id, "user_message", {"content": "first", "turn_id": "turn-1"}
     )
     recorder.record_event(
-        session_id, "agent_output", {"content": "assistant> one\n", "turn_id": "turn-1"}
+        session_id,
+        "agent_event",
+        {
+            "turn_id": "turn-1",
+            "event": {"type": "text_delta", "content": "one"},
+        },
     )
     recorder.record_event(
-        session_id, "agent_output", {"content": "assistant> two\n", "turn_id": "turn-2"}
+        session_id,
+        "agent_event",
+        {
+            "turn_id": "turn-2",
+            "event": {"type": "text_delta", "content": "two"},
+        },
     )
 
+    recorder.record_event(session_id, "turn_finished", {"turn_id": "turn-2"})
     history = database.console_history(session_id, user_id)
     assert history[0].data["turn_id"] == "turn-1"
     assert history[1].data["turn_id"] == "turn-1"
