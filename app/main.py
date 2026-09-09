@@ -52,10 +52,13 @@ def create_app(
 
     terminal_holder: list[TerminalManager] = []
 
-    async def runtime_stop_hook(session_id: str) -> None:
-        await watcher.stop(session_id)
+    async def runtime_start_hook(session_id: str, generation: int) -> None:
+        await watcher.ensure(session_id, generation)
+
+    async def runtime_stop_hook(session_id: str, generation: int) -> None:
+        await watcher.stop(session_id, generation)
         if terminal_holder:
-            await terminal_holder[0].stop_session(session_id)
+            await terminal_holder[0].stop_session(session_id, generation)
 
     runtime = RuntimeManager(
         effective_settings,
@@ -63,7 +66,7 @@ def create_app(
         events,
         launcher=launcher,
         activity_hook=database.touch_session,
-        runtime_start_hook=watcher.ensure,
+        runtime_start_hook=runtime_start_hook,
         runtime_stop_hook=runtime_stop_hook,
         relay_tokens=relay_tokens,
         session_owner_resolver=database.get_session_owner_id,

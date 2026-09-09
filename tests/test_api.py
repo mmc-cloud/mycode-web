@@ -394,42 +394,11 @@ def test_console_history_api_is_owned_and_session_scoped(tmp_path: Path) -> None
         ).json()
         assert snapshot_a["events"][0]["content"] == "only a"
         assert snapshot_b["events"][0]["content"] == "only b"
-        assert snapshot_a["event_cursor"] == 0
-        assert snapshot_b["event_cursor"] == 0
+        assert "event_cursor" not in snapshot_a
+        assert "event_cursor" not in snapshot_b
         assert stranger.get(
             f"{API_BASE_PATH}/sessions/{session_a}/console"
         ).status_code == 404
-
-
-def test_console_snapshot_cursor_replays_event_published_before_sse(
-    tmp_path: Path,
-) -> None:
-    app = create_test_app(tmp_path)
-    with TestClient(app) as client:
-        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
-        snapshot = client.get(
-            f"{API_BASE_PATH}/sessions/{session_id}/console"
-        ).json()
-
-        async def publish_then_connect():
-            published = await app.state.services.events.publish(
-                session_id,
-                "console_event",
-                console_id=1,
-                kind="assistant",
-                content="between snapshot and SSE",
-                data={},
-            )
-            stream = app.state.services.events.stream(
-                session_id, snapshot["event_cursor"]
-            )
-            replayed = await anext(stream)
-            await stream.aclose()
-            return published, replayed
-
-        published, replayed = asyncio.run(publish_then_connect())
-
-    assert replayed == published
 
 
 def test_session_bootstrap_cursor_is_captured_before_runtime_snapshot(

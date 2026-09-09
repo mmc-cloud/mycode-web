@@ -64,7 +64,6 @@ class ConsoleEventResponse(BaseModel):
 
 class ConsoleSnapshotResponse(BaseModel):
     events: list[ConsoleEventResponse]
-    event_cursor: int
 
 
 class FileTreeEntry(BaseModel):

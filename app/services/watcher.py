@@ -35,12 +35,14 @@ class WorkspaceWatchManager:
         self._session_owner_resolver = session_owner_resolver
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop_events: dict[str, asyncio.Event] = {}
+        self._generations: dict[str, int | None] = {}
         self._lock = asyncio.Lock()
 
-    async def ensure(self, session_id: str) -> None:
+    async def ensure(self, session_id: str, generation: int | None = None) -> None:
         async with self._lock:
             existing = self._tasks.get(session_id)
             if existing is not None and not existing.done():
+                self._generations[session_id] = generation
                 return
             owner_id = (
                 self._session_owner_resolver(session_id)
@@ -63,11 +65,16 @@ class WorkspaceWatchManager:
             )
             self._stop_events[session_id] = stop_event
             self._tasks[session_id] = task
+            self._generations[session_id] = generation
 
-    async def stop(self, session_id: str) -> None:
+    async def stop(self, session_id: str, generation: int | None = None) -> None:
         async with self._lock:
+            current_generation = self._generations.get(session_id)
+            if generation is not None and current_generation != generation:
+                return
             stop_event = self._stop_events.pop(session_id, None)
             task = self._tasks.pop(session_id, None)
+            self._generations.pop(session_id, None)
             if stop_event is not None:
                 stop_event.set()
         if task is not None and not task.done():
@@ -114,6 +121,7 @@ class WorkspaceWatchManager:
         if self._tasks.get(session_id) is task:
             self._tasks.pop(session_id, None)
             self._stop_events.pop(session_id, None)
+            self._generations.pop(session_id, None)
 
 
 def _project_changes(

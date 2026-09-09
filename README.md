@@ -58,14 +58,15 @@ Workspace watcher 跟随 active Runtime 生命周期，而不是永久附着在�
 
 ## 页面初始化
 
-进入 Session 后，metadata、Workspace tree 和 activate 可以并行执行。Console 与 fresh SSE 使用明确的 snapshot + cursor 协议：
+进入 Session 后，Workspace tree 和 activate 可以与 bootstrap 请求并行执行。Runtime metadata、Console history 和 fresh SSE 使用明确的 bootstrap cursor 协议：
 
-1. 前端先请求 `/console`；
-2. FastAPI 先记录该 Session 的 EventHub `latest_id`，再读取 SQLite Console history；
-3. `/console` 返回 SQLite snapshot 和 `event_cursor`；
-4. 前端通过 `/events?after=<event_cursor>` 建立 fresh SSE。
+1. 前端先请求 `GET /sessions/{id}`；
+2. FastAPI 先捕获该 Session 的 EventHub `latest_id` 作为 `event_cursor`，再读取 Runtime snapshot：`runtime_status`、`active_turn_id`、`pending_permission` 和 `pending_mcp_trust`；
+3. 前端使用 bootstrap response 的 `event_cursor` 作为 `/events?after=<event_cursor>` 的 fresh SSE 起点；
+4. 前端独立请求 `/console`，它只返回 SQLite stable Console history，不再返回或维护 SSE cursor；
+5. bootstrap cursor 之后产生的 replayable event 由 SSE replay/live stream 补齐。
 
-语义上，`<= event_cursor` 的稳定 Console history 来自 SQLite snapshot，`> event_cursor` 的增量由 SSE replay/live stream 提供，从而避免 Console snapshot 与 SSE 初始化之间丢事件或整批重复历史。
+cursor 在 Runtime snapshot 之前捕获，因此 Permission / MCP Trust 请求要么已经存在于 bootstrap snapshot，要么会作为 cursor 之后的 replayable SSE event 到达。两者短暂重复是允许的，但事件不能丢失。
 
 网络断线重连时，浏览器携带的 `Last-Event-ID` 用于补发错过的 replayable stable events；`Last-Event-ID` 的优先级高于 query parameter `after`。
 
@@ -93,7 +94,7 @@ Web 与 Core 之间使用正式的 JSONL machine protocol：
 
 Core `agent_event` 由 RuntimeManager 投影为 Browser 使用的结构化事件：`text_delta` 用于 assistant streaming，`tool_call` / `tool_result` 用于 execution group，其他支持事件保留结构化字段。`console_live` 与 raw `agent_event` 都是 live-only，不进入 EventHub replay history；稳定的 `console_event` 由 ConsoleRecorder 写入 SQLite，负责刷新后的历史恢复。过大的 tool result 在 Web projection 层做有界摘要，不改变 Core wire message。
 
-SSE replay buffer 位于 FastAPI 进程内。`runtime_status`、Permission/MCP Trust 生命周期事件、`runtime_warning`、`runtime_error` 和 `console_event` 等稳定事件可以 replay；raw `agent_event` 和 `console_live` 只发送给当前 live subscriber。Fresh connection 使用 snapshot `event_cursor`，reconnect 使用 `Last-Event-ID`，且 `Last-Event-ID` 优先于 `after`。服务重启后 replay buffer 不恢复；Console 历史恢复依赖 SQLite，而不是 SSE history。
+SSE replay buffer 位于 FastAPI 进程内。`runtime_status`、Permission/MCP Trust 生命周期事件、`runtime_warning`、`runtime_error` 和 `console_event` 等稳定事件可以 replay；raw `agent_event` 和 `console_live` 只发送给当前 live subscriber。Fresh connection 使用 Session bootstrap `event_cursor`，reconnect 使用 `Last-Event-ID`，且 `Last-Event-ID` 优先于 `after`。服务重启后 replay buffer 不恢复；Console 历史恢复依赖 SQLite，而不是 SSE history。
 
 ## 环境要求
 

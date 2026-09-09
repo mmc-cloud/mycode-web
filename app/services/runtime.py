@@ -255,8 +255,8 @@ class RuntimeManager:
         *,
         clock: Callable[[], float] = time.monotonic,
         activity_hook: Callable[[str], None] | None = None,
-        runtime_start_hook: Callable[[str], Awaitable[None]] | None = None,
-        runtime_stop_hook: Callable[[str], Awaitable[None]] | None = None,
+        runtime_start_hook: Callable[[str, int], Awaitable[None]] | None = None,
+        runtime_stop_hook: Callable[[str, int], Awaitable[None]] | None = None,
         relay_tokens: RuntimeTokenRegistry | None = None,
         session_owner_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
@@ -800,6 +800,7 @@ class RuntimeManager:
         self, session_id: str, state: _RuntimeSession, turn_content: str | None
     ) -> None:
         process: SandboxProcess | None = None
+        launch_generation = state.runtime_generation
         try:
             owner_id = (
                 self._session_owner_resolver(session_id)
@@ -816,7 +817,7 @@ class RuntimeManager:
                 **_turn_payload(state.active_turn_id),
             )
             if self._runtime_start_hook is not None:
-                await self._runtime_start_hook(session_id)
+                await self._runtime_start_hook(session_id, launch_generation)
             set_token = getattr(self.launcher, "set_runtime_token", None)
             if set_token is not None:
                 if state.relay_token is None:
@@ -855,7 +856,7 @@ class RuntimeManager:
                 **_turn_payload(failed_turn_id),
             )
             if self._runtime_stop_hook is not None:
-                await self._runtime_stop_hook(session_id)
+                await self._runtime_stop_hook(session_id, launch_generation)
             await self._schedule_waiting()
             raise RuntimeUnavailableError("Sandbox failed to start.") from error
         async with self._lock:
@@ -980,6 +981,7 @@ class RuntimeManager:
                 state.container_ref = None
                 stopped_intentionally = state.stopping
                 clean_exit = return_code == 0
+                completed_generation = state.runtime_generation
                 self._set_status_locked(
                     state,
                     "stopped" if stopped_intentionally or clean_exit else "error",
@@ -996,7 +998,7 @@ class RuntimeManager:
                 **_turn_payload(completed_turn_id),
             )
             if self._runtime_stop_hook is not None:
-                await self._runtime_stop_hook(session_id)
+                await self._runtime_stop_hook(session_id, completed_generation)
             if not stopped_intentionally:
                 await self._schedule_waiting()
         except asyncio.CancelledError:
@@ -1338,6 +1340,7 @@ class RuntimeManager:
         reason: str,
         final_status: str = "stopped",
     ) -> None:
+        cleanup_generation = state.runtime_generation
         process = state.process
         reader_task = state.reader_task
         stderr_task = state.stderr_task
@@ -1384,7 +1387,7 @@ class RuntimeManager:
             **_turn_payload(completed_turn_id),
         )
         if self._runtime_stop_hook is not None:
-            await self._runtime_stop_hook(session_id)
+            await self._runtime_stop_hook(session_id, cleanup_generation)
 
     def _prepare_start_locked(
         self, session_id: str, state: _RuntimeSession

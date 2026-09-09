@@ -1388,7 +1388,7 @@ def test_oldest_idle_is_evicted_instead_of_queueing(tmp_path: Path) -> None:
 
         assert await manager.send_message("new", "third") == "running"
         assert manager.status("old-idle") == "stopped"
-        stop_watcher.assert_any_await("old-idle")
+        stop_watcher.assert_any_await("old-idle", 1)
         assert manager.queued_count == 0
         assert (marker_workspace / "keep.txt").read_text(encoding="utf-8") == "workspace"
         assert (marker_state / "keep.txt").read_text(encoding="utf-8") == "state"
@@ -1458,7 +1458,7 @@ def test_idle_ttl_only_reclaims_expired_runtime_and_preserves_data(
         clock.advance(1)
         assert await manager.sweep_expired() == ("session",)
         assert manager.status("session") == "stopped"
-        stop_watcher.assert_awaited_with("session")
+        stop_watcher.assert_awaited_with("session", 1)
         assert (root / "keep.txt").exists()
         assert (state_root / "keep.txt").exists()
 
@@ -1777,6 +1777,61 @@ def test_runtime_start_failure_clears_turn_and_allows_retry(tmp_path: Path) -> N
             "turn_id": "turn-2",
             "content": "retry",
         }
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_startup_failure_cleanup_cannot_stop_new_runtime_generation(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FailNextLauncher()
+        launcher.fail_next = True
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleanup_calls: list[tuple[str, int]] = []
+        manager: RuntimeManager
+
+        async def stop_hook(session_id: str, generation: int) -> None:
+            cleanup_calls.append((session_id, generation))
+            if generation == 1:
+                cleanup_started.set()
+                await release_cleanup.wait()
+            if manager.runtime_generation(session_id) == generation:
+                raise AssertionError("stale cleanup still owns the new generation")
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+
+        first = asyncio.create_task(
+            manager.send_message("session", "first", turn_id="turn-1")
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        assert manager.status("session") == "error"
+        assert manager.active_turn_id("session") is None
+
+        token_generation = manager.runtime_generation("session")
+        assert await manager.send_message(
+            "session", "retry", turn_id="turn-2"
+        ) == "running"
+        assert manager.runtime_generation("session") == token_generation + 1
+        assert manager.active_turn_id("session") == "turn-2"
+        assert launcher.by_session["session"][0].returncode is None
+
+        release_cleanup.set()
+        with pytest.raises(RuntimeUnavailableError):
+            await first
+        assert manager.status("session") == "running"
+        assert manager.active_turn_id("session") == "turn-2"
+        assert manager.runtime_token("session") is not None
+        assert cleanup_calls == [("session", 1)]
         await manager.shutdown()
 
     asyncio.run(scenario())

@@ -294,13 +294,12 @@ def console_history(
     context: WebContext = Depends(current_context),
 ) -> ConsoleSnapshotResponse:
     app_services = services(request)
-    event_cursor = app_services.events.latest_id(context.session.id)
     events = list(
         app_services.database.console_history(
             context.session.id, context.user.id
         )
     )
-    return ConsoleSnapshotResponse(events=events, event_cursor=event_cursor)
+    return ConsoleSnapshotResponse(events=events)
 
 
 @router.post("/sessions/{session_id}/permission")

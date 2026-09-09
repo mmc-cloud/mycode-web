@@ -282,12 +282,19 @@ class TerminalManager:
         if _process_is_live(process):
             await process.resize(cols, rows)
 
-    async def stop_session(self, session_id: str) -> None:
+    async def stop_session(
+        self, session_id: str, generation: int | None = None
+    ) -> None:
         current_task = asyncio.current_task()
         async with self._lock:
-            state = self._sessions.pop(session_id, None)
+            state = self._sessions.get(session_id)
             if state is None:
                 return
+            runtime_generation = getattr(self.runtime, "runtime_generation", None)
+            if generation is not None and runtime_generation is not None:
+                if runtime_generation(session_id) != generation:
+                    return
+            self._sessions.pop(session_id, None)
             start_task = state.start_task
             reader_task = state.reader_task
             process = state.process
