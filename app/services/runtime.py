@@ -399,12 +399,15 @@ class RuntimeManager:
 
     async def activate(self, session_id: str) -> str:
         """Best-effort warm activation without queueing an empty Agent turn."""
-        victim: tuple[str, _RuntimeSession] | None = None
+        victim: tuple[str, _RuntimeSession, int] | None = None
         start_state: _RuntimeSession | None = None
+        dead_finalizer_task: asyncio.Task[None] | None = None
         async with self._lock:
             if self._closed:
                 raise RuntimeUnavailableError("Runtime manager is shutting down.")
             state = self._sessions.setdefault(session_id, _RuntimeSession())
+            if self._is_finalizing(state):
+                return "stopped"
             if state.status == "stopped":
                 state.startup_error = None
             if state.status in {
@@ -415,22 +418,46 @@ class RuntimeManager:
                 "waiting_mcp_trust",
                 "queued",
             }:
-                return state.status
-            if state.status == "stopping":
+                if (
+                    state.status != "queued"
+                    and state.runtime_generation > 0
+                    and not self._is_live(state)
+                ):
+                    dead_finalizer_task = self._begin_finalization_locked(
+                        session_id,
+                        state,
+                        state.runtime_generation,
+                        reason="dead_process_detected",
+                        final_status="error",
+                    )
+                else:
+                    return state.status
+            if dead_finalizer_task is not None:
+                pass
+            elif state.status == "stopping":
                 return "stopped"
-            if self._can_start_locked(session_id):
+            elif self._can_start_locked(session_id):
                 self._prepare_start_locked(session_id, state)
                 start_state = state
             else:
                 victim = self._oldest_evictable_idle_locked(session_id)
                 if victim is not None:
                     victim_id, victim_state = victim
-                    self._set_status_locked(victim_state, "stopping")
-                    victim_state.stopping = True
+                    victim_generation = victim_state.runtime_generation
+                    self._begin_finalization_locked(
+                        victim_id,
+                        victim_state,
+                        victim_generation,
+                        reason="capacity_eviction",
+                    )
+                    victim = (victim_id, victim_state, victim_generation)
                     self._prepare_start_locked(session_id, state)
                     start_state = state
                 else:
                     return "stopped"
+        if dead_finalizer_task is not None:
+            await asyncio.shield(dead_finalizer_task)
+            return await self.activate(session_id)
         if start_state is None:
             return self.status(session_id)
         if victim is None:
@@ -446,23 +473,48 @@ class RuntimeManager:
     ) -> str:
         turn_content = _validate_message_content(content)
         turn_id = turn_id or uuid4().hex
-        victim: tuple[str, _RuntimeSession] | None = None
+        victim: tuple[str, _RuntimeSession, int] | None = None
         start_state: _RuntimeSession | None = None
         reuse_state: _RuntimeSession | None = None
         waiting_start_state: _RuntimeSession | None = None
+        dead_finalizer_task: asyncio.Task[None] | None = None
         queue_position = 0
 
         async with self._lock:
             if self._closed:
                 raise RuntimeUnavailableError("Runtime manager is shutting down.")
             state = self._sessions.setdefault(session_id, _RuntimeSession())
+            if self._is_finalizing(state):
+                raise RuntimeConflictError(
+                    "This Session runtime is finalizing and cannot accept a new turn."
+                )
             if state.status == "stopped":
                 state.startup_error = None
-            if state.active_turn_id is not None:
+            if (
+                state.active_turn_id is None
+                and state.status in {
+                    "idle",
+                    "running",
+                    "waiting_permission",
+                    "waiting_mcp_trust",
+                }
+                and state.runtime_generation > 0
+                and not self._is_live(state)
+            ):
+                dead_finalizer_task = self._begin_finalization_locked(
+                    session_id,
+                    state,
+                    state.runtime_generation,
+                    reason="dead_process_detected",
+                    final_status="error",
+                )
+            elif state.active_turn_id is not None:
                 raise RuntimeConflictError(
                     "This Session already has an active or queued Agent turn."
                 )
-            if state.status == "starting":
+            if dead_finalizer_task is not None:
+                pass
+            elif state.status == "starting":
                 state.active_turn_id = turn_id
                 waiting_start_state = state
             elif state.status in {
@@ -490,8 +542,14 @@ class RuntimeManager:
                 victim = self._oldest_evictable_idle_locked(session_id)
                 if victim is not None:
                     victim_id, victim_state = victim
-                    self._set_status_locked(victim_state, "stopping")
-                    victim_state.stopping = True
+                    victim_generation = victim_state.runtime_generation
+                    self._begin_finalization_locked(
+                        victim_id,
+                        victim_state,
+                        victim_generation,
+                        reason="capacity_eviction",
+                    )
+                    victim = (victim_id, victim_state, victim_generation)
                     self._prepare_start_locked(session_id, state)
                     state.active_turn_id = turn_id
                     start_state = state
@@ -511,6 +569,9 @@ class RuntimeManager:
                     )
                     queue_position = len(self._queue)
 
+        if dead_finalizer_task is not None:
+            await asyncio.shield(dead_finalizer_task)
+            return await self.send_message(session_id, content, turn_id=turn_id)
         if queue_position:
             message_data = {"content": content}
             if turn_id is not None:
@@ -548,7 +609,12 @@ class RuntimeManager:
                 raise
             return "running"
         if victim is not None:
-            await self._finalize_generation(*victim, reason="capacity_eviction")
+            await self._finalize_generation(
+                victim[0],
+                victim[1],
+                generation=victim[2],
+                reason="capacity_eviction",
+            )
         if start_state is None:
             raise RuntimeUnavailableError("Sandbox admission failed.")
         message_data = {"content": content}
@@ -571,6 +637,8 @@ class RuntimeManager:
             pending = None if state is None else state.pending_permission
             if pending is None:
                 raise RuntimeConflictError("There is no pending permission request.")
+            if self._is_finalizing(state):
+                raise RuntimeConflictError("Runtime is finalizing or unavailable.")
             expected_request_id = pending.get("request_id")
             if request_id != expected_request_id:
                 raise RuntimeConflictError("Permission request_id is stale.")
@@ -621,6 +689,8 @@ class RuntimeManager:
             pending = None if state is None else state.pending_mcp_trust
             if pending is None:
                 raise RuntimeConflictError("There is no pending MCP trust request.")
+            if self._is_finalizing(state):
+                raise RuntimeConflictError("Runtime is finalizing or unavailable.")
             expected_request_id = pending.get("request_id")
             if request_id != expected_request_id:
                 raise RuntimeConflictError("MCP trust request_id is stale.")
@@ -675,6 +745,8 @@ class RuntimeManager:
                 str,
                 dict[str, object] | None,
                 dict[str, object] | None,
+                int,
+                asyncio.Task[None] | None,
             ]
         ] = []
         async with self._lock:
@@ -717,8 +789,13 @@ class RuntimeManager:
                     state.pending_permission = None
                     state.pending_mcp_trust = None
                     state.mcp_trust_resume_status = None
-                    self._set_status_locked(state, "stopping")
-                    state.stopping = True
+                    generation = state.runtime_generation
+                    finalizer_task = self._begin_finalization_locked(
+                        session_id,
+                        state,
+                        generation,
+                        reason="inactivity_ttl",
+                    )
                     expired.append(
                         (
                             session_id,
@@ -726,9 +803,19 @@ class RuntimeManager:
                             previous,
                             permission_data,
                             mcp_trust_data,
+                            generation,
+                            finalizer_task,
                         )
                     )
-        for session_id, state, previous, permission_data, mcp_trust_data in expired:
+        for (
+            session_id,
+            state,
+            previous,
+            permission_data,
+            mcp_trust_data,
+            _generation,
+            finalizer_task,
+        ) in expired:
             if previous == "waiting_permission" and permission_data is not None:
                 await self.events.publish(
                     session_id,
@@ -748,7 +835,8 @@ class RuntimeManager:
                     **(mcp_trust_data or {}),
                     **_turn_payload(state.active_turn_id),
                 )
-            await self._finalize_generation(session_id, state, reason="inactivity_ttl")
+            if finalizer_task is not None:
+                await asyncio.shield(finalizer_task)
             await self.events.publish(
                 session_id, "runtime_expired",
                 message="Sandbox stopped after inactivity; session data was preserved.",
@@ -757,7 +845,7 @@ class RuntimeManager:
             await self._schedule_waiting()
         return tuple(
             session_id
-            for session_id, _state, _previous, _permission, _mcp in expired
+            for session_id, _state, _previous, _permission, _mcp, _generation, _task in expired
         )
 
     async def run_sweeper(self) -> None:
@@ -768,6 +856,7 @@ class RuntimeManager:
     async def stop_session(self, session_id: str) -> None:
         queued = False
         state_to_finalize: _RuntimeSession | None = None
+        finalizer_task: asyncio.Task[None] | None = None
         async with self._lock:
             state = self._sessions.get(session_id)
             if state is None:
@@ -785,9 +874,13 @@ class RuntimeManager:
                 or state.status == "starting"
                 or state.finalizing_generation is not None
             ):
-                self._set_status_locked(state, "stopping")
-                state.stopping = True
                 state_to_finalize = state
+                finalizer_task = self._begin_finalization_locked(
+                    session_id,
+                    state,
+                    state.runtime_generation,
+                    reason="session_stop",
+                )
             else:
                 return
         if queued:
@@ -796,34 +889,33 @@ class RuntimeManager:
                 **_turn_payload(completed_turn_id),
             )
             return
-        if state_to_finalize is not None:
-            await self._finalize_generation(
-                session_id, state_to_finalize, reason="session_stop"
-            )
+        if state_to_finalize is not None and finalizer_task is not None:
+            await asyncio.shield(finalizer_task)
 
     async def shutdown(self) -> None:
         async with self._lock:
             self._closed = True
             self._queue.clear()
             sessions = list(self._sessions.items())
+            finalizer_tasks: list[asyncio.Task[None]] = []
             for _session_id, state in sessions:
                 if (
                     self._is_live(state)
                     or state.status == "starting"
                     or state.finalizing_generation is not None
                 ):
-                    self._set_status_locked(state, "stopping")
-                    state.stopping = True
+                    task = self._begin_finalization_locked(
+                        _session_id,
+                        state,
+                        state.runtime_generation,
+                        reason="shutdown",
+                    )
+                    if task is not None:
+                        finalizer_tasks.append(task)
                 elif state.status == "queued":
                     self._set_status_locked(state, "stopped")
         await asyncio.gather(
-            *(
-                self._finalize_generation(session_id, state, reason="shutdown")
-                for session_id, state in sessions
-                if self._is_live(state)
-                or state.status == "starting"
-                or state.finalizing_generation is not None
-            ),
+            *(asyncio.shield(task) for task in finalizer_tasks),
             return_exceptions=True,
         )
         tasks = tuple(self._background_tasks)
@@ -887,12 +979,16 @@ class RuntimeManager:
                         state.process = process
                         state.container_ref = container_ref
                         state.reader_task = asyncio.create_task(
-                            self._read_output(session_id, state, process)
+                            self._read_output(
+                                session_id, state, process, launch_generation
+                            )
                         )
                         stderr = getattr(process, "stderr", None)
                         if stderr is not None:
                             state.stderr_task = asyncio.create_task(
-                                self._read_stderr(session_id, stderr)
+                                self._read_stderr(
+                                    session_id, stderr, launch_generation
+                                )
                             )
                         self._touch(session_id, state)
                 if should_stop:
@@ -966,7 +1062,18 @@ class RuntimeManager:
         if final_status is not None:
             async with self._lock:
                 failed_turn_id = state.active_turn_id
-                stopping = state.stopping or state.status == "stopping"
+                stopping = self._is_finalizing(state)
+                finalizer_task = self._begin_finalization_locked(
+                    session_id,
+                    state,
+                    launch_generation,
+                    reason=(
+                        "startup_failure"
+                        if final_status == "error"
+                        else "session_stop"
+                    ),
+                    final_status=final_status,
+                )
             if failure_message is not None and not stopping:
                 await self.events.publish(
                     session_id,
@@ -974,12 +1081,8 @@ class RuntimeManager:
                     message=failure_message,
                     **_turn_payload(failed_turn_id),
                 )
-            await self._finalize_generation(
-                session_id,
-                state,
-                reason="startup_failure" if final_status == "error" else "session_stop",
-                final_status=final_status,
-            )
+            if finalizer_task is not None:
+                await asyncio.shield(finalizer_task)
             if failure is not None:
                 raise RuntimeUnavailableError(str(failure)) from failure
             raise RuntimeUnavailableError("Runtime manager is shutting down.")
@@ -987,7 +1090,11 @@ class RuntimeManager:
             self._spawn(self._dispatch_from_idle(session_id, state))
 
     async def _read_output(
-        self, session_id: str, state: _RuntimeSession, process: SandboxProcess
+        self,
+        session_id: str,
+        state: _RuntimeSession,
+        process: SandboxProcess,
+        reader_generation: int,
     ) -> None:
         if process.stdout is None:
             return
@@ -999,22 +1106,30 @@ class RuntimeManager:
                 self._touch(session_id, state)
                 for message in state.adapter.feed(chunk):
                     await self._handle_message(session_id, state, message)
-            for message in state.adapter.finish():
-                await self._handle_message(session_id, state, message)
             return_code = await process.wait()
-            stderr_task = state.stderr_task
-            if (
-                stderr_task is not None
-                and stderr_task is not asyncio.current_task()
-            ):
-                await asyncio.gather(stderr_task, return_exceptions=True)
+            finished_messages = state.adapter.finish()
             async with self._lock:
-                if state.process is not process:
+                if (
+                    state.process is not process
+                    or state.runtime_generation != reader_generation
+                ):
                     return
                 completed_turn_id = state.active_turn_id
-                stopped_intentionally = state.stopping or state.status == "stopping"
+                stopped_intentionally = self._is_finalizing(state)
                 clean_exit = return_code == 0
                 final_status = "stopped" if stopped_intentionally or clean_exit else "error"
+                finalizer_task = self._begin_finalization_locked(
+                    session_id,
+                    state,
+                    reader_generation,
+                    reason="process_exit",
+                    final_status=final_status,
+                    exclude_tasks={asyncio.current_task()},
+                )
+            if finalizer_task is None:
+                return
+            for message in finished_messages:
+                await self._handle_message(session_id, state, message)
             if not stopped_intentionally and not clean_exit:
                 await self.events.publish(
                     session_id,
@@ -1022,50 +1137,64 @@ class RuntimeManager:
                     message=f"MyCode process exited with code {return_code}.",
                     **_turn_payload(completed_turn_id),
                 )
-            await self._finalize_generation(
-                session_id,
-                state,
-                reason="process_exit",
-                final_status=final_status,
-                exclude_tasks={asyncio.current_task()},
-            )
+            await asyncio.shield(finalizer_task)
         except asyncio.CancelledError:
             raise
         except JsonlProtocolError as error:
             async with self._lock:
-                if state.process is process:
-                    state.startup_error = str(error)
+                if (
+                    state.process is not process
+                    or state.runtime_generation != reader_generation
+                ):
+                    return
+                state.startup_error = str(error)
+                completed_turn_id = state.active_turn_id
+                finalizer_task = self._begin_finalization_locked(
+                    session_id,
+                    state,
+                    reader_generation,
+                    reason="protocol_error",
+                    final_status="error",
+                    exclude_tasks={asyncio.current_task()},
+                )
+            if finalizer_task is None:
+                return
             await self.events.publish(
                 session_id,
                 "error",
                 code=error.code,
                 message=f"Runtime JSONL protocol error: {error}",
-                **_turn_payload(state.active_turn_id),
+                **_turn_payload(completed_turn_id),
             )
-            await self._finalize_generation(
-                session_id,
-                state,
-                reason="protocol_error",
-                final_status="error",
-                exclude_tasks={asyncio.current_task()},
-            )
+            await asyncio.shield(finalizer_task)
         except Exception as error:
+            async with self._lock:
+                if (
+                    state.process is not process
+                    or state.runtime_generation != reader_generation
+                ):
+                    return
+                completed_turn_id = state.active_turn_id
+                finalizer_task = self._begin_finalization_locked(
+                    session_id,
+                    state,
+                    reader_generation,
+                    reason="reader_failure",
+                    final_status="error",
+                    exclude_tasks={asyncio.current_task()},
+                )
+            if finalizer_task is None:
+                return
             await self.events.publish(
                 session_id,
                 "error",
                 message=f"Runtime output reader failed: {type(error).__name__}: {error}",
-                **_turn_payload(state.active_turn_id),
+                **_turn_payload(completed_turn_id),
             )
-            await self._finalize_generation(
-                session_id,
-                state,
-                reason="reader_failure",
-                final_status="error",
-                exclude_tasks={asyncio.current_task()},
-            )
+            await asyncio.shield(finalizer_task)
 
     async def _read_stderr(
-        self, session_id: str, stream: ProcessStderr
+        self, session_id: str, stream: ProcessStderr, _generation: int
     ) -> None:
         while True:
             chunk = await stream.read(4096)
@@ -1090,6 +1219,8 @@ class RuntimeManager:
             ready_data = _without_protocol_fields(message)
             ready_data.pop("session_id", None)
             async with self._lock:
+                if self._is_finalizing(state):
+                    return
                 state.ready.set()
                 state.status_changed.set()
                 self._touch(session_id, state)
@@ -1112,6 +1243,8 @@ class RuntimeManager:
             request_id = _required_string(message, "request_id", "mcp_trust_request")
             servers = _safe_mcp_servers(message.get("servers"))
             async with self._lock:
+                if self._is_finalizing(state):
+                    return
                 state.mcp_trust_resume_status = state.status
                 state.pending_mcp_trust = {
                     "request_id": request_id,
@@ -1144,6 +1277,8 @@ class RuntimeManager:
                     "invalid_permission_request", "Permission request projection is invalid."
                 )
             async with self._lock:
+                if self._is_finalizing(state):
+                    return
                 state.pending_permission = bounded_data
                 self._set_status_locked(state, "waiting_permission")
                 self._touch(session_id, state)
@@ -1173,7 +1308,23 @@ class RuntimeManager:
             return
         if message_type == "turn_finished":
             turn_id = message.get("turn_id")
-            completed_turn_id = turn_id if isinstance(turn_id, str) else state.active_turn_id
+            completed_turn_id = turn_id if isinstance(turn_id, str) else None
+            finalizing = False
+            should_dispatch = False
+            async with self._lock:
+                finalizing = self._is_finalizing(state)
+                if completed_turn_id is None:
+                    completed_turn_id = state.active_turn_id
+                if not finalizing and (
+                    state.active_turn_id == completed_turn_id
+                    or completed_turn_id is None
+                ):
+                    state.busy = False
+                    state.pending_permission = None
+                    self._set_status_locked(state, "idle")
+                    self._touch(session_id, state)
+                    state.active_turn_id = None
+                    should_dispatch = True
             await self.events.publish(
                 session_id,
                 "turn_finished",
@@ -1181,20 +1332,16 @@ class RuntimeManager:
                 stop_reason=message.get("stop_reason"),
                 **_turn_payload(completed_turn_id),
             )
-            async with self._lock:
-                if state.active_turn_id == completed_turn_id or completed_turn_id is None:
-                    state.busy = False
-                    state.pending_permission = None
-                    self._set_status_locked(state, "idle")
-                    self._touch(session_id, state)
-                    state.active_turn_id = None
+            if finalizing:
+                return
             await self.events.publish(
                 session_id,
                 "runtime_status",
                 status="idle",
                 **_turn_payload(completed_turn_id),
             )
-            self._spawn(self._dispatch_from_idle(session_id, state))
+            if should_dispatch:
+                self._spawn(self._dispatch_from_idle(session_id, state))
             return
         if message_type == "runtime_warning":
             await self.events.publish(
@@ -1225,6 +1372,7 @@ class RuntimeManager:
     async def _dispatch_from_idle(
         self, session_id: str, state: _RuntimeSession
     ) -> None:
+        generation: int | None = None
         async with self._lock:
             if (
                 self._closed
@@ -1237,11 +1385,22 @@ class RuntimeManager:
             if item is None:
                 return
             target = self._sessions[item.session_id]
-            self._set_status_locked(state, "stopping")
-            state.stopping = True
+            generation = state.runtime_generation
+            self._begin_finalization_locked(
+                session_id,
+                state,
+                generation,
+                reason="queue_handoff",
+            )
             self._prepare_start_locked(item.session_id, target)
             target.active_turn_id = item.turn_id
-        await self._finalize_generation(session_id, state, reason="queue_handoff")
+        if generation is not None:
+            await self._finalize_generation(
+                session_id,
+                state,
+                generation=generation,
+                reason="queue_handoff",
+            )
         try:
             await self._start_runtime(item.session_id, target, item.content)
         except RuntimeUnavailableError:
@@ -1284,12 +1443,17 @@ class RuntimeManager:
 
     async def _start_after_eviction(
         self,
-        victim: tuple[str, _RuntimeSession],
+        victim: tuple[str, _RuntimeSession, int],
         session_id: str,
         state: _RuntimeSession,
         turn_content: str | None,
     ) -> None:
-        await self._finalize_generation(*victim, reason="capacity_eviction")
+        await self._finalize_generation(
+            victim[0],
+            victim[1],
+            generation=victim[2],
+            reason="capacity_eviction",
+        )
         try:
             await self._start_runtime(session_id, state, turn_content)
         except RuntimeUnavailableError:
@@ -1416,6 +1580,7 @@ class RuntimeManager:
         session_id: str,
         state: _RuntimeSession,
         *,
+        generation: int,
         reason: str,
         final_status: str = "stopped",
         exclude_tasks: set[asyncio.Task[None] | None] | None = None,
@@ -1426,26 +1591,63 @@ class RuntimeManager:
         async with self._lock:
             if self._sessions.get(session_id) is not state:
                 return
-            cleanup_generation = state.runtime_generation
-            existing = state.finalizer_task
-            if state.finalizing_generation == cleanup_generation and existing is not None:
-                task = existing
-            else:
-                state.finalizing_generation = cleanup_generation
-                state.stopping = True
-                self._set_status_locked(state, "stopping")
-                task = asyncio.create_task(
-                    self._run_generation_finalizer(
-                        session_id,
-                        state,
-                        cleanup_generation,
-                        reason=reason,
-                        final_status=final_status,
-                        exclude_tasks=excluded,
-                    )
-                )
-                state.finalizer_task = task
+            task = self._begin_finalization_locked(
+                session_id,
+                state,
+                generation,
+                reason=reason,
+                final_status=final_status,
+                exclude_tasks=excluded,
+            )
+        if task is None:
+            return
         await asyncio.shield(task)
+
+    def _claim_finalization_locked(
+        self, state: _RuntimeSession, expected_generation: int
+    ) -> bool:
+        """Atomically make one generation the only generation that may finish."""
+        if state.runtime_generation != expected_generation:
+            return False
+        if state.finalizing_generation is not None:
+            return state.finalizing_generation == expected_generation
+        if (
+            state.status in {"stopped", "error"}
+            and state.process is None
+            and state.finalizer_task is None
+        ):
+            return False
+        state.finalizing_generation = expected_generation
+        state.stopping = True
+        self._set_status_locked(state, "stopping")
+        return True
+
+    def _begin_finalization_locked(
+        self,
+        session_id: str,
+        state: _RuntimeSession,
+        generation: int,
+        *,
+        reason: str,
+        final_status: str = "stopped",
+        exclude_tasks: set[asyncio.Task[None] | None] | None = None,
+    ) -> asyncio.Task[None] | None:
+        if not self._claim_finalization_locked(state, generation):
+            return None
+        if state.finalizer_task is not None:
+            return state.finalizer_task
+        task = asyncio.create_task(
+            self._run_generation_finalizer(
+                session_id,
+                state,
+                generation,
+                reason=reason,
+                final_status=final_status,
+                exclude_tasks=set(exclude_tasks or ()),
+            )
+        )
+        state.finalizer_task = task
+        return task
 
     async def _run_generation_finalizer(
         self,
@@ -1459,6 +1661,9 @@ class RuntimeManager:
     ) -> None:
         completed_turn_id: str | None = None
         terminal_lease_ids: tuple[str, ...] = ()
+        cleanup_errors: list[Exception] = []
+        process: SandboxProcess | None = None
+        converged = False
         async with state.lifecycle_lock:
             async with self._lock:
                 if (
@@ -1471,41 +1676,73 @@ class RuntimeManager:
                 stderr_task = state.stderr_task
                 completed_turn_id = state.active_turn_id
                 terminal_lease_ids = tuple(state.terminal_lease_ids)
-            await self._terminate_process(process)
+            try:
+                cleanup_errors.extend(await self._terminate_process(process))
+            except Exception as error:
+                cleanup_errors.append(error)
+                logger.exception(
+                    "Runtime process termination failed session=%s generation=%s",
+                    session_id,
+                    cleanup_generation,
+                )
+
             for task in (reader_task, stderr_task):
                 if task is None or task in exclude_tasks or task.done():
                     continue
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                try:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                except Exception as error:
+                    cleanup_errors.append(error)
+                    logger.exception(
+                        "Runtime task cleanup failed session=%s generation=%s",
+                        session_id,
+                        cleanup_generation,
+                    )
+
             async with self._lock:
                 if (
                     self._sessions.get(session_id) is not state
                     or state.runtime_generation != cleanup_generation
                 ):
                     return
-                if state.process is process:
-                    state.process = None
-                    state.reader_task = None
-                    state.stderr_task = None
+                state.process = None
+                state.reader_task = None
+                state.stderr_task = None
                 state.ready.clear()
-                self._revoke_runtime_token_locked(session_id, state)
+                try:
+                    self._revoke_runtime_token_locked(session_id, state)
+                except Exception as error:
+                    cleanup_errors.append(error)
+                    logger.exception(
+                        "Runtime token cleanup failed session=%s generation=%s",
+                        session_id,
+                        cleanup_generation,
+                    )
 
             if self._runtime_stop_hook is not None:
                 try:
                     await self._runtime_stop_hook(session_id, cleanup_generation)
-                except Exception:
+                except Exception as error:
+                    cleanup_errors.append(error)
                     logger.exception(
                         "Runtime generation cleanup hook failed session=%s generation=%s",
                         session_id,
                         cleanup_generation,
                     )
-            await asyncio.gather(
-                *(
-                    self.release_terminal_lease(session_id, lease_id)
-                    for lease_id in terminal_lease_ids
-                ),
-                return_exceptions=True,
-            )
+
+            for lease_id in terminal_lease_ids:
+                try:
+                    await self.release_terminal_lease(session_id, lease_id)
+                except Exception as error:
+                    cleanup_errors.append(error)
+                    logger.exception(
+                        "Terminal lease cleanup failed session=%s generation=%s lease=%s",
+                        session_id,
+                        cleanup_generation,
+                        lease_id,
+                    )
+
             async with self._lock:
                 if (
                     self._sessions.get(session_id) is not state
@@ -1524,27 +1761,72 @@ class RuntimeManager:
                 state.readiness_pause_total = 0.0
                 state.active_turn_id = None
                 state.container_ref = None
-                self._set_status_locked(state, final_status)
+                state.terminal_lease_ids.clear()
+                effective_status = (
+                    "error" if cleanup_errors and final_status == "stopped" else final_status
+                )
+                self._set_status_locked(state, effective_status)
                 state.finalizing_generation = None
                 state.finalizer_task = None
-            await self.events.publish(
-                session_id,
-                "runtime_status",
-                status=final_status,
-                reason=reason,
-                **_turn_payload(completed_turn_id),
-            )
+                converged = True
+
+            if cleanup_errors:
+                await self.events.publish(
+                    session_id,
+                    "runtime_warning",
+                    code="runtime_cleanup_failed",
+                    message=(
+                        "Runtime cleanup encountered one or more errors; "
+                        "the generation was converged best-effort."
+                    ),
+                    **_turn_payload(completed_turn_id),
+                )
+            if converged:
+                await self.events.publish(
+                    session_id,
+                    "runtime_status",
+                    status=effective_status,
+                    reason=reason,
+                    **_turn_payload(completed_turn_id),
+                )
         await self._schedule_waiting()
 
-    async def _terminate_process(self, process: SandboxProcess | None) -> None:
-        if process is None or process.returncode is not None:
-            return
-        process.terminate()
+    async def _terminate_process(
+        self, process: SandboxProcess | None
+    ) -> list[Exception]:
+        errors: list[Exception] = []
+        if process is None:
+            return errors
+        try:
+            if process.returncode is not None:
+                return errors
+        except Exception as error:
+            errors.append(error)
+        try:
+            process.terminate()
+        except Exception as error:
+            errors.append(error)
+            logger.exception("Sandbox process terminate() failed")
         try:
             await asyncio.wait_for(process.wait(), timeout=5)
-        except TimeoutError:
+            return errors
+        except TimeoutError as error:
+            errors.append(error)
+            logger.warning("Sandbox process did not exit after terminate(); killing it")
+        except Exception as error:
+            errors.append(error)
+            logger.exception("Sandbox process wait() failed after terminate()")
+        try:
             process.kill()
+        except Exception as error:
+            errors.append(error)
+            logger.exception("Sandbox process kill() failed")
+        try:
             await process.wait()
+        except Exception as error:
+            errors.append(error)
+            logger.exception("Sandbox process wait() failed after kill()")
+        return errors
 
     def _prepare_start_locked(
         self, session_id: str, state: _RuntimeSession
@@ -1657,6 +1939,14 @@ class RuntimeManager:
     @staticmethod
     def _is_live(state: _RuntimeSession) -> bool:
         return state.process is not None and state.process.returncode is None
+
+    @staticmethod
+    def _is_finalizing(state: _RuntimeSession) -> bool:
+        return (
+            state.stopping
+            or state.status == "stopping"
+            or state.finalizing_generation is not None
+        )
 
     @classmethod
     def _is_genuinely_idle(cls, state: _RuntimeSession) -> bool:

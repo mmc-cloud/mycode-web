@@ -1906,6 +1906,259 @@ def test_process_exit_cleanup_serializes_next_runtime_generation(
     asyncio.run(scenario())
 
 
+def test_process_eof_atomically_claims_generation_before_finalizer_cleanup(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        claim_observed = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def stop_hook(_session_id: str, _generation: int) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+        original_begin = manager._begin_finalization_locked
+
+        def observe_claim(
+            session_id: str,
+            state,
+            generation: int,
+            **kwargs,
+        ):
+            task = original_begin(session_id, state, generation, **kwargs)
+            if (
+                session_id == "session"
+                and generation == 1
+                and state.finalizing_generation == generation
+            ):
+                claim_observed.set()
+            return task
+
+        manager._begin_finalization_locked = observe_claim  # type: ignore[method-assign]
+
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+        process = launcher.process
+        process.returncode = 17
+        process.done.set()
+        await process.stdout.feed(b"")
+        await process.stderr.feed(b"")
+
+        await asyncio.wait_for(claim_observed.wait(), timeout=1)
+        assert manager.status("session") == "stopping"
+        assert manager._sessions["session"].finalizing_generation == 1
+        assert manager.runtime_generation("session") == 1
+        with pytest.raises(RuntimeConflictError):
+            await manager.send_message("session", "must-wait")
+        assert await manager.activate("session") == "stopped"
+        assert launcher.calls == 1
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        release_cleanup.set()
+        await wait_for_status(manager, "session", "error")
+        assert manager._sessions["session"].finalizing_generation is None
+        assert await manager.send_message("session", "retry") == "running"
+        assert launcher.calls == 2
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_late_turn_finished_cannot_reopen_finalizing_runtime(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        events = EventHub()
+        launcher = FakeLauncher()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def stop_hook(_session_id: str, _generation: int) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            events,
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+        await manager.send_message("session", "task", turn_id="turn-1")
+        stop_task = asyncio.create_task(manager.stop_session("session"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        state = manager._sessions["session"]
+        await manager._handle_message(
+            "session", state, {"type": "runtime_ready"}
+        )
+        await manager._handle_message(
+            "session",
+            state,
+            {"type": "permission_request", "request_id": "late-permission"},
+        )
+        await manager._handle_message(
+            "session",
+            state,
+            {"type": "mcp_trust_request", "request_id": "late-trust", "servers": []},
+        )
+        await manager._handle_message(
+            "session",
+            state,
+            {"type": "turn_finished", "turn_id": "turn-1", "status": "completed"},
+        )
+
+        assert manager.status("session") == "stopping"
+        assert state.active_turn_id == "turn-1"
+        assert state.pending_permission is None
+        assert state.pending_mcp_trust is None
+        assert not state.ready.is_set()
+        assert not any(
+            event.type == "runtime_status" and event.data.get("status") == "idle"
+            for event in events.history("session")
+        )
+
+        release_cleanup.set()
+        await stop_task
+        assert manager.status("session") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_permission_resolve_is_rejected_after_finalization_claim(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def stop_hook(_session_id: str, _generation: int) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+        await manager.send_message("session", "task")
+        await launcher.process.stdout.feed(permission_wire())
+        await wait_for_status(manager, "session", "waiting_permission")
+        stop_task = asyncio.create_task(manager.stop_session("session"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        writes_before = list(launcher.process.stdin.raw_writes)
+        with pytest.raises(RuntimeConflictError, match="finalizing"):
+            await manager.resolve_permission("session", "once", "permission-1")
+        assert launcher.process.stdin.raw_writes == writes_before
+        assert manager.status("session") == "stopping"
+
+        release_cleanup.set()
+        await stop_task
+        assert manager.status("session") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_trust_resolve_is_rejected_after_finalization_claim(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def stop_hook(_session_id: str, _generation: int) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+        await manager.send_message("session", "task")
+        await launcher.process.stdout.feed(trust_wire())
+        await wait_for_status(manager, "session", "waiting_mcp_trust")
+        stop_task = asyncio.create_task(manager.stop_session("session"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        writes_before = list(launcher.process.stdin.raw_writes)
+        with pytest.raises(RuntimeConflictError, match="finalizing"):
+            await manager.resolve_mcp_trust("session", True, "trust-1")
+        assert launcher.process.stdin.raw_writes == writes_before
+        assert manager.status("session") == "stopping"
+
+        release_cleanup.set()
+        await stop_task
+        assert manager.status("session") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_finalizer_converges_when_process_cleanup_raises(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+        )
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+        process = launcher.process
+
+        async def failing_wait() -> int:
+            raise RuntimeError("wait failed")
+
+        def failing_terminate() -> None:
+            raise RuntimeError("terminate failed")
+
+        def failing_kill() -> None:
+            raise RuntimeError("kill failed")
+
+        process.wait = failing_wait  # type: ignore[method-assign]
+        process.terminate = failing_terminate  # type: ignore[method-assign]
+        process.kill = failing_kill  # type: ignore[method-assign]
+
+        await manager.stop_session("session")
+
+        state = manager._sessions["session"]
+        assert manager.status("session") == "error"
+        assert state.finalizing_generation is None
+        assert state.finalizer_task is None
+        assert state.process is None
+        assert state.active_turn_id is None
+        assert manager.runtime_token("session") is None
+        assert manager.relay_tokens.active_count == 0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_runtime_workspace_start_failure_revokes_issued_token(tmp_path: Path) -> None:
     class FailingWorkspace:
         def ensure_session_directories(self, session_id: str):
