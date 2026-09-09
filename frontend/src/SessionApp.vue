@@ -71,6 +71,7 @@ const pendingMcpTrust = ref(null)
 const turnStates = ref({})
 const expandedGroups = ref({})
 const message = ref("")
+const sendingMessage = ref(false)
 const error = ref("")
 const lifecycleNotice = ref("")
 const outputElement = ref(null)
@@ -80,8 +81,10 @@ let generation = 0
 let resizeState = null
 
 const sendDisabled = computed(() =>
-  Boolean(currentSession.value?.active_turn_id) &&
-  ACTIVE_TURN_STATUSES.includes(currentSession.value?.runtime_status),
+  sendingMessage.value || (
+    Boolean(currentSession.value?.active_turn_id) &&
+    ACTIVE_TURN_STATUSES.includes(currentSession.value?.runtime_status)
+  ),
 )
 const executionGroups = computed(() => buildExecutionGroups(
   consoleEvents.value,
@@ -322,13 +325,11 @@ function connectEvents(sessionId, token, after) {
   })
   eventSource.addEventListener("error", (event) => {
     if (generation === token && event.data) {
-      clearPendingInteractions()
       showError(JSON.parse(event.data).message || "运行时错误")
     }
   })
   eventSource.addEventListener("runtime_error", (event) => {
     if (generation === token) {
-      clearPendingInteractions()
       const data = JSON.parse(event.data)
       showError(data.message || "运行时协议错误")
     }
@@ -432,8 +433,10 @@ async function deleteEntry(entry) {
 }
 
 async function sendMessage() {
+  if (sendDisabled.value) return
   const content = message.value.trim()
   if (!content) return
+  sendingMessage.value = true
   try {
     const result = await request(scoped("/message"), {
       method: "POST",
@@ -445,6 +448,7 @@ async function sendMessage() {
     updateTurnStatus(result.turn_id, result.status)
     message.value = ""
   } catch (reason) { showError(reason) }
+  finally { sendingMessage.value = false }
 }
 
 async function resolvePermission(decision) {

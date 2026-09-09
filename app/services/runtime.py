@@ -2,12 +2,11 @@ import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 import logging
 import re
 import time
-from typing import Coroutine, Literal, Protocol
+from typing import Coroutine, Protocol
 from uuid import uuid4
 
 from app.config import ServerSettings
@@ -221,7 +220,6 @@ class _QueuedTurn:
     session_id: str
     content: str
     turn_id: str | None
-    enqueued_at: str
 
 
 @dataclass
@@ -445,7 +443,11 @@ class RuntimeManager:
             state = self._sessions.setdefault(session_id, _RuntimeSession())
             if state.status == "stopped":
                 state.startup_error = None
-            if state.status == "starting" and not state.busy:
+            if state.status == "starting":
+                if state.active_turn_id is not None:
+                    raise RuntimeConflictError(
+                        "This Session already has an active Agent turn."
+                    )
                 state.active_turn_id = turn_id
                 waiting_start_state = state
             elif state.status in {
@@ -490,7 +492,6 @@ class RuntimeManager:
                             session_id=session_id,
                             content=turn_content,
                             turn_id=turn_id,
-                            enqueued_at=datetime.now(timezone.utc).isoformat(),
                         )
                     )
                     queue_position = len(self._queue)
@@ -665,7 +666,10 @@ class RuntimeManager:
                         "waiting_mcp_trust",
                     }
                     and self._is_live(state)
-                    and state.terminal_clients == 0
+                    and (
+                        state.status == "waiting_mcp_trust"
+                        or state.terminal_clients == 0
+                    )
                     and now - state.last_activity
                     >= self.settings.sandbox_idle_ttl_seconds
                 ):

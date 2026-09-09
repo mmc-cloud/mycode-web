@@ -264,6 +264,57 @@ def test_runtime_writes_multiline_browser_message_once(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_starting_runtime_with_active_turn_rejects_duplicate_message(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = ManualPromptLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        assert await manager.activate("session") == "starting"
+        for _ in range(20):
+            if launcher.calls:
+                break
+            await asyncio.sleep(0)
+        assert launcher.calls == 1
+        assert manager.status("session") == "starting"
+        assert manager.active_turn_id("session") is None
+
+        first = asyncio.create_task(
+            manager.send_message("session", "first", turn_id="turn-1")
+        )
+        await wait_for_status(manager, "session", "starting")
+        for _ in range(20):
+            if manager.active_turn_id("session") == "turn-1":
+                break
+            await asyncio.sleep(0)
+        assert manager.active_turn_id("session") == "turn-1"
+        with pytest.raises(RuntimeConflictError):
+            await manager.send_message("session", "second", turn_id="turn-2")
+        assert manager.active_turn_id("session") == "turn-1"
+
+        await launcher.process.stdout.feed(READY_WIRE)
+        assert await asyncio.wait_for(first, timeout=1) == "running"
+        turns = [
+            json.loads(payload)
+            for payload in launcher.process.stdin.raw_writes
+            if json.loads(payload).get("type") == "turn"
+        ]
+        assert turns == [
+            {
+                "version": 1,
+                "type": "turn",
+                "turn_id": "turn-1",
+                "content": "first",
+            }
+        ]
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_same_user_runtimes_share_workspace_but_keep_state_private(
     tmp_path: Path,
 ) -> None:
@@ -310,6 +361,7 @@ def test_activate_is_async_idempotent_and_message_waits_same_runtime(
         assert await manager.activate("session") == "starting"
         await asyncio.sleep(0)
         assert launcher.calls == 1
+        assert manager.active_turn_id("session") is None
         send = asyncio.create_task(manager.send_message("session", "hello"))
         await asyncio.sleep(0)
         assert not send.done()
@@ -1784,7 +1836,7 @@ def test_waiting_mcp_trust_is_not_an_eviction_victim(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_waiting_mcp_trust_expires_releases_slot_and_starts_queue(
+def test_waiting_mcp_trust_ttl_ignores_terminal_lease_and_starts_queue(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1799,16 +1851,19 @@ def test_waiting_mcp_trust_expires_releases_slot_and_starts_queue(
         manager = RuntimeManager(
             config, WorkspaceService(config), events, launcher=launcher, clock=clock
         )
+        await manager.acquire_terminal_lease("trusted")
         starting = asyncio.create_task(manager.send_message("trusted", "task"))
         await asyncio.sleep(0)
         await launcher.process.stdout.feed(trust_wire())
         await wait_for_status(manager, "trusted", "waiting_mcp_trust")
+        assert manager.terminal_clients("trusted") == 1
         assert await manager.send_message("queued", "other task") == "queued"
 
         clock.advance(10)
         assert await manager.sweep_expired() == ("trusted",)
         assert manager.status("trusted") == "stopped"
         assert manager.pending_mcp_trust("trusted") is None
+        assert manager.terminal_clients("trusted") == 0
         assert manager.status("queued") == "starting"
         assert any(
             event.type == "mcp_trust_resolved"

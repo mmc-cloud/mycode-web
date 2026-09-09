@@ -91,11 +91,16 @@ def test_workspace_zip_upload_label_explains_extraction_destination() -> None:
     assert 'accept=".zip"' in source
 
 
-def test_frontend_send_is_disabled_only_for_an_active_agent_turn() -> None:
+def test_frontend_send_is_disabled_during_request_or_active_agent_turn() -> None:
     source = (
         Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
     ).read_text(encoding="utf-8")
 
+    assert "const sendingMessage = ref(false)" in source
+    assert "sendingMessage.value ||" in source
+    assert "if (sendDisabled.value) return" in source
+    assert "sendingMessage.value = true" in source
+    assert "finally { sendingMessage.value = false }" in source
     assert "Boolean(currentSession.value?.active_turn_id)" in source
     assert (
         "currentSession?.runtime_status === 'queued' && "
@@ -173,3 +178,8 @@ def test_frontend_clears_pending_interactions_on_terminal_runtime_events() -> No
     assert "clearPendingInteractions()" in source
     assert "permission.value = null" in source
     assert "pendingMcpTrust.value = null" in source
+    runtime_error_handler = source.split(
+        'eventSource.addEventListener("runtime_error"', 1
+    )[1].split("\n  })", 1)[0]
+    assert "showError" in runtime_error_handler
+    assert "clearPendingInteractions()" not in runtime_error_handler

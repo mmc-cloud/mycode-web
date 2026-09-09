@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from app.services.jsonl_runtime import JsonlProtocolError, JsonlRuntimeAdapter
+from app.services.jsonl_runtime import (
+    MAX_JSONL_BUFFER_BYTES,
+    MAX_JSONL_LINE_BYTES,
+    JsonlProtocolError,
+    JsonlRuntimeAdapter,
+)
 
 
 def wire(*messages: dict[str, object]) -> bytes:
@@ -64,6 +69,34 @@ def test_adapter_rejects_incomplete_line_at_eof() -> None:
     assert adapter.feed(b'{"version":1,"type":"runtime_ready"') == ()
     with pytest.raises(JsonlProtocolError, match="incomplete"):
         adapter.finish()
+
+
+def test_adapter_rejects_fragmented_oversized_buffer_before_parsing() -> None:
+    adapter = JsonlRuntimeAdapter()
+    half = MAX_JSONL_BUFFER_BYTES // 2
+    assert adapter.feed(b"x" * half) == ()
+    with pytest.raises(JsonlProtocolError) as raised:
+        adapter.feed(b"x" * (half + 1))
+    assert raised.value.code == "message_too_large"
+
+
+def test_adapter_rejects_oversized_complete_line_before_json_decode() -> None:
+    payload = (
+        b'{"version":1,"type":"runtime_warning","message":"'
+        + b"x" * MAX_JSONL_LINE_BYTES
+        + b'"}\n'
+    )
+    with pytest.raises(JsonlProtocolError) as raised:
+        JsonlRuntimeAdapter().feed(payload)
+    assert raised.value.code == "jsonl_line_too_large"
+
+
+def test_adapter_accepts_normal_large_utf8_message_below_transport_limit() -> None:
+    content = "你好" * 100_000
+    payload = wire({"type": "runtime_warning", "message": content})
+    assert JsonlRuntimeAdapter().feed(payload) == (
+        {"version": 1, "type": "runtime_warning", "message": content},
+    )
 
 
 def test_adapter_encodes_turn_without_collapsing_newlines() -> None:
