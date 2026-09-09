@@ -68,6 +68,9 @@ class FakeRuntime:
         self.activations = 0
         self.leases = 0
 
+    def runtime_generation(self, session_id: str) -> int:
+        return 0
+
     def status(self, session_id: str) -> str:
         return self.states.get(session_id, "stopped")
 
@@ -83,10 +86,15 @@ class FakeRuntime:
     def container_ref(self, session_id: str) -> str | None:
         return self.refs.get(session_id)
 
-    async def acquire_terminal_lease(self, session_id: str) -> None:
+    async def acquire_terminal_lease(
+        self, session_id: str, generation: int | None = None
+    ) -> int:
         self.leases += 1
+        return 0 if generation is None else generation
 
-    async def release_terminal_lease(self, session_id: str) -> None:
+    async def release_terminal_lease(
+        self, session_id: str, generation: int | None = None
+    ) -> None:
         self.leases = max(0, self.leases - 1)
 
 

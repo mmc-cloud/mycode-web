@@ -238,6 +238,7 @@ class _RuntimeSession:
     active_turn_id: str | None = None
     startup_error: str | None = None
     terminal_clients: int = 0
+    terminal_leases: dict[int | None, int] = field(default_factory=dict)
     runtime_generation: int = 0
     relay_token: str | None = None
     pending_permission: dict[str, object] | None = None
@@ -344,23 +345,61 @@ class RuntimeManager:
             else:
                 await status_changed.wait()
 
-    async def acquire_terminal_lease(self, session_id: str) -> None:
+    async def acquire_terminal_lease(
+        self, session_id: str, generation: int | None = None
+    ) -> int:
         async with self._lock:
             if self._closed:
                 raise RuntimeUnavailableError("Runtime manager is shutting down.")
             state = self._sessions.setdefault(session_id, _RuntimeSession())
             if state.status == "stopping":
                 raise RuntimeUnavailableError("Runtime is not active.")
-            state.terminal_clients += 1
+            lease_generation = (
+                None
+                if generation is None and state.status == "stopped"
+                else state.runtime_generation
+                if generation is None
+                else generation
+            )
+            if lease_generation is not None and lease_generation != state.runtime_generation:
+                raise RuntimeUnavailableError("Runtime generation changed.")
+            state.terminal_leases[lease_generation] = (
+                state.terminal_leases.get(lease_generation, 0) + 1
+            )
+            if lease_generation is None:
+                state.terminal_clients += 1
+            else:
+                state.terminal_clients = state.terminal_leases.get(
+                    state.runtime_generation, 0
+                )
             self._touch(session_id, state)
+            return state.runtime_generation if lease_generation is None else lease_generation
 
-    async def release_terminal_lease(self, session_id: str) -> None:
+    async def release_terminal_lease(
+        self, session_id: str, generation: int | None = None
+    ) -> None:
         schedule_dispatch = False
         async with self._lock:
             state = self._sessions.get(session_id)
-            if state is None or state.terminal_clients == 0:
+            if state is None:
                 return
-            state.terminal_clients -= 1
+            lease_generation = state.runtime_generation if generation is None else generation
+            count = state.terminal_leases.get(lease_generation, 0)
+            if count == 0 and generation is None:
+                lease_generation = None
+                count = state.terminal_leases.get(lease_generation, 0)
+            if count == 0:
+                return
+            if count == 1:
+                state.terminal_leases.pop(lease_generation, None)
+            else:
+                state.terminal_leases[lease_generation] = count - 1
+            if lease_generation != state.runtime_generation:
+                if lease_generation is None and generation is None:
+                    state.terminal_clients = max(0, state.terminal_clients - 1)
+                    self._touch(session_id, state)
+                return
+            state.terminal_clients = count - 1
             self._touch(session_id, state)
             schedule_dispatch = (
                 state.terminal_clients == 0
@@ -369,6 +408,22 @@ class RuntimeManager:
             )
         if schedule_dispatch:
             self._spawn(self._dispatch_from_idle(session_id, state))
+
+    async def rebind_terminal_leases(
+        self, session_id: str, from_generation: int, to_generation: int
+    ) -> None:
+        if from_generation == to_generation:
+            return
+        async with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None or state.runtime_generation != to_generation:
+                raise RuntimeUnavailableError("Runtime generation changed.")
+            count = state.terminal_leases.pop(from_generation, 0)
+            if count:
+                state.terminal_leases[to_generation] = (
+                    state.terminal_leases.get(to_generation, 0) + count
+                )
+            state.terminal_clients = state.terminal_leases.get(to_generation, 0)
 
     def terminal_clients(self, session_id: str) -> int:
         state = self._sessions.get(session_id)
@@ -1402,6 +1457,15 @@ class RuntimeManager:
         state.active_turn_id = None
         state.startup_error = None
         state.runtime_generation += 1
+        provisional_leases = state.terminal_leases.pop(None, 0)
+        if provisional_leases:
+            state.terminal_leases[state.runtime_generation] = (
+                state.terminal_leases.get(state.runtime_generation, 0)
+                + provisional_leases
+            )
+        state.terminal_clients = state.terminal_leases.get(
+            state.runtime_generation, 0
+        )
         state.relay_token = self.relay_tokens.issue(
             session_id, state.runtime_generation
         )

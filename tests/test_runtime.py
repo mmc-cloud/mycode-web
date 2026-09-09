@@ -18,6 +18,7 @@ from app.services.runtime import (
     RuntimeUnavailableError,
     _validate_message_content,
 )
+from app.services.terminal import TerminalManager
 from app.services.workspace import WorkspaceService
 
 
@@ -1833,6 +1834,115 @@ def test_startup_failure_cleanup_cannot_stop_new_runtime_generation(
         assert manager.runtime_token("session") is not None
         assert cleanup_calls == [("session", 1)]
         await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_old_terminal_cleanup_releases_only_its_runtime_generation(
+    tmp_path: Path,
+) -> None:
+    class ControlledTerminalProcess:
+        def __init__(self, *, blocking: bool) -> None:
+            self.blocking = blocking
+            self.returncode: int | None = None
+            self.output: asyncio.Queue[bytes] = asyncio.Queue()
+            self.done = asyncio.Event()
+            self.terminate_started = asyncio.Event()
+            self.release_wait = asyncio.Event()
+            self.writes: list[bytes] = []
+
+        async def read(self, size: int = 4096) -> bytes:
+            return await self.output.get()
+
+        async def write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+        async def resize(self, cols: int, rows: int) -> None:
+            return None
+
+        async def wait(self) -> int:
+            if self.blocking:
+                await self.release_wait.wait()
+            else:
+                await self.done.wait()
+            self.returncode = 0
+            return 0
+
+        def terminate(self) -> None:
+            self.terminate_started.set()
+            if not self.blocking:
+                self.returncode = 0
+                self.done.set()
+                self.output.put_nowait(b"")
+
+        def kill(self) -> None:
+            self.release_wait.set()
+            self.terminate()
+
+    class ControlledTerminalBackend:
+        def __init__(self) -> None:
+            self.processes: list[ControlledTerminalProcess] = []
+
+        async def launch(self, container_ref: str, cols: int, rows: int):
+            process = ControlledTerminalProcess(blocking=not self.processes)
+            self.processes.append(process)
+            return process
+
+    async def wait_for_terminal_ready(connection) -> None:
+        for _ in range(20):
+            message = await asyncio.wait_for(connection.messages.get(), timeout=1)
+            if message.get("type") == "status" and message.get("status") == "ready":
+                return
+        raise AssertionError("Terminal did not become ready")
+
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        launcher.container_ref = lambda session_id: f"container-{session_id}"
+        terminal_holder: list[TerminalManager] = []
+
+        async def runtime_stop_hook(session_id: str, generation: int) -> None:
+            await terminal_holder[0].stop_session(session_id, generation)
+
+        runtime = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=runtime_stop_hook,
+        )
+        backend = ControlledTerminalBackend()
+        terminal = TerminalManager(runtime, config, backend=backend)
+        terminal_holder.append(terminal)
+
+        await runtime.send_message("session", "first")
+        await launcher.process.stdout.feed(FINISH_WIRE)
+        await wait_for_status(runtime, "session", "idle")
+        first = await terminal.attach("session")
+        await wait_for_terminal_ready(first)
+        assert runtime.runtime_generation("session") == 1
+        assert runtime.terminal_clients("session") == 1
+
+        old_stop = asyncio.create_task(runtime.stop_session("session"))
+        await asyncio.wait_for(backend.processes[0].terminate_started.wait(), timeout=1)
+
+        assert await runtime.activate("session") == "starting"
+        await wait_for_status(runtime, "session", "idle")
+        second = await terminal.attach("session")
+        await wait_for_terminal_ready(second)
+        assert runtime.runtime_generation("session") == 2
+        assert runtime.terminal_clients("session") == 1
+
+        backend.processes[0].release_wait.set()
+        await old_stop
+        assert runtime.terminal_clients("session") == 1
+        await terminal.input(second, "echo gen2\n")
+        assert backend.processes[1].writes == [b"echo gen2\n"]
+
+        await terminal.detach(second)
+        assert runtime.terminal_clients("session") == 0
+        await terminal.shutdown()
+        await runtime.shutdown()
 
     asyncio.run(scenario())
 

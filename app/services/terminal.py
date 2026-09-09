@@ -147,6 +147,7 @@ class _TerminalState:
     start_task: asyncio.Task[None] | None = None
     clients: dict[str, asyncio.Queue[dict[str, object]]] = field(default_factory=dict)
     leased_clients: set[str] = field(default_factory=set)
+    lease_generations: dict[str, int] = field(default_factory=dict)
     buffer: deque[bytes] = field(default_factory=deque)
     buffer_size: int = 0
     decoder: object = field(
@@ -161,6 +162,7 @@ class TerminalConnection:
     session_id: str
     client_id: str
     messages: asyncio.Queue[dict[str, object]]
+    runtime_generation: int
 
 
 class TerminalManager:
@@ -198,17 +200,25 @@ class TerminalManager:
             state = self._sessions.setdefault(session_id, _TerminalState())
             state.clients[client_id] = queue
             lease_acquired = False
+            lease_generation = _runtime_generation(self.runtime, session_id)
             try:
-                await self.runtime.acquire_terminal_lease(session_id)
+                acquired_generation = await self.runtime.acquire_terminal_lease(
+                    session_id, lease_generation
+                )
+                if acquired_generation is not None:
+                    lease_generation = acquired_generation
                 lease_acquired = True
                 state.leased_clients.add(client_id)
+                state.lease_generations[client_id] = lease_generation
                 process = state.process
                 snapshot = _buffer_text(state)
                 if _process_is_live(process):
                     if snapshot:
                         _queue_message(queue, {"type": "output", "data": snapshot})
                     _queue_message(queue, {"type": "status", "status": "ready"})
-                    return TerminalConnection(session_id, client_id, queue)
+                    return TerminalConnection(
+                        session_id, client_id, queue, lease_generation
+                    )
 
                 runtime_status = self.runtime.status(session_id)
                 _queue_message(
@@ -222,30 +232,40 @@ class TerminalManager:
                     state.start_task = asyncio.create_task(
                         self._start_shell(session_id, state, cols, rows)
                     )
-                return TerminalConnection(session_id, client_id, queue)
+                return TerminalConnection(
+                    session_id, client_id, queue, lease_generation
+                )
             except Exception:
                 state.clients.pop(client_id, None)
                 state.leased_clients.discard(client_id)
+                state.lease_generations.pop(client_id, None)
                 if not state.clients and state.process is None and state.start_task is None:
                     self._sessions.pop(session_id, None)
                 if lease_acquired:
-                    await self.runtime.release_terminal_lease(session_id)
+                    await self.runtime.release_terminal_lease(
+                        session_id, lease_generation
+                    )
                 raise
 
     async def detach(self, connection: TerminalConnection) -> None:
         start_task: asyncio.Task[None] | None = None
-        leased = False
+        lease_generation: int | None = None
         async with self._lock:
             state = self._sessions.get(connection.session_id)
             if state is None:
                 return
             state.clients.pop(connection.client_id, None)
-            leased = connection.client_id in state.leased_clients
-            state.leased_clients.discard(connection.client_id)
+            if connection.client_id in state.leased_clients:
+                lease_generation = state.lease_generations.pop(
+                    connection.client_id, connection.runtime_generation
+                )
+                state.leased_clients.discard(connection.client_id)
             if not state.clients and state.process is None:
                 start_task = state.start_task
-        if leased:
-            await self.runtime.release_terminal_lease(connection.session_id)
+        if lease_generation is not None:
+            await self.runtime.release_terminal_lease(
+                connection.session_id, lease_generation
+            )
         current_task = asyncio.current_task()
         if (
             start_task is not None
@@ -299,11 +319,18 @@ class TerminalManager:
             reader_task = state.reader_task
             process = state.process
             clients = tuple(state.clients.values())
-            leased_clients = tuple(state.leased_clients)
+            leased_clients = tuple(
+                (
+                    client_id,
+                    state.lease_generations.get(client_id),
+                )
+                for client_id in state.leased_clients
+            )
             state.start_task = None
             state.reader_task = None
             state.process = None
             state.leased_clients.clear()
+            state.lease_generations.clear()
             for queue in clients:
                 _queue_message(queue, {"type": "status", "status": "closed"})
         if start_task is not None and not start_task.done():
@@ -322,7 +349,11 @@ class TerminalManager:
         if start_task is not None and start_task is not current_task:
             await asyncio.gather(start_task, return_exceptions=True)
         await asyncio.gather(
-            *(self.runtime.release_terminal_lease(session_id) for _ in leased_clients),
+            *(
+                self.runtime.release_terminal_lease(session_id, generation)
+                for _client_id, generation in leased_clients
+                if generation is not None
+            ),
             return_exceptions=True,
         )
 
@@ -341,6 +372,7 @@ class TerminalManager:
         process: TerminalProcess | None = None
         started = False
         try:
+            initial_generation = _runtime_generation(self.runtime, session_id)
             runtime_status = await self.runtime.activate(session_id)
             status_message = (
                 "Waiting for Sandbox capacity."
@@ -357,6 +389,17 @@ class TerminalManager:
                 session_id, status_payload,
             )
             await self.runtime.wait_until_ready(session_id)
+            current_generation = _runtime_generation(self.runtime, session_id)
+            if current_generation != initial_generation:
+                rebind = getattr(self.runtime, "rebind_terminal_leases", None)
+                if rebind is not None:
+                    await rebind(
+                        session_id, initial_generation, current_generation
+                    )
+                async with self._lock:
+                    for client_id in state.leased_clients:
+                        if state.lease_generations.get(client_id) == initial_generation:
+                            state.lease_generations[client_id] = current_generation
             container_ref = self.runtime.container_ref(session_id)
             if not container_ref:
                 raise TerminalUnavailableError(
@@ -396,10 +439,20 @@ class TerminalManager:
         finally:
             if not started:
                 async with self._lock:
-                    leased = tuple(state.leased_clients)
+                    leased = tuple(
+                        (
+                            client_id,
+                            state.lease_generations.get(client_id),
+                        )
+                        for client_id in state.leased_clients
+                    )
                     state.leased_clients.clear()
-                for _client_id in leased:
-                    await self.runtime.release_terminal_lease(session_id)
+                    state.lease_generations.clear()
+                for _client_id, generation in leased:
+                    if generation is not None:
+                        await self.runtime.release_terminal_lease(
+                            session_id, generation
+                        )
             async with self._lock:
                 if state.start_task is asyncio.current_task():
                     state.start_task = None
@@ -459,11 +512,22 @@ class TerminalManager:
             if state.process is process:
                 state.process = None
                 state.reader_task = None
-            leased_clients = tuple(state.leased_clients)
+            leased_clients = tuple(
+                (
+                    client_id,
+                    state.lease_generations.get(client_id),
+                )
+                for client_id in state.leased_clients
+            )
             state.leased_clients.clear()
+            state.lease_generations.clear()
         _close_process(process)
         await asyncio.gather(
-            *(self.runtime.release_terminal_lease(session_id) for _ in leased_clients),
+            *(
+                self.runtime.release_terminal_lease(session_id, generation)
+                for _client_id, generation in leased_clients
+                if generation is not None
+            ),
             return_exceptions=True,
         )
 
@@ -491,6 +555,11 @@ def _bounded_size(cols: int, rows: int) -> tuple[int, int]:
     if not isinstance(cols, int) or not isinstance(rows, int):
         raise TerminalUnavailableError("Terminal size must be integer values.")
     return max(1, min(cols, 500)), max(1, min(rows, 300))
+
+
+def _runtime_generation(runtime: object, session_id: str) -> int:
+    getter = getattr(runtime, "runtime_generation", None)
+    return 0 if getter is None else getter(session_id)
 
 
 def _initial_terminal_status(runtime_status: str) -> str:
