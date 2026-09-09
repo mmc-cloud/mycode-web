@@ -71,7 +71,7 @@ const pendingMcpTrust = ref(null)
 const turnStates = ref({})
 const expandedGroups = ref({})
 const message = ref("")
-const sendingMessage = ref(false)
+const sendingSessionIds = reactive(new Set())
 const error = ref("")
 const lifecycleNotice = ref("")
 const outputElement = ref(null)
@@ -81,7 +81,7 @@ let generation = 0
 let resizeState = null
 
 const sendDisabled = computed(() =>
-  sendingMessage.value || (
+  sendingSessionIds.has(currentSession.value?.id) || (
     Boolean(currentSession.value?.active_turn_id) &&
     ACTIVE_TURN_STATUSES.includes(currentSession.value?.runtime_status)
   ),
@@ -434,21 +434,30 @@ async function deleteEntry(entry) {
 
 async function sendMessage() {
   if (sendDisabled.value) return
+  const sessionId = currentSession.value?.id
+  const token = generation
+  if (!sessionId) return
   const content = message.value.trim()
   if (!content) return
-  sendingMessage.value = true
+  sendingSessionIds.add(sessionId)
   try {
-    const result = await request(scoped("/message"), {
+    const result = await request(scoped("/message", sessionId), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
     })
+    if (generation !== token || currentSession.value?.id !== sessionId) return
     currentSession.value.runtime_status = result.status
     currentSession.value.active_turn_id = result.turn_id
     updateTurnStatus(result.turn_id, result.status)
     message.value = ""
-  } catch (reason) { showError(reason) }
-  finally { sendingMessage.value = false }
+  } catch (reason) {
+    if (generation === token && currentSession.value?.id === sessionId) {
+      showError(reason)
+    }
+  } finally {
+    sendingSessionIds.delete(sessionId)
+  }
 }
 
 async function resolvePermission(decision) {

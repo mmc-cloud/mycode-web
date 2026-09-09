@@ -96,11 +96,15 @@ def test_frontend_send_is_disabled_during_request_or_active_agent_turn() -> None
         Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
     ).read_text(encoding="utf-8")
 
-    assert "const sendingMessage = ref(false)" in source
-    assert "sendingMessage.value ||" in source
+    assert "const sendingSessionIds = reactive(new Set())" in source
+    assert "sendingSessionIds.has(currentSession.value?.id)" in source
     assert "if (sendDisabled.value) return" in source
-    assert "sendingMessage.value = true" in source
-    assert "finally { sendingMessage.value = false }" in source
+    assert "const sessionId = currentSession.value?.id" in source
+    assert "const token = generation" in source
+    assert 'scoped("/message", sessionId)' in source
+    assert "generation !== token || currentSession.value?.id !== sessionId" in source
+    assert "sendingSessionIds.add(sessionId)" in source
+    assert "sendingSessionIds.delete(sessionId)" in source
     assert "Boolean(currentSession.value?.active_turn_id)" in source
     assert (
         "currentSession?.runtime_status === 'queued' && "

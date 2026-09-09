@@ -364,7 +364,7 @@ class RuntimeManager:
             self._touch(session_id, state)
             schedule_dispatch = (
                 state.terminal_clients == 0
-                and state.status == "idle"
+                and self._is_genuinely_idle(state)
                 and bool(self._queue)
             )
         if schedule_dispatch:
@@ -443,11 +443,11 @@ class RuntimeManager:
             state = self._sessions.setdefault(session_id, _RuntimeSession())
             if state.status == "stopped":
                 state.startup_error = None
+            if state.active_turn_id is not None:
+                raise RuntimeConflictError(
+                    "This Session already has an active or queued Agent turn."
+                )
             if state.status == "starting":
-                if state.active_turn_id is not None:
-                    raise RuntimeConflictError(
-                        "This Session already has an active Agent turn."
-                    )
                 state.active_turn_id = turn_id
                 waiting_start_state = state
             elif state.status in {
@@ -668,7 +668,15 @@ class RuntimeManager:
                     and self._is_live(state)
                     and (
                         state.status == "waiting_mcp_trust"
-                        or state.terminal_clients == 0
+                        or (
+                            state.status == "waiting_permission"
+                            and state.terminal_clients == 0
+                        )
+                        or (
+                            state.status == "idle"
+                            and state.terminal_clients == 0
+                            and self._is_genuinely_idle(state)
+                        )
                     )
                     and now - state.last_activity
                     >= self.settings.sandbox_idle_ttl_seconds
@@ -1177,7 +1185,7 @@ class RuntimeManager:
         async with self._lock:
             if (
                 self._closed
-                or state.status != "idle"
+                or not self._is_genuinely_idle(state)
                 or state.terminal_clients > 0
                 or not self._queue
             ):
@@ -1462,8 +1470,7 @@ class RuntimeManager:
             (candidate_session_id, state)
             for candidate_session_id, state in self._sessions.items()
             if (
-                state.status == "idle"
-                and self._is_live(state)
+                self._is_genuinely_idle(state)
                 and state.terminal_clients == 0
                 and self._user_has_capacity_locked(
                     target_session_id,
@@ -1476,6 +1483,15 @@ class RuntimeManager:
     @staticmethod
     def _is_live(state: _RuntimeSession) -> bool:
         return state.process is not None and state.process.returncode is None
+
+    @classmethod
+    def _is_genuinely_idle(cls, state: _RuntimeSession) -> bool:
+        return (
+            state.status == "idle"
+            and cls._is_live(state)
+            and state.active_turn_id is None
+            and not state.busy
+        )
 
     def _touch(self, session_id: str, state: _RuntimeSession) -> None:
         state.last_activity = self._clock()

@@ -347,6 +347,69 @@ def test_same_user_runtimes_share_workspace_but_keep_state_private(
     asyncio.run(scenario())
 
 
+def test_reserved_turn_runtime_is_not_handed_to_queue_until_turn_finishes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), sandbox_max_active=1)
+        launcher = ManualPromptLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        assert await manager.activate("a") == "starting"
+        for _ in range(20):
+            if launcher.calls:
+                break
+            await asyncio.sleep(0)
+        first = asyncio.create_task(
+            manager.send_message("a", "turn a", turn_id="turn-a")
+        )
+        for _ in range(20):
+            if manager.active_turn_id("a") == "turn-a":
+                break
+            await asyncio.sleep(0)
+        assert manager.active_turn_id("a") == "turn-a"
+        assert await manager.send_message("b", "turn b", turn_id="turn-b") == "queued"
+        assert manager.status("b") == "queued"
+
+        await launcher.by_session["a"][0].stdout.feed(READY_WIRE)
+        assert await asyncio.wait_for(first, timeout=1) == "running"
+        assert manager.status("a") == "running"
+        assert manager.active_turn_id("a") == "turn-a"
+        assert launcher.calls == 1
+        assert [
+            json.loads(payload)
+            for payload in launcher.by_session["a"][0].stdin.raw_writes
+            if json.loads(payload).get("type") == "turn"
+        ] == [
+            {
+                "version": 1,
+                "type": "turn",
+                "turn_id": "turn-a",
+                "content": "turn a",
+            }
+        ]
+
+        await launcher.by_session["a"][0].stdout.feed(FINISH_WIRE)
+        await wait_for_status(manager, "a", "idle")
+        for _ in range(100):
+            if launcher.calls == 2:
+                break
+            await asyncio.sleep(0)
+        assert launcher.calls == 2
+        await launcher.by_session["b"][0].stdout.feed(READY_WIRE)
+        await wait_for_status(manager, "b", "running")
+        assert json.loads(launcher.by_session["b"][0].stdin.raw_writes[-1]) == {
+            "version": 1,
+            "type": "turn",
+            "turn_id": "turn-b",
+            "content": "turn b",
+        }
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_activate_is_async_idempotent_and_message_waits_same_runtime(
     tmp_path: Path,
 ) -> None:
@@ -1465,6 +1528,49 @@ def test_connected_terminal_runtime_is_not_an_idle_eviction_victim(
         assert await manager.send_message("new", "three") == "running"
         assert manager.status("protected") == "idle"
         assert manager.status("other") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_reserved_idle_runtime_is_not_eviction_or_idle_ttl_victim(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        config = replace(
+            settings(tmp_path),
+            sandbox_max_active=1,
+            sandbox_idle_ttl_seconds=10,
+        )
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher, clock=clock
+        )
+        await manager.send_message("reserved", "initial")
+        await launcher.process.stdout.feed(FINISH_WIRE)
+        await wait_for_status(manager, "reserved", "idle")
+
+        state = manager._sessions["reserved"]
+        async with manager._lock:
+            state.active_turn_id = "reserved-turn"
+            state.busy = False
+            assert manager._oldest_evictable_idle_locked("new") is None
+        clock.advance(10)
+        assert await manager.sweep_expired() == ()
+        assert manager.status("reserved") == "idle"
+        assert manager.active_turn_id("reserved") == "reserved-turn"
+
+        with pytest.raises(RuntimeConflictError):
+            await manager.send_message("reserved", "second")
+        assert await manager.send_message("new", "queued") == "queued"
+        assert manager.status("reserved") == "idle"
+        assert manager.active_turn_id("reserved") == "reserved-turn"
+        assert manager.status("new") == "queued"
+        assert launcher.calls == 1
+        await manager._dispatch_from_idle("reserved", state)
+        assert manager.status("reserved") == "idle"
+        assert manager.status("new") == "queued"
         await manager.shutdown()
 
     asyncio.run(scenario())
