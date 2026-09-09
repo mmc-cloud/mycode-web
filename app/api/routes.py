@@ -54,7 +54,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _session_response(request: Request, session: WebSession) -> SessionResponse:
+def _session_response(
+    request: Request,
+    session: WebSession,
+    *,
+    event_cursor: int | None = None,
+) -> SessionResponse:
     runtime = services(request).runtime
     return SessionResponse(
         id=session.id,
@@ -65,6 +70,7 @@ def _session_response(request: Request, session: WebSession) -> SessionResponse:
         active_turn_id=runtime.active_turn_id(session.id),
         pending_permission=runtime.pending_permission(session.id),
         pending_mcp_trust=runtime.pending_mcp_trust(session.id),
+        event_cursor=event_cursor,
     )
 
 
@@ -100,10 +106,13 @@ async def get_session(
     context: WebContext = Depends(current_context),
 ) -> SessionResponse:
     app_services = services(request)
+    # Capture the cursor before reading the runtime interaction snapshot. Any
+    # event published after this point remains eligible for SSE replay.
+    event_cursor = app_services.events.latest_id(context.session.id)
     app_services.database.touch_session(context.session.id)
     session = app_services.database.get_session(context.session.id, context.user.id)
     assert session is not None
-    return _session_response(request, session)
+    return _session_response(request, session, event_cursor=event_cursor)
 
 
 @router.delete("/sessions/{session_id}", status_code=204)

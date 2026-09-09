@@ -41,6 +41,9 @@ class SessionResponse(BaseModel):
     active_turn_id: str | None = None
     pending_permission: dict[str, object] | None = None
     pending_mcp_trust: dict[str, object] | None = None
+    # Detail responses use this as the SSE bootstrap cursor. List/create
+    # responses leave it unset because they are not bootstrap snapshots.
+    event_cursor: int | None = None
 
 
 class SessionListResponse(BaseModel):

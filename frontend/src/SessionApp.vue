@@ -175,7 +175,10 @@ async function openSession(sessionId, replace = false) {
   window.history[replace ? "replaceState" : "pushState"]({}, "", url)
   const metadata = loadMetadata(sessionId, token)
   const tree = refreshTree(sessionId, token)
-  const history = loadConsole(sessionId, token)
+  const history = metadata.then((bootstrap) => {
+    if (!bootstrap) return
+    return loadConsole(sessionId, token, bootstrap.event_cursor)
+  })
   void request(scoped("/activate", sessionId), { method: "POST" })
     .then((result) => {
       if (generation === token && currentSession.value?.id === sessionId) {
@@ -188,7 +191,7 @@ async function openSession(sessionId, replace = false) {
 
 async function loadMetadata(sessionId, token) {
   const result = await request(scoped("", sessionId))
-  if (generation !== token) return
+  if (generation !== token || currentSession.value?.id !== sessionId) return null
   currentSession.value = result
   permission.value = result.pending_permission
   pendingMcpTrust.value = result.pending_mcp_trust
@@ -197,15 +200,20 @@ async function loadMetadata(sessionId, token) {
   }
   const index = sessions.value.findIndex((item) => item.id === sessionId)
   if (index >= 0) sessions.value[index] = result
+  return result
 }
 
-async function loadConsole(sessionId, token) {
+async function loadConsole(sessionId, token, bootstrapCursor) {
   const result = await request(scoped("/console", sessionId))
-  if (generation !== token) return
+  if (
+    generation !== token ||
+    currentSession.value?.id !== sessionId ||
+    !Number.isInteger(bootstrapCursor)
+  ) return
   const merged = new Map(result.events.map((event) => [event.id, event]))
   for (const event of consoleEvents.value) merged.set(event.id, event)
   consoleEvents.value = [...merged.values()].sort((left, right) => left.id - right.id)
-  connectEvents(sessionId, token, result.event_cursor)
+  connectEvents(sessionId, token, bootstrapCursor)
 }
 
 async function createSession() {

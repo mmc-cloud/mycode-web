@@ -1744,8 +1744,39 @@ def test_runtime_start_failure_revokes_issued_token(tmp_path: Path) -> None:
         )
         with pytest.raises(RuntimeUnavailableError):
             await manager.send_message("session", "task")
+        assert manager.active_turn_id("session") is None
         assert manager.runtime_token("session") is None
         assert manager.relay_tokens.active_count == 0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_start_failure_clears_turn_and_allows_retry(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FailNextLauncher()
+        launcher.fail_next = True
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+        )
+
+        with pytest.raises(RuntimeUnavailableError):
+            await manager.send_message("session", "first", turn_id="turn-1")
+        assert manager.status("session") == "error"
+        assert manager.active_turn_id("session") is None
+        assert manager.runtime_token("session") is None
+
+        assert await manager.send_message("session", "retry", turn_id="turn-2") == "running"
+        assert json.loads(launcher.process.stdin.raw_writes[-1]) == {
+            "version": 1,
+            "type": "turn",
+            "turn_id": "turn-2",
+            "content": "retry",
+        }
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -1766,6 +1797,7 @@ def test_runtime_workspace_start_failure_revokes_issued_token(tmp_path: Path) ->
         )
         with pytest.raises(RuntimeUnavailableError):
             await manager.send_message("session", "task")
+        assert manager.active_turn_id("session") is None
         assert manager.runtime_token("session") is None
         assert manager.relay_tokens.active_count == 0
         await manager.shutdown()

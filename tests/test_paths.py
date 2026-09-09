@@ -112,6 +112,19 @@ def test_frontend_send_is_disabled_during_request_or_active_agent_turn() -> None
     ) in source
 
 
+def test_frontend_uses_session_bootstrap_cursor_for_sse() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "const history = metadata.then((bootstrap) =>" in source
+    assert "loadConsole(sessionId, token, bootstrap.event_cursor)" in source
+    assert "async function loadConsole(sessionId, token, bootstrapCursor)" in source
+    assert "connectEvents(sessionId, token, bootstrapCursor)" in source
+    assert "connectEvents(sessionId, token, result.event_cursor)" not in source
+    assert "currentSession.value?.id !== sessionId" in source
+
+
 def test_terminal_clipboard_ux_uses_xterm_paste_and_cleans_listeners() -> None:
     terminal = (
         Path(__file__).resolve().parents[1] / "frontend/src/TerminalPanel.vue"

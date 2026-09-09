@@ -799,6 +799,7 @@ class RuntimeManager:
     async def _start_runtime(
         self, session_id: str, state: _RuntimeSession, turn_content: str | None
     ) -> None:
+        process: SandboxProcess | None = None
         try:
             owner_id = (
                 self._session_owner_resolver(session_id)
@@ -827,20 +828,31 @@ class RuntimeManager:
             ref_factory = getattr(self.launcher, "container_ref", None)
             container_ref = ref_factory(session_id) if ref_factory else None
         except Exception as error:
+            if process is not None and process.returncode is None:
+                try:
+                    process.terminate()
+                    await process.wait()
+                except Exception:
+                    logger.exception("Failed to clean up a Sandbox after startup failure.")
             async with self._lock:
+                failed_turn_id = state.active_turn_id
                 self._set_status_locked(state, "error")
                 state.busy = False
+                state.active_turn_id = None
+                state.pending_permission = None
+                state.pending_mcp_trust = None
+                state.mcp_trust_resume_status = None
                 state.ready.set()
                 self._revoke_runtime_token_locked(session_id, state)
             await self.events.publish(
                 session_id,
                 "error",
                 message=f"Sandbox failed to start: {type(error).__name__}: {error}",
-                **_turn_payload(state.active_turn_id),
+                **_turn_payload(failed_turn_id),
             )
             await self.events.publish(
                 session_id, "runtime_status", status="error",
-                **_turn_payload(state.active_turn_id),
+                **_turn_payload(failed_turn_id),
             )
             if self._runtime_stop_hook is not None:
                 await self._runtime_stop_hook(session_id)

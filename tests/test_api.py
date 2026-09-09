@@ -432,6 +432,72 @@ def test_console_snapshot_cursor_replays_event_published_before_sse(
     assert replayed == published
 
 
+def test_session_bootstrap_cursor_is_captured_before_runtime_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_test_app(tmp_path)
+    events = app.state.services.events
+    runtime = app.state.services.runtime
+    calls: list[str] = []
+    original_latest_id = events.latest_id
+    original_status = runtime.status
+
+    def tracked_latest_id(session_id: str) -> int:
+        calls.append("cursor")
+        return original_latest_id(session_id)
+
+    def tracked_status(session_id: str) -> str:
+        calls.append("runtime")
+        return original_status(session_id)
+
+    monkeypatch.setattr(events, "latest_id", tracked_latest_id)
+    monkeypatch.setattr(runtime, "status", tracked_status)
+
+    with TestClient(app) as client:
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        calls.clear()
+        response = client.get(f"{API_BASE_PATH}/sessions/{session_id}")
+
+    assert response.status_code == 200
+    assert response.json()["event_cursor"] == 0
+    assert calls.index("cursor") < calls.index("runtime")
+
+
+def test_session_bootstrap_cursor_replays_permission_and_mcp_events(
+    tmp_path: Path,
+) -> None:
+    app = create_test_app(tmp_path)
+    with TestClient(app) as client:
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        bootstrap = client.get(
+            f"{API_BASE_PATH}/sessions/{session_id}"
+        ).json()
+
+        async def publish_and_replay():
+            permission = await app.state.services.events.publish(
+                session_id,
+                "permission_request",
+                request_id="permission-1",
+            )
+            trust = await app.state.services.events.publish(
+                session_id,
+                "mcp_trust_request",
+                request_id="trust-1",
+            )
+            stream = app.state.services.events.stream(
+                session_id, bootstrap["event_cursor"]
+            )
+            replayed = [await anext(stream), await anext(stream), await anext(stream)]
+            await stream.aclose()
+            return permission, trust, replayed
+
+        permission, trust, replayed = asyncio.run(publish_and_replay())
+
+    assert replayed[0] == permission
+    assert replayed[1].type == "console_event"
+    assert replayed[2] == trust
+
+
 def test_activate_api_returns_before_slow_runtime_startup(tmp_path: Path) -> None:
     app = create_app(configured_settings(tmp_path), launcher=SlowLauncher())
     with TestClient(app) as client:
