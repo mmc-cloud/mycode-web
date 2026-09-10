@@ -57,11 +57,12 @@ if [ "$WEB_OLD" != "$WEB_NEW" ]; then
     WEB_CHANGED=1
     WEB_CHANGED_FILES="$(git_in "$WEB_DIR" diff --name-only "$WEB_OLD" "$WEB_NEW")"
 
-    # README/docs/site changes are static-only. nginx configuration is handled
+    # README/docs/site, CI/CD workflow files, and deploy-server.sh are
+    # deployment/static-only changes. nginx configuration is handled
     # separately below. None of them require Python dependency sync, Vue build,
     # FastAPI restart, or Sandbox rebuild by themselves.
     if printf '%s\n' "$WEB_CHANGED_FILES" | \
-        grep -Ev '^(README\.md|docs/|site/|deploy/nginx/)' | grep -q .; then
+        grep -Ev '^(README\.md|docs/|site/|deploy/nginx/|\.github/|scripts/deploy-server\.sh$)' | grep -q .; then
         WEB_RUNTIME_CHANGED=1
     fi
 
@@ -101,7 +102,7 @@ if [ "$NGINX_CONFIG_CHANGED" -eq 1 ]; then
 fi
 
 if [ "$MYCODE_CHANGED" -eq 0 ] && [ "$WEB_RUNTIME_CHANGED" -eq 0 ]; then
-    echo "==> Web changes are static/documentation-only. No runtime deployment needed."
+    echo "==> Web changes are static/documentation/deployment-only. No runtime deployment needed."
     exit 0
 fi
 
