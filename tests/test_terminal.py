@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from app.config import ServerSettings
+from app.services.runtime import RuntimeTerminalTarget
 from app.services.terminal import (
     TERMINAL_HOME,
     TERMINAL_USER,
@@ -65,8 +66,9 @@ class FakeRuntime:
     def __init__(self) -> None:
         self.states = {"session": "stopped"}
         self.refs = {"session": "mycode-web-session"}
+        self.target_generation = 1
         self.activations = 0
-        self.leases = 0
+        self.lease_ids: set[str] = set()
 
     def status(self, session_id: str) -> str:
         return self.states.get(session_id, "stopped")
@@ -80,14 +82,18 @@ class FakeRuntime:
     async def wait_until_ready(self, session_id: str) -> str:
         return self.states[session_id]
 
-    def container_ref(self, session_id: str) -> str | None:
-        return self.refs.get(session_id)
+    async def get_terminal_target(self, session_id: str) -> RuntimeTerminalTarget:
+        return RuntimeTerminalTarget(self.target_generation, self.refs[session_id])
 
-    async def acquire_terminal_lease(self, session_id: str) -> None:
-        self.leases += 1
+    async def acquire_terminal_lease(self, session_id: str, lease_id: str) -> None:
+        self.lease_ids.add(lease_id)
 
-    async def release_terminal_lease(self, session_id: str) -> None:
-        self.leases = max(0, self.leases - 1)
+    async def release_terminal_lease(self, session_id: str, lease_id: str) -> None:
+        self.lease_ids.discard(lease_id)
+
+    @property
+    def leases(self) -> int:
+        return len(self.lease_ids)
 
 
 class CapacityWaitingRuntime(FakeRuntime):
@@ -268,5 +274,32 @@ def test_terminal_ring_buffer_is_bounded_and_replayed(tmp_path: Path) -> None:
         closed = await asyncio.wait_for(first.messages.get(), timeout=1)
         assert closed == {"type": "status", "status": "closed"}
         assert runtime.leases == 0
+
+    asyncio.run(scenario())
+
+
+def test_terminal_shell_is_not_reused_across_runtime_generations(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.refs["session"] = "container-gen1"
+        backend = FakeTerminalBackend()
+        settings = ServerSettings(data_dir=tmp_path / "data")
+        manager = TerminalManager(runtime, settings, backend=backend)
+
+        first = await manager.attach("session")
+        await wait_for_status(first, "ready")
+        assert manager._sessions["session"].shell_generation == 1
+        await manager.stop_session("session")
+
+        runtime.target_generation = 2
+        runtime.refs["session"] = "container-gen2"
+        second = await manager.attach("session")
+        await wait_for_status(second, "ready")
+        assert backend.refs == ["container-gen1", "container-gen2"]
+        assert manager._sessions["session"].shell_generation == 2
+
+        await manager.shutdown()
 
     asyncio.run(scenario())

@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue"
 
+import AppDialog from "./AppDialog.vue"
 import FileTree from "./FileTree.vue"
 import TerminalPanel from "./TerminalPanel.vue"
 import { API_BASE, sessionApiPath } from "./api"
@@ -74,6 +75,18 @@ const message = ref("")
 const sendingSessionIds = reactive(new Set())
 const error = ref("")
 const lifecycleNotice = ref("")
+const dialog = reactive({
+  type: null,
+  target: null,
+  title: "",
+  message: "",
+  detail: "",
+  inputLabel: "",
+  inputValue: "",
+  confirmText: "确认",
+  danger: false,
+  busy: false,
+})
 const outputElement = ref(null)
 let eventSource = null
 let workspaceTimer = null
@@ -93,6 +106,11 @@ const executionGroups = computed(() => buildExecutionGroups(
   currentSession.value,
   turnStates.value,
   expandedGroups.value,
+))
+const dialogOpen = computed(() => Boolean(dialog.type))
+const dialogMode = computed(() => dialog.type === "rename" ? "input" : "confirm")
+const dialogConfirmDisabled = computed(() => (
+  dialog.type === "rename" && !dialog.inputValue.trim()
 ))
 
 async function request(path, options = {}) {
@@ -134,6 +152,7 @@ async function initialize() {
 
 function clearCurrentSession(replace = true) {
   generation += 1
+  closeDialog()
   eventSource?.close()
   eventSource = null
   if (workspaceTimer) window.clearTimeout(workspaceTimer)
@@ -156,6 +175,7 @@ function clearCurrentSession(replace = true) {
 
 async function openSession(sessionId, replace = false) {
   const token = ++generation
+  closeDialog()
   eventSource?.close()
   eventSource = null
   if (workspaceTimer) window.clearTimeout(workspaceTimer)
@@ -224,36 +244,124 @@ async function createSession() {
   } catch (reason) { showError(reason) }
 }
 
-async function renameSession(session) {
-  const name = window.prompt("会话名称", session.name || sessionLabel(session))
-  if (name === null || !name.trim()) return
-  try {
-    const updated = await request(scoped("", session.id), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    })
-    const index = sessions.value.findIndex((item) => item.id === session.id)
-    if (index >= 0) sessions.value[index] = updated
-    if (currentSession.value?.id === session.id) currentSession.value = updated
-    sessionMenuId.value = null
-  } catch (reason) { showError(reason) }
+function openRenameDialog(session) {
+  sessionMenuId.value = null
+  closeDialog()
+  Object.assign(dialog, {
+    type: "rename",
+    target: { sessionId: session.id, name: session.name || sessionLabel(session) },
+    title: "重命名会话",
+    message: "",
+    detail: "",
+    inputLabel: "会话名称",
+    inputValue: session.name || sessionLabel(session),
+    confirmText: "保存",
+    danger: false,
+    busy: false,
+  })
 }
 
-async function removeSession(session) {
+function openRemoveSessionDialog(session) {
   sessionMenuId.value = null
+  closeDialog()
   const title = sessionLabel(session)
-  if (!window.confirm(`确认删除会话“${title}”吗？\n该会话的聊天记录、运行状态和 Terminal 状态将被删除。\n项目 Workspace 文件不会受到影响。`)) return
+  Object.assign(dialog, {
+    type: "delete-session",
+    target: { sessionId: session.id, title },
+    title: "删除会话？",
+    message: `确定删除 “${title}” 吗？`,
+    detail: "该会话的聊天记录、运行状态和 Terminal 状态将被删除。项目 Workspace 文件不会受到影响。",
+    inputLabel: "",
+    inputValue: "",
+    confirmText: "删除会话",
+    danger: true,
+    busy: false,
+  })
+}
+
+function openDeleteEntryDialog(entry) {
+  const sessionId = currentSession.value?.id
+  if (!sessionId) return
+  closeDialog()
+  const isDirectory = entry.kind === "directory"
+  Object.assign(dialog, {
+    type: "delete-entry",
+    target: { sessionId, generation, path: entry.path, name: entry.name, kind: entry.kind },
+    title: isDirectory ? "删除目录？" : "删除文件？",
+    message: `确定删除 “${entry.name}” 吗？`,
+    detail: isDirectory ? "该目录及其中的全部内容将被递归删除。" : "",
+    inputLabel: "",
+    inputValue: "",
+    confirmText: "删除",
+    danger: true,
+    busy: false,
+  })
+}
+
+function closeDialog() {
+  Object.assign(dialog, {
+    type: null,
+    target: null,
+    title: "",
+    message: "",
+    detail: "",
+    inputLabel: "",
+    inputValue: "",
+    confirmText: "确认",
+    danger: false,
+    busy: false,
+  })
+}
+
+async function submitDialog() {
+  if (!dialog.target || dialog.busy) return
+  const type = dialog.type
+  const target = dialog.target
+  if (type === "rename" && !dialog.inputValue.trim()) return
+  dialog.busy = true
   try {
-    await request(scoped("", session.id), { method: "DELETE" })
-    sessions.value = sessions.value.filter((item) => item.id !== session.id)
-    if (currentSession.value?.id !== session.id) return
-    if (!sessions.value.length) {
-      clearCurrentSession()
+    if (type === "rename") {
+      const name = dialog.inputValue.trim()
+      const updated = await request(scoped("", target.sessionId), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      })
+      const index = sessions.value.findIndex((item) => item.id === target.sessionId)
+      if (index >= 0) sessions.value[index] = updated
+      if (currentSession.value?.id === target.sessionId) currentSession.value = updated
+      closeDialog()
       return
     }
-    await openSession(sessions.value[0].id, true)
-  } catch (reason) { showError(reason) }
+
+    if (type === "delete-session") {
+      await request(scoped("", target.sessionId), { method: "DELETE" })
+      sessions.value = sessions.value.filter((item) => item.id !== target.sessionId)
+      const wasCurrent = currentSession.value?.id === target.sessionId
+      closeDialog()
+      if (!wasCurrent) return
+      if (!sessions.value.length) {
+        clearCurrentSession()
+        return
+      }
+      await openSession(sessions.value[0].id, true)
+      return
+    }
+
+    if (type === "delete-entry") {
+      await request(`${scoped("/files", target.sessionId)}?path=${encodeURIComponent(target.path)}`, { method: "DELETE" })
+      const wasCurrent = currentSession.value?.id === target.sessionId
+      if (wasCurrent && (selectedPath.value === target.path || selectedPath.value.startsWith(`${target.path}/`))) {
+        selectedPath.value = ""
+        fileContent.value = ""
+      }
+      closeDialog()
+      await refreshTree(target.sessionId, target.generation)
+    }
+  } catch (reason) {
+    dialog.busy = false
+    showError(reason)
+  }
 }
 
 function clearPendingInteractions() {
@@ -425,19 +533,6 @@ async function openFile(path, sessionId = currentSession.value?.id, token = gene
     }
     showError(reason)
   }
-}
-
-async function deleteEntry(entry) {
-  const suffix = entry.kind === "directory" ? "？目录内容将递归删除。" : "？"
-  if (!window.confirm(`确认删除 ${entry.name}${suffix}`)) return
-  try {
-    await request(`${scoped("/files")}?path=${encodeURIComponent(entry.path)}`, { method: "DELETE" })
-    if (selectedPath.value === entry.path || selectedPath.value.startsWith(`${entry.path}/`)) {
-      selectedPath.value = ""
-      fileContent.value = ""
-    }
-    await refreshTree()
-  } catch (reason) { showError(reason) }
 }
 
 async function sendMessage() {
@@ -760,8 +855,8 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
             </button>
             <button class="more-button" title="会话菜单" @click.stop="sessionMenuId = sessionMenuId === session.id ? null : session.id">⋯</button>
             <div v-if="sessionMenuId === session.id" class="session-menu">
-              <button @click="renameSession(session)">Rename</button>
-              <button class="menu-danger" @click="removeSession(session)">Delete</button>
+              <button @click="openRenameDialog(session)">Rename</button>
+              <button class="menu-danger" @click="openRemoveSessionDialog(session)">Delete</button>
             </div>
           </div>
           <button @click="createSession">New Session</button>
@@ -782,7 +877,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
             <a v-if="currentSession" class="button-link" :href="API_BASE + scoped('/workspace/download')">Download</a>
           </div>
           <div class="workspace-body">
-            <nav class="tree-pane"><FileTree :entries="entries" :selected="selectedPath" @open="openFile" @delete="deleteEntry" /><p v-if="!entries.length" class="muted">Workspace 为空</p></nav>
+            <nav class="tree-pane"><FileTree :entries="entries" :selected="selectedPath" @open="openFile" @delete="openDeleteEntryDialog" /><p v-if="!entries.length" class="muted">Workspace 为空</p></nav>
             <div class="splitter horizontal inner workspace-splitter" title="拖动调整 File Tree 高度" @pointerdown="startResize('workspaceTree', $event)" />
             <article class="preview"><div class="preview-title"><span>{{ selectedPath || "选择一个文本文件" }}</span><a v-if="selectedPath" :href="`${API_BASE}${scoped('/files/download')}?path=${encodeURIComponent(selectedPath)}`">Download</a></div><pre>{{ fileContent }}</pre></article>
           </div>
@@ -828,4 +923,20 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
       <TerminalPanel v-if="!layout.terminalCollapsed && currentSession" :session-id="currentSession.id" :collapsed="layout.terminalCollapsed" />
     </section>
   </main>
+  <AppDialog
+    :open="dialogOpen"
+    :mode="dialogMode"
+    :title="dialog.title"
+    :message="dialog.message"
+    :detail="dialog.detail"
+    :input-label="dialog.inputLabel"
+    :input-value="dialog.inputValue"
+    :confirm-text="dialog.confirmText"
+    :danger="dialog.danger"
+    :busy="dialog.busy"
+    :confirm-disabled="dialogConfirmDisabled"
+    @update:input-value="dialog.inputValue = $event"
+    @cancel="closeDialog"
+    @confirm="submitDialog"
+  />
 </template>

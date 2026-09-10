@@ -18,6 +18,7 @@ from app.services.runtime import (
     RuntimeUnavailableError,
     _validate_message_content,
 )
+from app.services.terminal import TerminalManager
 from app.services.workspace import WorkspaceService
 
 
@@ -597,13 +598,13 @@ def test_activate_does_not_evict_idle_victim_with_terminal_lease(
         await manager.send_message("a2", "two")
         await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a1", "idle")
-        await manager.acquire_terminal_lease("a1")
+        await manager.acquire_terminal_lease("a1", "client-a1")
 
         assert await manager.activate("a3") == "stopped"
         assert manager.status("a1") == "idle"
         assert manager.status("a3") == "stopped"
         assert manager.queued_count == 0
-        await manager.release_terminal_lease("a1")
+        await manager.release_terminal_lease("a1", "client-a1")
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -620,7 +621,7 @@ def test_wait_until_ready_survives_capacity_queue_until_handoff(
         )
 
         await manager.send_message("blocker", "first")
-        await manager.acquire_terminal_lease("waiting")
+        await manager.acquire_terminal_lease("waiting", "client-waiting")
         waiter = asyncio.create_task(
             manager.wait_until_ready("waiting", timeout=30)
         )
@@ -636,7 +637,7 @@ def test_wait_until_ready_survives_capacity_queue_until_handoff(
         await launcher.by_session["blocker"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "waiting", "running")
         assert await asyncio.wait_for(waiter, timeout=1) == "running"
-        await manager.release_terminal_lease("waiting")
+        await manager.release_terminal_lease("waiting", "client-waiting")
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -1258,8 +1259,8 @@ def test_repeated_activate_and_terminal_leases_count_one_sandbox(
         assert await manager.activate("session") == "starting"
         assert await manager.activate("session") == "starting"
         await wait_for_status(manager, "session", "idle")
-        await manager.acquire_terminal_lease("session")
-        await manager.acquire_terminal_lease("session")
+        await manager.acquire_terminal_lease("session", "client-session")
+        await manager.acquire_terminal_lease("session", "client-session")
         assert await manager.activate("session") == "idle"
         assert await manager.send_message("session", "task") == "running"
         assert manager.active_count == 1
@@ -1491,13 +1492,13 @@ def test_connected_terminal_lease_protects_idle_runtime_from_ttl(
         await launcher.process.stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "session", "idle")
 
-        await manager.acquire_terminal_lease("session")
+        await manager.acquire_terminal_lease("session", "client-session")
         clock.advance(10)
         assert await manager.sweep_expired() == ()
         assert manager.status("session") == "idle"
         assert manager.terminal_clients("session") == 1
 
-        await manager.release_terminal_lease("session")
+        await manager.release_terminal_lease("session", "client-session")
         clock.advance(10)
         assert await manager.sweep_expired() == ("session",)
         await manager.shutdown()
@@ -1523,7 +1524,7 @@ def test_connected_terminal_runtime_is_not_an_idle_eviction_victim(
         await launcher.by_session["other"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "protected", "idle")
         await wait_for_status(manager, "other", "idle")
-        await manager.acquire_terminal_lease("protected")
+        await manager.acquire_terminal_lease("protected", "client-protected")
 
         assert await manager.send_message("new", "three") == "running"
         assert manager.status("protected") == "idle"
@@ -1588,7 +1589,7 @@ def test_terminal_lease_blocks_queue_handoff_until_disconnect(
         await manager.send_message("a", "first")
         await launcher.by_session["a"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a", "idle")
-        await manager.acquire_terminal_lease("a")
+        await manager.acquire_terminal_lease("a", "client-a")
 
         assert await manager.send_message("b", "second") == "queued"
         await asyncio.sleep(0)
@@ -1596,7 +1597,7 @@ def test_terminal_lease_blocks_queue_handoff_until_disconnect(
         assert manager.status("b") == "queued"
         assert manager.queued_count == 1
 
-        await manager.release_terminal_lease("a")
+        await manager.release_terminal_lease("a", "client-a")
         await wait_for_status(manager, "b", "running")
         assert manager.status("a") == "stopped"
         assert manager.queued_count == 0
@@ -1617,21 +1618,40 @@ def test_last_terminal_disconnect_releases_multi_client_protection(
         await manager.send_message("a", "first")
         await launcher.by_session["a"][0].stdout.feed(FINISH_WIRE)
         await wait_for_status(manager, "a", "idle")
-        await manager.acquire_terminal_lease("a")
-        await manager.acquire_terminal_lease("a")
+        await manager.acquire_terminal_lease("a", "client-a1")
+        await manager.acquire_terminal_lease("a", "client-a2")
         assert manager.terminal_clients("a") == 2
 
         assert await manager.send_message("b", "second") == "queued"
-        await manager.release_terminal_lease("a")
+        await manager.release_terminal_lease("a", "client-a1")
         await asyncio.sleep(0)
         assert manager.terminal_clients("a") == 1
         assert manager.status("a") == "idle"
         assert manager.status("b") == "queued"
 
-        await manager.release_terminal_lease("a")
+        await manager.release_terminal_lease("a", "client-a2")
         await wait_for_status(manager, "b", "running")
         assert manager.terminal_clients("a") == 0
         assert manager.status("a") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_old_terminal_client_release_cannot_remove_new_client_lease(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        manager = RuntimeManager(
+            settings(tmp_path), WorkspaceService(settings(tmp_path)), EventHub(), launcher=FakeLauncher()
+        )
+        await manager.acquire_terminal_lease("session", "client-old")
+        await manager.release_terminal_lease("session", "client-old")
+        await manager.acquire_terminal_lease("session", "client-new")
+        await manager.release_terminal_lease("session", "client-old")
+        assert manager.terminal_clients("session") == 1
+        await manager.release_terminal_lease("session", "client-new")
+        assert manager.terminal_clients("session") == 0
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -1677,7 +1697,7 @@ def test_terminal_reservation_protects_starting_runtime_before_ready(
             config, WorkspaceService(config), EventHub(), launcher=launcher
         )
 
-        await manager.acquire_terminal_lease("a")
+        await manager.acquire_terminal_lease("a", "client-a")
         assert manager.terminal_clients("a") == 1
         assert await manager.activate("a") == "starting"
         assert await manager.send_message("b", "second") == "queued"
@@ -1687,7 +1707,7 @@ def test_terminal_reservation_protects_starting_runtime_before_ready(
         assert manager.status("b") == "queued"
         assert manager.queued_count == 1
 
-        await manager.release_terminal_lease("a")
+        await manager.release_terminal_lease("a", "client-a")
         await wait_for_status(manager, "b", "running")
         assert manager.status("a") == "stopped"
         await manager.shutdown()
@@ -1782,7 +1802,7 @@ def test_runtime_start_failure_clears_turn_and_allows_retry(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
-def test_startup_failure_cleanup_cannot_stop_new_runtime_generation(
+def test_startup_failure_cleanup_serializes_next_runtime_generation(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1799,8 +1819,6 @@ def test_startup_failure_cleanup_cannot_stop_new_runtime_generation(
             if generation == 1:
                 cleanup_started.set()
                 await release_cleanup.wait()
-            if manager.runtime_generation(session_id) == generation:
-                raise AssertionError("stale cleanup still owns the new generation")
 
         manager = RuntimeManager(
             config,
@@ -1814,24 +1832,328 @@ def test_startup_failure_cleanup_cannot_stop_new_runtime_generation(
             manager.send_message("session", "first", turn_id="turn-1")
         )
         await asyncio.wait_for(cleanup_started.wait(), timeout=1)
-        assert manager.status("session") == "error"
-        assert manager.active_turn_id("session") is None
+        assert manager.status("session") == "stopping"
+        assert manager.runtime_generation("session") == 1
+        assert manager.active_turn_id("session") == "turn-1"
+        assert await manager.activate("session") == "stopped"
+        assert launcher.calls == 0
 
         token_generation = manager.runtime_generation("session")
+        release_cleanup.set()
+        with pytest.raises(RuntimeUnavailableError):
+            await first
+        await wait_for_status(manager, "session", "error")
+        assert manager.active_turn_id("session") is None
+        assert manager.runtime_token("session") is None
         assert await manager.send_message(
             "session", "retry", turn_id="turn-2"
         ) == "running"
         assert manager.runtime_generation("session") == token_generation + 1
         assert manager.active_turn_id("session") == "turn-2"
-        assert launcher.by_session["session"][0].returncode is None
-
-        release_cleanup.set()
-        with pytest.raises(RuntimeUnavailableError):
-            await first
-        assert manager.status("session") == "running"
-        assert manager.active_turn_id("session") == "turn-2"
         assert manager.runtime_token("session") is not None
         assert cleanup_calls == [("session", 1)]
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_process_exit_cleanup_serializes_next_runtime_generation(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleanup_calls: list[tuple[str, int]] = []
+
+        async def runtime_stop_hook(session_id: str, generation: int) -> None:
+            cleanup_calls.append((session_id, generation))
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        runtime = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=runtime_stop_hook,
+        )
+        await runtime.send_message("session", "first")
+        await launcher.process.stdout.feed(FINISH_WIRE)
+        await wait_for_status(runtime, "session", "idle")
+        await asyncio.sleep(0.05)
+        process = launcher.process
+        process.returncode = 7
+        process.done.set()
+        await process.stdout.feed(b"")
+        await process.stderr.feed(b"")
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        assert runtime.status("session") == "stopping"
+        assert await runtime.activate("session") == "stopped"
+        assert runtime.runtime_generation("session") == 1
+        assert launcher.calls == 1
+
+        release_cleanup.set()
+        await wait_for_status(runtime, "session", "error")
+        assert cleanup_calls == [("session", 1)]
+        assert await runtime.activate("session") == "starting"
+        await wait_for_status(runtime, "session", "idle")
+        assert runtime.runtime_generation("session") == 2
+        assert launcher.calls == 2
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_process_eof_atomically_claims_generation_before_finalizer_cleanup(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        claim_observed = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def stop_hook(_session_id: str, _generation: int) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+        original_begin = manager._begin_finalization_locked
+
+        def observe_claim(
+            session_id: str,
+            state,
+            generation: int,
+            **kwargs,
+        ):
+            task = original_begin(session_id, state, generation, **kwargs)
+            if (
+                session_id == "session"
+                and generation == 1
+                and state.finalizing_generation == generation
+            ):
+                claim_observed.set()
+            return task
+
+        manager._begin_finalization_locked = observe_claim  # type: ignore[method-assign]
+
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+        process = launcher.process
+        process.returncode = 17
+        process.done.set()
+        await process.stdout.feed(b"")
+        await process.stderr.feed(b"")
+
+        await asyncio.wait_for(claim_observed.wait(), timeout=1)
+        assert manager.status("session") == "stopping"
+        assert manager._sessions["session"].finalizing_generation == 1
+        assert manager.runtime_generation("session") == 1
+        with pytest.raises(RuntimeConflictError):
+            await manager.send_message("session", "must-wait")
+        assert await manager.activate("session") == "stopped"
+        assert launcher.calls == 1
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        release_cleanup.set()
+        await wait_for_status(manager, "session", "error")
+        assert manager._sessions["session"].finalizing_generation is None
+        assert await manager.send_message("session", "retry") == "running"
+        assert launcher.calls == 2
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_late_turn_finished_cannot_reopen_finalizing_runtime(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        events = EventHub()
+        launcher = FakeLauncher()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def stop_hook(_session_id: str, _generation: int) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            events,
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+        await manager.send_message("session", "task", turn_id="turn-1")
+        stop_task = asyncio.create_task(manager.stop_session("session"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        state = manager._sessions["session"]
+        await manager._handle_message(
+            "session", state, {"type": "runtime_ready"}
+        )
+        await manager._handle_message(
+            "session",
+            state,
+            {"type": "permission_request", "request_id": "late-permission"},
+        )
+        await manager._handle_message(
+            "session",
+            state,
+            {"type": "mcp_trust_request", "request_id": "late-trust", "servers": []},
+        )
+        await manager._handle_message(
+            "session",
+            state,
+            {"type": "turn_finished", "turn_id": "turn-1", "status": "completed"},
+        )
+
+        assert manager.status("session") == "stopping"
+        assert state.active_turn_id == "turn-1"
+        assert state.pending_permission is None
+        assert state.pending_mcp_trust is None
+        assert not state.ready.is_set()
+        assert not any(
+            event.type == "runtime_status" and event.data.get("status") == "idle"
+            for event in events.history("session")
+        )
+
+        release_cleanup.set()
+        await stop_task
+        assert manager.status("session") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_permission_resolve_is_rejected_after_finalization_claim(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def stop_hook(_session_id: str, _generation: int) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+        await manager.send_message("session", "task")
+        await launcher.process.stdout.feed(permission_wire())
+        await wait_for_status(manager, "session", "waiting_permission")
+        stop_task = asyncio.create_task(manager.stop_session("session"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        writes_before = list(launcher.process.stdin.raw_writes)
+        with pytest.raises(RuntimeConflictError, match="finalizing"):
+            await manager.resolve_permission("session", "once", "permission-1")
+        assert launcher.process.stdin.raw_writes == writes_before
+        assert manager.status("session") == "stopping"
+
+        release_cleanup.set()
+        await stop_task
+        assert manager.status("session") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_trust_resolve_is_rejected_after_finalization_claim(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def stop_hook(_session_id: str, _generation: int) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+            runtime_stop_hook=stop_hook,
+        )
+        await manager.send_message("session", "task")
+        await launcher.process.stdout.feed(trust_wire())
+        await wait_for_status(manager, "session", "waiting_mcp_trust")
+        stop_task = asyncio.create_task(manager.stop_session("session"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        writes_before = list(launcher.process.stdin.raw_writes)
+        with pytest.raises(RuntimeConflictError, match="finalizing"):
+            await manager.resolve_mcp_trust("session", True, "trust-1")
+        assert launcher.process.stdin.raw_writes == writes_before
+        assert manager.status("session") == "stopping"
+
+        release_cleanup.set()
+        await stop_task
+        assert manager.status("session") == "stopped"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_finalizer_converges_when_process_cleanup_raises(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = settings(tmp_path)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config,
+            WorkspaceService(config),
+            EventHub(),
+            launcher=launcher,
+        )
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+        process = launcher.process
+
+        async def failing_wait() -> int:
+            raise RuntimeError("wait failed")
+
+        def failing_terminate() -> None:
+            raise RuntimeError("terminate failed")
+
+        def failing_kill() -> None:
+            raise RuntimeError("kill failed")
+
+        process.wait = failing_wait  # type: ignore[method-assign]
+        process.terminate = failing_terminate  # type: ignore[method-assign]
+        process.kill = failing_kill  # type: ignore[method-assign]
+
+        await manager.stop_session("session")
+
+        state = manager._sessions["session"]
+        assert manager.status("session") == "error"
+        assert state.finalizing_generation is None
+        assert state.finalizer_task is None
+        assert state.process is None
+        assert state.active_turn_id is None
+        assert manager.runtime_token("session") is None
+        assert manager.relay_tokens.active_count == 0
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -2006,6 +2328,34 @@ def test_mcp_trust_reject_response_is_structured_and_does_not_deadlock(
     asyncio.run(scenario())
 
 
+def test_mcp_trust_wait_does_not_consume_readiness_budget(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        launcher = ManualPromptLauncher()
+        manager = RuntimeManager(
+            settings(tmp_path),
+            WorkspaceService(settings(tmp_path)),
+            EventHub(),
+            launcher=launcher,
+            clock=clock,
+        )
+        sending = asyncio.create_task(manager.send_message("session", "task"))
+        await asyncio.sleep(0)
+        await launcher.process.stdout.feed(trust_wire())
+        await wait_for_status(manager, "session", "waiting_mcp_trust")
+
+        clock.advance(60)
+        await manager.resolve_mcp_trust("session", True, request_id="trust-1")
+        clock.advance(15)
+        await launcher.process.stdout.feed(READY_WIRE)
+
+        assert await asyncio.wait_for(sending, timeout=1) == "running"
+        assert manager.status("session") == "running"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_waiting_mcp_trust_is_not_an_eviction_victim(tmp_path: Path) -> None:
     async def scenario() -> None:
         config = replace(settings(tmp_path), sandbox_max_active=1)
@@ -2044,7 +2394,7 @@ def test_waiting_mcp_trust_ttl_ignores_terminal_lease_and_starts_queue(
         manager = RuntimeManager(
             config, WorkspaceService(config), events, launcher=launcher, clock=clock
         )
-        await manager.acquire_terminal_lease("trusted")
+        await manager.acquire_terminal_lease("trusted", "client-trusted")
         starting = asyncio.create_task(manager.send_message("trusted", "task"))
         await asyncio.sleep(0)
         await launcher.process.stdout.feed(trust_wire())

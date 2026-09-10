@@ -200,3 +200,27 @@ def test_frontend_clears_pending_interactions_on_terminal_runtime_events() -> No
     )[1].split("\n  })", 1)[0]
     assert "showError" in runtime_error_handler
     assert "clearPendingInteractions()" not in runtime_error_handler
+
+
+def test_frontend_uses_dom_dialogs_for_session_and_workspace_mutations() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "frontend/src/SessionApp.vue").read_text(encoding="utf-8")
+    dialog = (root / "frontend/src/AppDialog.vue").read_text(encoding="utf-8")
+
+    assert 'import AppDialog from "./AppDialog.vue"' in source
+    assert "window.confirm" not in source
+    assert "window.prompt" not in source
+    assert "window.alert" not in source
+    assert 'type: "delete-session"' in source
+    assert 'type: "delete-entry"' in source
+    assert "target.path" in source
+    assert "target.sessionId" in source
+    assert "dialog.busy = true" in source
+    assert "detail: isDirectory ? \"该目录及其中的全部内容将被递归删除。\" : \"\"" in source
+    assert "项目 Workspace 文件不会受到影响。" in source
+    assert "dialog.inputValue.trim()" in source
+    assert "role=\"dialog\"" in dialog
+    assert "aria-modal=\"true\"" in dialog
+    assert "@keydown.esc.stop.prevent" in dialog
+    assert "@keydown.tab=\"handleTab\"" in dialog
+    assert "cancelButton.value?.focus()" in dialog

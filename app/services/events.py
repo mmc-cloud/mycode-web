@@ -16,12 +16,17 @@ class WebEvent:
     created_at: str
 
 
+@dataclass(eq=False)
+class _Subscriber:
+    queue: asyncio.Queue[WebEvent | None]
+
+
 class _SessionEvents:
     def __init__(self, history_limit: int) -> None:
         self.condition = asyncio.Condition()
         self.history: deque[WebEvent] = deque(maxlen=history_limit)
         self.next_id = 1
-        self.subscribers: set[asyncio.Queue[WebEvent]] = set()
+        self.subscribers: set[_Subscriber] = set()
 
 
 class EventHub:
@@ -30,9 +35,13 @@ class EventHub:
         history_limit: int = 1000,
         *,
         console: ConsoleRecorder | None = None,
+        subscriber_queue_limit: int = 256,
     ) -> None:
+        if subscriber_queue_limit < 1:
+            raise ValueError("subscriber_queue_limit must be positive")
         self.history_limit = history_limit
         self.console = console
+        self.subscriber_queue_limit = subscriber_queue_limit
         self._sessions: dict[str, _SessionEvents] = {}
 
     def _state(self, session_id: str) -> _SessionEvents:
@@ -90,8 +99,23 @@ class EventHub:
             state.next_id += 1
             if replayable:
                 state.history.append(event)
-            for subscriber in state.subscribers:
-                subscriber.put_nowait(event)
+            for subscriber in tuple(state.subscribers):
+                try:
+                    subscriber.queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    if not replayable:
+                        # Live-only deltas are intentionally lossy. A reconnect
+                        # obtains the stable history from the replay buffer.
+                        continue
+                    # Stable events are already in history. Close this slow
+                    # stream so EventSource reconnects with Last-Event-ID.
+                    state.subscribers.discard(subscriber)
+                    while True:
+                        try:
+                            subscriber.queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    subscriber.queue.put_nowait(None)
             state.condition.notify_all()
             return event
 
@@ -111,17 +135,19 @@ class EventHub:
     ) -> AsyncIterator[WebEvent]:
         state = self._state(session_id)
         cursor = max(after_id, 0)
-        queue: asyncio.Queue[WebEvent] = asyncio.Queue()
+        subscriber = _Subscriber(
+            asyncio.Queue(maxsize=self.subscriber_queue_limit)
+        )
         async with state.condition:
             available = [event for event in state.history if event.id > cursor]
-            state.subscribers.add(queue)
+            state.subscribers.add(subscriber)
         try:
             for event in available:
                 cursor = event.id
                 yield event
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                    event = await asyncio.wait_for(subscriber.queue.get(), timeout=15)
                 except TimeoutError:
                     yield WebEvent(
                         id=cursor,
@@ -130,11 +156,13 @@ class EventHub:
                         created_at=datetime.now(timezone.utc).isoformat(),
                     )
                     continue
+                if event is None:
+                    return
                 if event.id > cursor:
                     cursor = event.id
                     yield event
         finally:
-            state.subscribers.discard(queue)
+            state.subscribers.discard(subscriber)
 
 
 def encode_sse(event: WebEvent) -> str:

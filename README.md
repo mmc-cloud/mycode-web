@@ -54,6 +54,8 @@ Runtime Pool、FIFO Queue 和调度锁都位于单个 FastAPI 进程内。最大
 
 `starting`、`running`、`waiting_permission` 和 `waiting_mcp_trust` 都可能占用 active capacity。`idle`、等待 Permission 和等待 MCP Trust 都受 inactivity TTL 约束；等待交互超时会清除 pending request、停止 Runtime 并释放 slot。Runtime 也可因 capacity eviction、explicit stop、process exit 或 lifecycle cleanup 停止，但这些操作不会删除 Workspace、`mycode_state` 或 SQLite Session metadata。再次 activate 时会启动新 Sandbox，并通过 `mycode runtime --jsonl --continue` 恢复 Session。
 
+Runtime resource ownership contract：Web Session 持有 Session metadata、Workspace、Console/EventHub、turn reservation，以及 Browser Terminal connection/terminal demand；这些不属于某个 Runtime generation。每个 generation 独占 Sandbox process/container、JSONL reader、relay token、watcher ownership 和 Terminal PTY shell，并且 generation teardown 完成前同一 Session 禁止启动下一 generation。Agent turn 的 `active_turn_id`、busy 和 pending Permission 属于 turn；MCP Trust 是可发生在 `runtime_ready` 之前的 startup interaction。Generation final status 只在 process/reader/token/watcher/terminal cleanup 完成后发布。
+
 Workspace watcher 跟随 active Runtime 生命周期，而不是永久附着在保留的 Session 上。Runtime starting/active 时 watcher 启动；Runtime 被回收或停止时 watcher 停止；Session 再次 activate 时 watcher 重启；Session delete 和 application shutdown 会清理 watcher。
 
 ## 页面初始化
