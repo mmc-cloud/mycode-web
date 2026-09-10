@@ -125,6 +125,30 @@ def test_frontend_uses_session_bootstrap_cursor_for_sse() -> None:
     assert "currentSession.value?.id !== sessionId" in source
 
 
+def test_frontend_distinguishes_session_history_hydration_from_empty_history() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    open_session = source.split("async function openSession", 1)[1].split(
+        "async function loadMetadata", 1
+    )[0]
+    clear_session = source.split("function clearCurrentSession", 1)[1].split(
+        "async function openSession", 1
+    )[0]
+
+    assert "const sessionHydrating = ref(false)" in source
+    assert "sessionHydrating.value = true" in open_session
+    assert "try {" in open_session
+    assert "finally {" in open_session
+    assert "generation === token && currentSession.value?.id === sessionId" in open_session
+    assert "sessionHydrating.value = false" in open_session
+    assert "sessionHydrating.value = false" in clear_session
+    assert '正在加载会话历史…' in source
+    assert '<p v-if="sessionHydrating"' in source
+    assert '<p v-else-if="!executionGroups.length"' in source
+
+
 def test_terminal_clipboard_ux_uses_xterm_paste_and_cleans_listeners() -> None:
     terminal = (
         Path(__file__).resolve().parents[1] / "frontend/src/TerminalPanel.vue"

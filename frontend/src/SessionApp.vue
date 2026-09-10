@@ -71,6 +71,7 @@ const permission = ref(null)
 const pendingMcpTrust = ref(null)
 const turnStates = ref({})
 const expandedGroups = ref({})
+const sessionHydrating = ref(false)
 const message = ref("")
 const sendingSessionIds = reactive(new Set())
 const error = ref("")
@@ -152,6 +153,7 @@ async function initialize() {
 
 function clearCurrentSession(replace = true) {
   generation += 1
+  sessionHydrating.value = false
   closeDialog()
   eventSource?.close()
   eventSource = null
@@ -175,6 +177,7 @@ function clearCurrentSession(replace = true) {
 
 async function openSession(sessionId, replace = false) {
   const token = ++generation
+  sessionHydrating.value = true
   closeDialog()
   eventSource?.close()
   eventSource = null
@@ -206,7 +209,17 @@ async function openSession(sessionId, replace = false) {
       }
     })
     .catch(showError)
-  await Promise.all([metadata, tree, history])
+  try {
+    await Promise.all([metadata, tree, history])
+  } catch (reason) {
+    if (generation === token && currentSession.value?.id === sessionId) {
+      showError(reason)
+    }
+  } finally {
+    if (generation === token && currentSession.value?.id === sessionId) {
+      sessionHydrating.value = false
+    }
+  }
 }
 
 async function loadMetadata(sessionId, token) {
@@ -905,7 +918,8 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
             <article v-for="event in group.assistants" :key="`assistant-${event.id}`" class="console-card assistant-card"><strong>Assistant</strong><pre>{{ event.content }}</pre></article>
             <article v-if="group.live && group.live.kind === 'assistant'" class="console-card assistant-card live-card"><strong>Assistant</strong><pre>{{ group.live.content }}</pre></article>
           </section>
-          <p v-if="!executionGroups.length" class="muted">等待 Agent 输出…</p>
+          <p v-if="sessionHydrating" class="muted">正在加载会话历史…</p>
+          <p v-else-if="!executionGroups.length" class="muted">等待 Agent 输出…</p>
         </div>
         <div v-else class="session-empty-state">
           <strong>No session selected</strong>
