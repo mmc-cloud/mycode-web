@@ -5,6 +5,8 @@ MYCODE_DIR="/opt/mycode"
 WEB_DIR="/opt/mycode-web"
 SERVICE="mycode-web"
 HEALTH_URL="http://127.0.0.1:8000/web/api/health"
+NGINX_CONFIG_SOURCE="$WEB_DIR/deploy/nginx/mycode.conf"
+NGINX_CONFIG_TARGET="/etc/nginx/conf.d/mycode.conf"
 
 # CentOS 7 ships an old Git that does not support `git -C`.
 git_in() {
@@ -44,6 +46,7 @@ MYCODE_CHANGED=0
 WEB_CHANGED=0
 WEB_RUNTIME_CHANGED=0
 SANDBOX_DEF_CHANGED=0
+NGINX_CONFIG_CHANGED=0
 WEB_CHANGED_FILES=""
 
 if [ "$MYCODE_OLD" != "$MYCODE_NEW" ]; then
@@ -54,9 +57,11 @@ if [ "$WEB_OLD" != "$WEB_NEW" ]; then
     WEB_CHANGED=1
     WEB_CHANGED_FILES="$(git_in "$WEB_DIR" diff --name-only "$WEB_OLD" "$WEB_NEW")"
 
-    # README/docs-only changes do not require dependency sync, frontend build,
-    # service restart, or Sandbox rebuild.
-    if printf '%s\n' "$WEB_CHANGED_FILES" | grep -Ev '^(README\.md|docs/)' | grep -q .; then
+    # README/docs/site changes are static-only. nginx configuration is handled
+    # separately below. None of them require Python dependency sync, Vue build,
+    # FastAPI restart, or Sandbox rebuild by themselves.
+    if printf '%s\n' "$WEB_CHANGED_FILES" | \
+        grep -Ev '^(README\.md|docs/|site/|deploy/nginx/)' | grep -q .; then
         WEB_RUNTIME_CHANGED=1
     fi
 
@@ -64,6 +69,10 @@ if [ "$WEB_OLD" != "$WEB_NEW" ]; then
     if printf '%s\n' "$WEB_CHANGED_FILES" | \
         grep -Eq '^(docker/|scripts/build-sandbox\.sh$|scripts/build-sandbox\.ps1$|\.dockerignore$)'; then
         SANDBOX_DEF_CHANGED=1
+    fi
+
+    if printf '%s\n' "$WEB_CHANGED_FILES" | grep -Eq '^deploy/nginx/mycode\.conf$'; then
+        NGINX_CONFIG_CHANGED=1
     fi
 fi
 
@@ -84,8 +93,15 @@ if [ "$MYCODE_CHANGED" -eq 0 ] && [ "$WEB_CHANGED" -eq 0 ]; then
     exit 0
 fi
 
+if [ "$NGINX_CONFIG_CHANGED" -eq 1 ]; then
+    echo "==> Updating nginx configuration"
+    install -m 0644 "$NGINX_CONFIG_SOURCE" "$NGINX_CONFIG_TARGET"
+    nginx -t
+    systemctl reload nginx
+fi
+
 if [ "$MYCODE_CHANGED" -eq 0 ] && [ "$WEB_RUNTIME_CHANGED" -eq 0 ]; then
-    echo "==> Web changes are documentation-only. No runtime deployment needed."
+    echo "==> Web changes are static/documentation-only. No runtime deployment needed."
     exit 0
 fi
 
