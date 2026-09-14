@@ -5,225 +5,187 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="MyCode 是一个从零实现的轻量级 Coding Agent，支持代码检索、文件修改、命令执行、上下文管理、MCP 与受控 SubAgent 协作。"
+      content="MyCode 是一个从零实现的轻量级 Coding Agent，围绕 Agent Runtime、工具系统、上下文与记忆、SubAgent、Skills、MCP 和 Harbor 评测持续迭代。"
     />
-    <meta name="theme-color" content="#eef0e8" />
-    <title>MyCode · Lightweight Coding Agent</title>
+    <meta name="theme-color" content="#050607" />
+    <title>MyCode · 轻量级 Coding Agent</title>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <header class="site-header">
-      <a class="brand" href="/" aria-label="MyCode home">
-        <span class="brand-mark" aria-hidden="true">M</span>
-        <span>MyCode</span>
+    <header class="site-header shell">
+      <a class="brand" href="/" aria-label="MyCode 主页">
+        <span class="prompt">$</span>
+        <span>mycode</span>
       </a>
-      <nav class="top-nav" aria-label="Primary navigation">
-        <a href="#capabilities">Capabilities</a>
-        <a href="#architecture">Architecture</a>
-        <a href="#evaluation">Evaluation</a>
+      <nav class="top-nav" aria-label="主导航">
+        <a href="#core">核心能力</a>
+        <a href="#extensibility">Skills / MCP</a>
+        <a href="#web">Web</a>
+        <a href="#evaluation">评测</a>
         <a href="https://github.com/mmc-cloud/mycode" target="_blank" rel="noreferrer">GitHub</a>
-        <a class="nav-cta" href="/web/">Open Web Demo</a>
       </nav>
     </header>
 
     <main>
-      <section class="hero section-shell">
-        <div class="hero-copy">
-          <p class="eyebrow">LIGHTWEIGHT CODING AGENT</p>
-          <h1>让模型真正进入<br />代码执行闭环。</h1>
-          <p class="hero-lead">
-            MyCode 是一个从零实现的轻量级 Coding Agent。它围绕 Agent Loop、Tool Calling、权限控制、上下文管理、MCP 与受控 SubAgent 协作，让模型能够检索代码、修改文件、执行命令并持续验证结果。
-          </p>
-          <div class="hero-actions">
-            <a class="button primary" href="/web/">在线体验 <span aria-hidden="true">→</span></a>
-            <a class="button secondary" href="https://github.com/mmc-cloud/mycode" target="_blank" rel="noreferrer">查看源码 ↗</a>
-          </div>
-          <div class="hero-meta" aria-label="Project highlights">
-            <span>Python</span>
-            <span>OpenAI-compatible</span>
-            <span>MCP</span>
-            <span>Docker Sandbox</span>
-          </div>
+      <section class="hero shell">
+        <p class="eyebrow">LIGHTWEIGHT CODING AGENT</p>
+        <h1>MyCode<span class="cursor">_</span></h1>
+        <p class="hero-lead">
+          一个从零实现的轻量级 Coding Agent。通过模型决策、工具执行、结果反馈和验证循环，
+          自主完成代码理解、文件修改、命令执行与调试验证。
+        </p>
+        <p class="hero-note">Core 独立运行 · Web 可交互展示 · Skills / MCP 可扩展</p>
+        <div class="hero-actions">
+          <a class="text-link" href="/web/">[ 在线体验 Web Demo ]</a>
+          <a class="text-link" href="https://github.com/mmc-cloud/mycode" target="_blank" rel="noreferrer">[ GitHub ]</a>
+          <a class="text-link" href="#core">[ 查看实现 ]</a>
         </div>
 
-        <div class="terminal-card" aria-label="MyCode agent terminal example">
+        <div class="terminal-card" aria-label="MyCode Agent 执行示例">
           <div class="terminal-bar">
-            <div class="terminal-dots" aria-hidden="true"><span></span><span></span><span></span></div>
-            <span>mycode agent</span>
-            <span class="terminal-status">ready</span>
+            <span>mycode agent — demo-project</span>
+            <span>runtime: running</span>
           </div>
           <div class="terminal-body">
-            <p><span class="prompt">$</span> mycode agent</p>
-            <p class="terminal-user"><span class="chevron">›</span> Fix the failing tests in this repository.</p>
-            <div class="terminal-step"><span class="step-dot"></span><span>Exploring workspace</span><small>read · grep</small></div>
-            <div class="terminal-step"><span class="step-dot"></span><span>Inspecting runtime state</span><small>read_file</small></div>
-            <div class="terminal-step active"><span class="step-dot"></span><span>Editing implementation</span><small>edit</small></div>
-            <div class="terminal-step success"><span class="step-dot"></span><span>Running pytest</span><small>32 passed</small></div>
-            <p class="terminal-result"><span>✓</span> Changes verified. Task complete.</p>
+            <p><span class="prompt">❯</span> 修复这个失败的测试，并验证修改结果。</p>
+            <p><span class="tool">read_file</span> tests/test_parser.py</p>
+            <p><span class="tool">read_file</span> src/parser.py</p>
+            <p><span class="reason">reason</span> empty-input 分支返回值不符合测试预期</p>
+            <p><span class="tool">edit_file</span> src/parser.py</p>
+            <p><span class="tool">run_command</span> pytest tests/test_parser.py -q</p>
+            <p class="success">✓ 8 passed</p>
+            <p class="success">✓ task completed</p>
           </div>
         </div>
       </section>
 
-      <section class="statement-section">
-        <div class="section-shell statement-grid">
-          <div>
-            <p class="eyebrow">DESIGN GOAL</p>
-            <h2>不是一个套壳聊天页，<br />而是一套可执行的 Agent Runtime。</h2>
-          </div>
-          <p>
-            模型负责决策，Runtime 负责工具执行、权限边界、状态维护、结果回填与收敛控制。Web 层通过独立 Sandbox 驱动 Core，使在线 Demo 与 Agent 核心保持解耦。
-          </p>
+      <section class="section shell" id="loop">
+        <div class="section-heading">
+          <h2>一个任务是怎样完成的</h2>
+          <p>模型负责决定下一步动作，Runtime 负责工具协议、执行状态、安全边界、上下文资源与完成条件。</p>
+        </div>
+        <div class="loop-flow" aria-label="Agent Loop">
+          <span>用户任务</span><i>→</i><span>模型决策</span><i>→</i><span>工具执行</span><i>→</i><span>结果回填</span><i>→</i><span>验证</span><i>↺</i>
         </div>
       </section>
 
-      <section id="capabilities" class="section-shell content-section">
+      <section class="section shell" id="core">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">CORE CAPABILITIES</p>
-            <h2>围绕 Coding Agent 的关键工程问题展开。</h2>
+            <p class="eyebrow">CORE</p>
+            <h2>核心能力</h2>
           </div>
-          <p>每个模块都服务于同一个目标：让 Agent 在真实工作区里更安全、更稳定地完成多轮任务。</p>
+          <p>围绕真实 Agent Runtime 展开，而不是把普通 UI 功能包装成核心能力。</p>
         </div>
 
-        <div class="feature-grid">
-          <article class="feature-card feature-large">
-            <div class="feature-index">01</div>
+        <div class="capability-grid">
+          <article class="capability">
+            <span class="index">01</span>
             <h3>Agent Runtime</h3>
-            <p>流式 Agent Loop 驱动“模型决策 → 工具执行 → 结果反馈 → 再次决策”，并维护任务阶段、验证状态与终止条件。</p>
-            <div class="mini-loop" aria-hidden="true">
-              <span>Decide</span><i>→</i><span>Act</span><i>→</i><span>Observe</span><i>→</i><span>Verify</span>
-            </div>
+            <p>流式 Agent Loop、任务阶段控制、重复调用检测、停滞识别、验证纠偏与循环终止。</p>
           </article>
-
-          <article class="feature-card">
-            <div class="feature-index">02</div>
-            <h3>Tool System</h3>
-            <p>统一 Registry、JSON Schema、参数校验与调用分发；只读工具可并发，写入与控制流工具保持串行。</p>
+          <article class="capability">
+            <span class="index">02</span>
+            <h3>Tools & Permission</h3>
+            <p>统一 Registry、JSON Schema、参数校验、权限检查和调用调度；高风险操作进入 HITL 人工确认。</p>
           </article>
-
-          <article class="feature-card">
-            <div class="feature-index">03</div>
-            <h3>Permission & Safety</h3>
-            <p>allow / deny / ask 三态决策、HITL 确认、Workspace 边界校验与命令风险分级，把安全约束落在执行层。</p>
-          </article>
-
-          <article class="feature-card">
-            <div class="feature-index">04</div>
+          <article class="capability">
+            <span class="index">03</span>
             <h3>Context & Memory</h3>
-            <p>大型工具结果外部化、历史压缩、摘要与确定性裁剪，并支持用户级 / 项目级长期记忆召回。</p>
+            <p>按 token 预算管理工具结果与历史消息，支持压缩、外部化以及用户级和项目级长期记忆。</p>
           </article>
-
-          <article class="feature-card">
-            <div class="feature-index">05</div>
-            <h3>MCP</h3>
-            <p>支持 stdio 与 Streamable HTTP MCP Server，将外部工具纳入统一 Schema、权限与执行链路。</p>
-          </article>
-
-          <article class="feature-card feature-full">
-            <div class="feature-index">06</div>
+          <article class="capability">
+            <span class="index">04</span>
             <h3>SubAgent</h3>
-            <p>以 Manager / Agent-as-tool 模式委派独立角色，使用独立上下文和受限工具集并行协作；写入与最终决策仍由主 Agent 收口。</p>
-            <div class="role-strip" aria-label="SubAgent roles"><span>Explorer · code exploration</span><span>Tester · validation</span><span>Reviewer · review</span></div>
+            <p>将独立的代码探索、测试与审查任务委派给具有独立上下文和受限工具集的专用 Agent。</p>
           </article>
         </div>
       </section>
 
-      <section id="architecture" class="architecture-wrap">
-        <div class="section-shell content-section">
-          <div class="section-heading architecture-heading">
-            <div>
-              <p class="eyebrow">ARCHITECTURE</p>
-              <h2>Core 与 Web 解耦，运行时进入独立 Sandbox。</h2>
-            </div>
-            <p>浏览器不直接接触 Provider 凭据。FastAPI 管理 Session / Runtime，并通过 JSONL machine protocol 驱动 Sandbox 中的 MyCode Core。</p>
-          </div>
-
-          <div class="architecture-card" role="img" aria-label="Browser to Nginx to Vue and FastAPI to Docker Sandbox to MyCode Core to Provider architecture">
-            <div class="arch-node arch-client">
-              <small>CLIENT</small>
-              <strong>Browser</strong>
-              <span>/web/</span>
-            </div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-node">
-              <small>EDGE</small>
-              <strong>Nginx</strong>
-              <span>HTTPS · static · proxy</span>
-            </div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-stack">
-              <div class="arch-node">
-                <small>UI</small>
-                <strong>Vue 3</strong>
-                <span>Vite static build</span>
-              </div>
-              <div class="arch-node">
-                <small>WEB LAYER</small>
-                <strong>FastAPI</strong>
-                <span>RuntimeManager · SSE</span>
-              </div>
-            </div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-node arch-highlight">
-              <small>ISOLATION</small>
-              <strong>Docker Sandbox</strong>
-              <span>mycode runtime --jsonl</span>
-            </div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-node arch-core">
-              <small>AGENT CORE</small>
-              <strong>MyCode</strong>
-              <span>Tools · Context · MCP</span>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section id="evaluation" class="section-shell content-section evaluation-section">
-        <div class="evaluation-copy">
-          <p class="eyebrow">EVALUATION</p>
-          <h2>用固定回归评测，而不是只看 Demo 感觉。</h2>
-          <p>
-            MyCode 使用 Harbor 建立 Coding Agent 回归评测流程，覆盖代码修改、命令执行、调试验证等任务。评测结果用于定位 Agent Loop、验证与终止策略中的行为瓶颈，并持续迭代 Runtime。
-          </p>
-          <div class="evaluation-tags">
-            <span>Harbor</span>
-            <span>Regression</span>
-            <span>Code Editing</span>
-            <span>Debugging</span>
-            <span>Validation</span>
-          </div>
-        </div>
-        <div class="evaluation-panel">
-          <div class="evaluation-row"><span>01</span><strong>Run</strong><p>固定任务集重复执行，保留 Trial 结果。</p></div>
-          <div class="evaluation-row"><span>02</span><strong>Inspect</strong><p>按失败类型检查工具轨迹、验证与收敛行为。</p></div>
-          <div class="evaluation-row"><span>03</span><strong>Iterate</strong><p>针对 Runtime 策略修改后重新回归，比较行为变化。</p></div>
-        </div>
-      </section>
-
-      <section class="cta-section">
-        <div class="section-shell cta-card">
+      <section class="section shell" id="extensibility">
+        <div class="section-heading">
           <div>
-            <p class="eyebrow">TRY MYCODE</p>
-            <h2>直接在浏览器里体验完整 Agent 工作流。</h2>
-            <p>上传一个工作区，创建 Session，让 MyCode 在隔离 Sandbox 中执行、修改和验证代码。</p>
+            <p class="eyebrow">EXTENSIBILITY</p>
+            <h2>Skills 与 MCP</h2>
           </div>
-          <div class="cta-actions">
-            <a class="button primary" href="/web/">打开 Web Demo →</a>
-            <a class="button secondary" href="https://github.com/mmc-cloud/mycode" target="_blank" rel="noreferrer">GitHub ↗</a>
+          <p>Skills 提供可复用的方法与知识，MCP 用于连接外部工具，两者都围绕现有 Agent Runtime 工作。</p>
+        </div>
+
+        <div class="extension-grid">
+          <article class="extension-card">
+            <h3>Skills · 可复用技能</h3>
+            <p>
+              按需发现和加载任务技能与参考资料，采用 Progressive Disclosure（渐进式披露），
+              启动时只暴露必要信息，需要时再读取正文和资源，避免无关内容持续占用上下文。
+            </p>
+            <div class="tag-row">
+              <span>Skill Registry</span><span>load_skill</span><span>read_skill_resource</span>
+            </div>
+          </article>
+          <article class="extension-card">
+            <h3>MCP · 外部工具扩展</h3>
+            <p>
+              通过 stdio 或 Streamable HTTP 接入外部 MCP Server。MCP Tool 进入 MyCode 后，
+              继续复用现有 Schema、Permission、Trust 与工具执行链路。
+            </p>
+            <div class="tag-row">
+              <span>stdio</span><span>Streamable HTTP</span><span>MCP Trust</span>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section shell" id="web">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">WEB DEMO</p>
+            <h2>同一个 Agent，不同的交互方式</h2>
+          </div>
+          <p>Web 与 Core 独立维护，通过正式 JSONL Machine Runtime 驱动 Core，而不是重新实现一套 Agent。</p>
+        </div>
+
+        <div class="architecture-list" aria-label="MyCode Web 架构">
+          <div><b>Browser</b><span>Vue 3 · Workspace · Agent Console · Permission UI</span></div>
+          <div><b>FastAPI</b><span>Session · SSE · Runtime Pool · JSONL Adapter</span></div>
+          <div><b>Machine Runtime</b><span>mycode runtime --jsonl --continue</span></div>
+          <div><b>MyCode Core</b><span>Runtime · Tools · Context · Memory · Skills · MCP · SubAgent</span></div>
+          <div><b>Sandbox</b><span>Workspace · Commands · Provider Relay</span></div>
+        </div>
+        <div class="section-action">
+          <a class="text-link" href="/web/">[ 打开 Web Demo ]</a>
+        </div>
+      </section>
+
+      <section class="section shell" id="evaluation">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">EVALUATION</p>
+            <h2>评测驱动迭代</h2>
+          </div>
+          <p>不只看 Demo 是否成功，而是通过固定回归任务、重复 attempts 和失败轨迹分析判断 Agent 是否真的变好。</p>
+        </div>
+
+        <div class="evaluation-grid">
+          <div class="harbor-box">
+            <strong>Harbor</strong>
+            <span>Regression Evaluation</span>
+          </div>
+          <div class="evaluation-copy">
+            <p>通过失败 Trial、工具调用轨迹和验证结果定位行为瓶颈，再迭代 Runtime、工具调度和完成策略。</p>
+            <div class="evaluation-flow"><span>实现</span> → <span>评测</span> → <span>分析失败</span> → <span>修改</span> → <span>重新评测</span></div>
           </div>
         </div>
       </section>
     </main>
 
-    <footer class="site-footer section-shell">
-      <div class="footer-brand"><span class="brand-mark" aria-hidden="true">M</span><span>MyCode</span></div>
-      <p>Lightweight Coding Agent · Built with Python</p>
-      <div class="footer-links">
+    <footer class="site-footer shell">
+      <span>MyCode · 轻量级 Coding Agent</span>
+      <span>Python · OpenAI-compatible · Pydantic · FastAPI · SQLite · MCP · Harbor</span>
+      <span class="footer-links">
         <a href="https://github.com/mmc-cloud/mycode" target="_blank" rel="noreferrer">Core</a>
         <a href="https://github.com/mmc-cloud/mycode-web" target="_blank" rel="noreferrer">Web</a>
         <a href="/web/">Demo</a>
-      </div>
+      </span>
     </footer>
   </body>
 </html>
