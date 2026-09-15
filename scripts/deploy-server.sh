@@ -47,6 +47,7 @@ WEB_CHANGED=0
 WEB_RUNTIME_CHANGED=0
 SANDBOX_DEF_CHANGED=0
 NGINX_CONFIG_CHANGED=0
+DOCS_CHANGED=0
 WEB_CHANGED_FILES=""
 
 if [ "$MYCODE_OLD" != "$MYCODE_NEW" ]; then
@@ -76,6 +77,14 @@ if [ "$WEB_OLD" != "$WEB_NEW" ]; then
     if printf '%s\n' "$WEB_CHANGED_FILES" | grep -Eq '^deploy/nginx/mycode\.conf$'; then
         NGINX_CONFIG_CHANGED=1
     fi
+
+    # VitePress documentation source. docs-site/ is already excluded from
+    # WEB_RUNTIME_CHANGED above, so documentation-only changes never trigger
+    # uv sync, the Vue frontend build, a FastAPI restart or a Sandbox rebuild.
+    # This flag only drives the static documentation build below.
+    if printf '%s\n' "$WEB_CHANGED_FILES" | grep -Eq '^docs-site/'; then
+        DOCS_CHANGED=1
+    fi
 fi
 
 echo
@@ -100,6 +109,29 @@ if [ "$NGINX_CONFIG_CHANGED" -eq 1 ]; then
     install -m 0644 "$NGINX_CONFIG_SOURCE" "$NGINX_CONFIG_TARGET"
     nginx -t
     systemctl reload nginx
+fi
+
+# The VitePress site is built from the Web repo but published as a plain
+# static directory. Build it in a throwaway Node container so the server
+# itself needs no Node/pnpm installation.
+if [ "$DOCS_CHANGED" -eq 1 ]; then
+    echo "==> Building VitePress documentation"
+
+    if ! docker run --rm \
+        -v "$WEB_DIR/docs-site:/app" \
+        -w /app \
+        node:22-bookworm-slim \
+        sh -c 'npm install -g pnpm@10.33.0 && pnpm install --frozen-lockfile && pnpm run docs:build'; then
+        echo "ERROR: VitePress documentation build failed"
+        exit 1
+    fi
+
+    echo "==> Publishing documentation to site/docs"
+    rm -rf "$WEB_DIR/site/docs"
+    mkdir -p "$WEB_DIR/site/docs"
+    cp -a "$WEB_DIR/docs-site/.vitepress/dist/." "$WEB_DIR/site/docs/"
+else
+    echo "==> docs-site unchanged; skipping documentation build"
 fi
 
 if [ "$MYCODE_CHANGED" -eq 0 ] && [ "$WEB_RUNTIME_CHANGED" -eq 0 ]; then
