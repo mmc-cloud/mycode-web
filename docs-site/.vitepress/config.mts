@@ -5,6 +5,7 @@ export default defineConfig({
   title: 'MyCode Docs',
   description: 'MyCode Documentation',
   lang: 'zh-CN',
+  base: '/docs/',
 
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
