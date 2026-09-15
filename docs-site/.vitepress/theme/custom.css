@@ -1,0 +1,487 @@
+/**
+ * MyCode Docs — default theme overrides
+ * ---------------------------------------------------------------------------
+ * 只做两件事：
+ *   1. 重新赋值 VitePress 的 CSS variables（颜色、边框、布局尺寸、代码块）；
+ *   2. 对少数无法用变量表达的细节，覆盖默认主题的 class。
+ *
+ * 默认主题的组件样式是 Vue scoped 的，编译后会带上 [data-v-xxx] 属性选择器
+ * （比单个 class 多一个 specificity）。因此凡是覆盖 scoped 规则的写法，都加了
+ * :root 前缀把 specificity 提到同级，并依赖本文件在 theme/index.ts 中晚于
+ * vitepress/theme 引入的顺序取胜。
+ * ---------------------------------------------------------------------------
+ */
+
+/* ===========================================================================
+   1. 设计变量
+   =========================================================================== */
+
+:root {
+  /* MyCode accent — 低饱和的 slate blue，开发者工具风格 */
+  --mc-accent-1: #2f6690;                     /* 正文中的链接 / 强调文字 */
+  --mc-accent-2: #35719e;                     /* hover */
+  --mc-accent-3: #3d7ba8;                     /* 实心背景 */
+  --mc-accent-soft: rgba(61, 123, 168, 0.1);  /* 轻量背景（active 项） */
+  --mc-accent-line: rgba(61, 123, 168, 0.45); /* 细边框 / 下划线 */
+
+  /* 中性分隔线：divider 走内容区，gutter 走顶栏，后者略重 */
+  --mc-divider: #e8e8ee;
+  --mc-gutter: #dcdce3;
+
+  /* 中性 hover 填充 */
+  --mc-hover: rgba(17, 24, 39, 0.045);
+}
+
+.dark {
+  --mc-accent-1: #93bcda;
+  --mc-accent-2: #6f9dc4;
+  --mc-accent-3: #3f6f96;
+  --mc-accent-soft: rgba(147, 188, 218, 0.13);
+  --mc-accent-line: rgba(147, 188, 218, 0.4);
+
+  --mc-divider: #2c2c33;
+  --mc-gutter: #35353d;
+
+  --mc-hover: rgba(255, 255, 255, 0.055);
+}
+
+/* ===========================================================================
+   2. 映射到 VitePress 变量
+   =========================================================================== */
+
+:root {
+  /* 品牌色（链接、active、按钮、搜索高亮） */
+  --vp-c-brand-1: var(--mc-accent-1);
+  --vp-c-brand-2: var(--mc-accent-2);
+  --vp-c-brand-3: var(--mc-accent-3);
+  --vp-c-brand-soft: var(--mc-accent-soft);
+  --vp-c-brand: var(--mc-accent-1);
+
+  /* tip / note 容器跟随品牌色 */
+  --vp-c-tip-1: var(--mc-accent-1);
+  --vp-c-tip-2: var(--mc-accent-2);
+  --vp-c-tip-3: var(--mc-accent-3);
+  --vp-c-tip-soft: var(--mc-accent-soft);
+  --vp-c-note-1: var(--mc-accent-1);
+  --vp-c-note-2: var(--mc-accent-2);
+  --vp-c-note-3: var(--mc-accent-3);
+  --vp-c-note-soft: var(--mc-accent-soft);
+
+  /* 文本：比默认略柔和 */
+  --vp-c-text-1: #2e2e36;
+  --vp-c-text-2: #5f5f69;
+  --vp-c-text-3: #8b8b95;
+
+  /* 背景：侧栏与正文同底，靠 1px 分隔线区分，避免默认的灰底面板感 */
+  --vp-c-bg: #ffffff;
+  --vp-c-bg-alt: #fafafb;
+  --vp-c-bg-soft: #f6f6f8;
+  --vp-c-bg-elv: #ffffff;
+
+  /* 分隔线 */
+  --vp-c-divider: var(--mc-divider);
+  --vp-c-gutter: var(--mc-gutter);
+  --vp-c-border: var(--mc-gutter);
+
+  /* 布局尺寸 */
+  --vp-nav-height: 56px;
+  --vp-sidebar-width: 264px;
+  --vp-sidebar-bg-color: var(--vp-c-bg);
+
+  /* 代码块 */
+  --vp-code-block-bg: #f9f9fb;
+  --vp-code-block-divider-color: var(--mc-divider);
+  --vp-code-copy-code-border-color: var(--mc-divider);
+
+  /* 正文字体：显式给出中文字体回退，不再依赖默认的 Punctuation SC */
+  --vp-font-family-base: 'Inter', ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji',
+    'Segoe UI Symbol', 'Noto Color Emoji';
+}
+
+.dark {
+  --vp-c-text-1: #e3e3e9;
+  --vp-c-text-2: #a1a1ab;
+  --vp-c-text-3: #6f6f79;
+
+  --vp-code-block-bg: #161619;
+}
+
+/* ===========================================================================
+   3. 顶部导航 Header
+   =========================================================================== */
+
+/* 顶栏底边：默认在 has-sidebar 时用 padding-left 让开侧栏宽度，只在正文区画线。
+   这里补满整宽，让 header 形成一条完整的分隔线。 */
+:root .VPNavBar.has-sidebar .divider {
+  padding-left: 0;
+}
+
+@media (min-width: 1440px) {
+  :root .VPNavBar.has-sidebar .divider {
+    padding-left: 0;
+  }
+}
+
+/* 站点标题：紧凑的 wordmark */
+:root .VPNavBarTitle .title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* 导航项：默认态降权，hover / active 再提亮 */
+:root .VPNavBarMenu .VPNavBarMenuLink {
+  padding: 0 10px;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--vp-c-text-2);
+}
+
+:root .VPNavBarMenu .VPNavBarMenuLink:hover {
+  color: var(--vp-c-text-1);
+}
+
+:root .VPNavBarMenu .VPNavBarMenuLink.active {
+  color: var(--vp-c-brand-1);
+}
+
+/* 搜索：默认是一个占满剩余宽度的大按钮（bg-alt 填充、无边框）。
+   改成固定宽度的安静入口：透明底 + 1px 细边框，靠左；导航项留在右侧。 */
+@media (min-width: 768px) {
+  .VPNavBarSearch {
+    flex-grow: 0;
+    flex-shrink: 1;
+    min-width: 0;
+    margin-right: auto;
+    padding-left: 0;
+  }
+
+  .DocSearch-Button {
+    width: 216px;
+    max-width: 100%;
+    height: 34px;
+    border: 1px solid var(--vp-c-divider);
+    border-radius: 8px;
+    padding: 0 8px 0 10px;
+    background-color: transparent;
+    transition: border-color 0.2s, background-color 0.2s;
+  }
+
+  .DocSearch-Button:hover {
+    border-color: var(--vp-c-brand-1);
+    background-color: var(--vp-c-bg-soft);
+  }
+
+  .DocSearch-Button .DocSearch-Button-Placeholder {
+    padding: 0 12px 0 0;
+    font-size: 13px;
+  }
+
+  .DocSearch-Button .DocSearch-Button-Key {
+    height: 20px;
+    line-height: 20px;
+    font-size: 11px;
+  }
+}
+
+/* ≥960px 时导航内容区从侧栏右边界开始，搜索框需要让开这段间距 */
+@media (min-width: 960px) {
+  .VPNavBarSearch {
+    padding-left: 32px;
+  }
+}
+
+/* 社交图标略微收紧，配合 56px 的 header */
+:root .VPNavBar .VPSocialLink {
+  width: 32px;
+  height: 32px;
+}
+
+/* .curtain 是侧栏顶部用来遮住滚动内容的色块。默认主题把它的 sticky 偏移硬编码成
+   -64px（即旧的 nav 高度），改了 --vp-nav-height 之后需要让它跟着变量走。 */
+@media (min-width: 960px) {
+  :root .VPSidebar .curtain {
+    top: calc(var(--vp-nav-height) * -1);
+  }
+}
+
+/* ===========================================================================
+   4. 左侧 Sidebar
+   =========================================================================== */
+
+/* 与正文同底，用一条细线分隔，替代默认的整块灰底 */
+@media (min-width: 960px) {
+  .VPSidebar {
+    border-right: 1px solid var(--vp-c-divider);
+  }
+}
+
+/* 分组标题：小号、降权、加字距，和 item 拉开层级 */
+:root .VPSidebar .VPSidebarItem.level-0 {
+  padding-bottom: 14px;
+}
+
+:root .VPSidebar .VPSidebarItem.level-0 > .item > .text {
+  padding: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  letter-spacing: 0.04em;
+  color: var(--vp-c-text-3);
+}
+
+/* 分组之间的分隔线去掉：标题样式本身已经足够区分层级 */
+:root .VPSidebar .group + .group {
+  border-top: 0;
+  padding-top: 12px;
+}
+
+/* item：整行做成轻量 pill，hover / active 都靠背景 + accent 表达 */
+:root .VPSidebar .VPSidebarItem.level-1 > .item {
+  border-radius: 6px;
+  padding: 0 10px;
+  transition: background-color 0.2s;
+}
+
+:root .VPSidebar .VPSidebarItem.level-1 > .item:hover {
+  background-color: var(--mc-hover);
+}
+
+:root .VPSidebar .VPSidebarItem.level-1.is-active > .item {
+  background-color: var(--vp-c-brand-soft);
+}
+
+:root .VPSidebar .VPSidebarItem.level-1 > .item > .link > .text {
+  padding: 5px 0;
+  font-size: 13.5px;
+  line-height: 22px;
+  font-weight: 500;
+  color: var(--vp-c-text-2);
+}
+
+/* 默认主题只在 level-2 及更深显示左侧 accent 竖条。这里让 level-1 也显示，
+   并对齐到 pill 的左边缘。 */
+:root .VPSidebar .VPSidebarItem.level-1.is-active > .item > .indicator {
+  top: 7px;
+  bottom: 7px;
+  left: 0;
+  width: 2px;
+  background-color: var(--vp-c-brand-1);
+}
+
+/* ===========================================================================
+   5. 正文排版（.vp-doc 是全局样式，按引入顺序直接覆盖即可）
+   =========================================================================== */
+
+.vp-doc h1 {
+  font-size: 30px;
+  line-height: 1.3;
+  font-weight: 700;
+  letter-spacing: -0.022em;
+}
+
+@media (min-width: 768px) {
+  .vp-doc h1 {
+    font-size: 33px;
+  }
+}
+
+/* 保留 padding-top: 24px —— .header-anchor 的 top 就是按它对齐的 */
+.vp-doc h2 {
+  margin: 56px 0 16px;
+  padding-top: 24px;
+  font-size: 22px;
+  line-height: 1.4;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.vp-doc h3 {
+  margin: 36px 0 0;
+  font-size: 18px;
+  line-height: 1.5;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.vp-doc h4 {
+  margin: 28px 0 0;
+  font-size: 16px;
+  line-height: 1.5;
+  font-weight: 600;
+}
+
+.vp-doc p {
+  margin: 16px 0;
+  line-height: 1.8;
+}
+
+/* 链接：保留下划线但降透明度，hover 时回到实色 */
+.vp-doc a {
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--mc-accent-line);
+  transition: color 0.2s, text-decoration-color 0.2s;
+}
+
+.vp-doc a:hover {
+  text-decoration-color: currentColor;
+}
+
+/* 列表 */
+.vp-doc ul,
+.vp-doc ol {
+  margin: 16px 0;
+  padding-left: 1.35rem;
+}
+
+.vp-doc li {
+  line-height: 1.8;
+}
+
+.vp-doc li + li {
+  margin-top: 6px;
+}
+
+/* 引用：左侧改为 accent 细线 */
+.vp-doc blockquote {
+  margin: 20px 0;
+  border-left: 2px solid var(--mc-accent-line);
+  padding: 2px 0 2px 16px;
+}
+
+.vp-doc blockquote > p {
+  line-height: 1.8;
+}
+
+/* 分隔线 */
+.vp-doc hr {
+  margin: 32px 0;
+  border-top: 1px solid var(--vp-c-divider);
+}
+
+/* 表格：去掉斑马纹和竖线，只留横向分隔，表头降权 */
+.vp-doc tr {
+  border-top: 0;
+  background-color: transparent;
+}
+
+.vp-doc tr:nth-child(2n) {
+  background-color: transparent;
+}
+
+.vp-doc th,
+.vp-doc td {
+  border: 0;
+  border-bottom: 1px solid var(--vp-c-divider);
+  padding: 10px 16px;
+}
+
+.vp-doc th {
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--vp-c-text-3);
+  background-color: transparent;
+}
+
+.vp-doc td {
+  font-size: 14.5px;
+}
+
+/* 代码块：加一圈细边框，让浅底块在正文里有明确边界 */
+@media (min-width: 640px) {
+  .vp-doc div[class*='language-'],
+  .vp-block {
+    border: 1px solid var(--vp-c-divider);
+    border-radius: 10px;
+  }
+}
+
+/* 行内 code 稍微收紧 */
+.vp-doc :not(pre) > code {
+  border-radius: 5px;
+  padding: 2px 5px;
+}
+
+/* 提示容器：统一圆角与纵向节奏 */
+.vp-doc .custom-block {
+  border-radius: 10px;
+  padding: 14px 18px 4px;
+}
+
+/* 正文容器宽度 */
+:root .VPDoc.has-aside .content-container {
+  max-width: 720px;
+}
+
+/* ===========================================================================
+   6. 右侧 Outline
+   ---------------------------------------------------------------------------
+   不要改 .outline-title / .outline-link 的 line-height。
+   VitePress 用 `activeLink.offsetTop + 39` 定位 .outline-marker，其中 39 来自
+   “标题 32px + (32px 行高 - 18px 标记高度) / 2”。行高一变，标记就会错位。
+   因此这里只调字号、字重和颜色。
+   =========================================================================== */
+
+:root .VPDocAsideOutline .content {
+  border-left: 1px solid var(--vp-c-divider);
+  padding-left: 14px;
+}
+
+:root .VPDocAsideOutline .outline-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--vp-c-text-3);
+}
+
+/* 非当前项降权 */
+:root .VPDocAsideOutline .outline-link {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--vp-c-text-3);
+}
+
+/* 当前项用 accent 强调（默认主题只会提升到 text-1） */
+:root .VPDocAside .VPDocAsideOutline .outline-link:hover,
+:root .VPDocAside .VPDocAsideOutline .outline-link.active {
+  font-weight: 500;
+  color: var(--vp-c-brand-1);
+}
+
+/* ===========================================================================
+   7. 上一页 / 下一页
+   =========================================================================== */
+
+:root .VPDocFooter .pager-link {
+  border-radius: 10px;
+  padding: 12px 16px;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+
+:root .VPDocFooter .pager-link:hover {
+  border-color: var(--vp-c-brand-1);
+  background-color: var(--vp-c-bg-soft);
+}
+
+/* ===========================================================================
+   8. 响应式
+   ---------------------------------------------------------------------------
+   窄屏（< 960px）保持默认主题的移动导航：本文件所有改动 header / sidebar
+   结构的规则都在 @media (min-width: 768px | 960px) 内，侧栏仍是默认抽屉。
+   新增宽度均使用相对单位或可收缩的 flex，没有引入会导致溢出的固定宽度。
+   =========================================================================== */
+
+@media (max-width: 767px) {
+  .vp-doc h1 {
+    font-size: 26px;
+  }
+
+  .vp-doc h2 {
+    margin-top: 44px;
+    font-size: 20px;
+  }
+}
