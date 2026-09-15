@@ -57,7 +57,8 @@ if [ "$WEB_OLD" != "$WEB_NEW" ]; then
     WEB_CHANGED=1
     WEB_CHANGED_FILES="$(git_in "$WEB_DIR" diff --name-only "$WEB_OLD" "$WEB_NEW")"
 
-    # README/docs/site, CI/CD workflow files, and deploy-server.sh are
+    # README, docs/, docs-site/, site/, CI/CD workflow files, and
+    # deploy-server.sh are
     # deployment/static-only changes. nginx configuration is handled
     # separately below. None of them require Python dependency sync, Vue build,
     # FastAPI restart, or Sandbox rebuild by themselves.
