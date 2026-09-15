@@ -105,6 +105,13 @@
   --vp-c-text-2: #a1a1ab;
   --vp-c-text-3: #6f6f79;
 
+  --vp-c-bg: #121214;
+  --vp-c-bg-alt: #18181b;
+  --vp-c-bg-soft: #202024;
+  --vp-c-bg-elv: #1c1c20;
+
+  --vp-sidebar-bg-color: var(--vp-c-bg);
+
   --vp-code-block-bg: #161619;
 }
 
