@@ -1,11 +1,21 @@
 import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
 // https://vitepress.dev/reference/site-config
-export default defineConfig({
+export default withMermaid(defineConfig({
   title: 'MyCode Docs',
   description: 'MyCode Documentation',
   lang: 'zh-CN',
   base: '/docs/',
+
+  vite: {
+    optimizeDeps: {
+      include: [
+        'fastdom',
+        'fastdom/extensions/fastdom-promised.js'
+      ]
+    }
+  },
 
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
@@ -17,15 +27,24 @@ export default defineConfig({
     // 全站统一 Sidebar，不按目录切换
     sidebar: [
       {
-        text: '开始使用',
+        text: '开始',
         items: [
           { text: '文档首页', link: '/' },
           { text: '快速开始', link: '/getting-started/' }
         ]
       },
       {
-        text: '扩展能力',
-        items: [{ text: 'MCP', link: '/mcp/' }]
+        text: '项目拆解',
+        items: [
+          { text: '项目总览', link: '/overview/' },
+          { text: 'Agent 与 Runtime', link: '/agent/' },
+          { text: 'Tool 系统', link: '/tools/' },
+          { text: 'Context / Memory', link: '/context/' },
+          { text: 'SubAgent / Session', link: '/subagent/' },
+          { text: 'MCP', link: '/mcp/' },
+          { text: 'Evaluation / Harbor', link: '/evaluation/' },
+          { text: 'MyCode 演进与设计取舍', link: '/evolution/' }
+        ]
       }
     ],
 
@@ -66,4 +85,4 @@ export default defineConfig({
       { icon: 'github', link: 'https://github.com/mmc-cloud/mycode' }
     ]
   }
-})
+}))
