@@ -3,6 +3,9 @@ set -Eeuo pipefail
 
 MYCODE_DIR="/opt/mycode"
 WEB_DIR="/opt/mycode-web"
+DEPLOY_STATE_DIR="/var/lib/mycode-deploy"
+MYCODE_DEPLOYED_SHA_FILE="$DEPLOY_STATE_DIR/mycode.sha"
+WEB_DEPLOYED_SHA_FILE="$DEPLOY_STATE_DIR/web.sha"
 SERVICE="mycode-web"
 HEALTH_URL="http://127.0.0.1:8000/web/api/health"
 NGINX_CONFIG_SOURCE="$WEB_DIR/deploy/nginx/mycode.conf"
@@ -20,6 +23,13 @@ git_in() {
 
 echo "==> Checking repositories"
 
+for state_file in "$MYCODE_DEPLOYED_SHA_FILE" "$WEB_DEPLOYED_SHA_FILE"; do
+    if [ ! -s "$state_file" ]; then
+        echo "ERROR: deployment state file is missing or empty: $state_file"
+        exit 1
+    fi
+done
+
 # Refuse to deploy over tracked local changes.
 # Untracked/ignored runtime files such as .env and data/ are not touched.
 for repo in "$MYCODE_DIR" "$WEB_DIR"; do
@@ -30,8 +40,8 @@ for repo in "$MYCODE_DIR" "$WEB_DIR"; do
     fi
 done
 
-MYCODE_OLD="$(git_in "$MYCODE_DIR" rev-parse HEAD)"
-WEB_OLD="$(git_in "$WEB_DIR" rev-parse HEAD)"
+MYCODE_OLD="$(cat "$MYCODE_DEPLOYED_SHA_FILE")"
+WEB_OLD="$(cat "$WEB_DEPLOYED_SHA_FILE")"
 
 echo "==> Updating MyCode Core"
 git_in "$MYCODE_DIR" pull --ff-only
@@ -64,7 +74,7 @@ if [ "$WEB_OLD" != "$WEB_NEW" ]; then
     # separately below. None of them require Python dependency sync, Vue build,
     # FastAPI restart, or Sandbox rebuild by themselves.
     if printf '%s\n' "$WEB_CHANGED_FILES" | \
-        grep -Ev '^(README\.md|docs/|docs-site/|site/|deploy/nginx/|\.github/|scripts/deploy-server\.sh$)' | grep -q .; then
+        grep -Ev '^(README\.md|docs/|docs-site/|site/|deploy/nginx/|\.github/|scripts/deploy-server\.sh$|\.gitignore$)' | grep -q .; then
         WEB_RUNTIME_CHANGED=1
     fi
 
@@ -118,6 +128,7 @@ if [ "$DOCS_CHANGED" -eq 1 ]; then
     echo "==> Building VitePress documentation"
 
     if ! docker run --rm \
+        -e CI=true \
         -v "$WEB_DIR/docs-site:/app" \
         -w /app \
         node:22-bookworm-slim \
@@ -134,7 +145,13 @@ else
     echo "==> docs-site unchanged; skipping documentation build"
 fi
 
+record_successful_deploy() {
+    printf '%s\n' "$MYCODE_NEW" > "$MYCODE_DEPLOYED_SHA_FILE"
+    printf '%s\n' "$WEB_NEW" > "$WEB_DEPLOYED_SHA_FILE"
+}
+
 if [ "$MYCODE_CHANGED" -eq 0 ] && [ "$WEB_RUNTIME_CHANGED" -eq 0 ]; then
+    record_successful_deploy
     echo "==> Web changes are static/documentation/deployment-only. No runtime deployment needed."
     exit 0
 fi
@@ -181,6 +198,7 @@ for i in $(seq 1 15); do
         echo
         curl -fsS "$HEALTH_URL"
         echo
+        record_successful_deploy
         echo "==> Deployment successful"
         echo "MyCode: $MYCODE_NEW"
         echo "Web:    $WEB_NEW"
