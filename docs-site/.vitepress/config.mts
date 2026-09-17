@@ -21,6 +21,8 @@ export default withMermaid(defineConfig({
     // https://vitepress.dev/reference/default-theme-config
     nav: [
       { text: '文档首页', link: '/' },
+      { text: '项目主页', link: 'https://mycode.icu/' },
+      { text: 'Web Demo', link: 'https://mycode.icu/web/' },
       { text: 'GitHub', link: 'https://github.com/mmc-cloud/mycode' }
     ],
 

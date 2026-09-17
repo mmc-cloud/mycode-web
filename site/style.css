@@ -55,6 +55,7 @@ a, button { -webkit-tap-highlight-color: transparent; }
 .hero-actions { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 26px; font-size: 13px; }
 .text-link { color: #d3d9df; }
 .text-link:hover { color: #fff; }
+.install-command { margin: 17px 0 0; color: #69727b; font-size: 12px; }
 
 .terminal-card { overflow: hidden; margin-top: 48px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
 .terminal-bar { min-height: 40px; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 14px; border-bottom: 1px solid var(--line); color: #626970; font-size: 12px; }
