@@ -1,6 +1,6 @@
 # MyCode Web
 
-`mycode-web` 是独立于 MyCode Core 的 Web 与 deployment layer。它不 import、复制或修改 MyCode Python package，而是通过 Core 14.5 的 machine runtime `mycode runtime --jsonl --continue` 驱动 Core。Web repo 与 MyCode Core repo 独立维护。
+`mycode-web` 是独立于 MyCode Core 的 Web 与 deployment layer。它不 import、复制或修改 MyCode Python package，而是通过 MyCode Runtime JSONL Protocol v1 的 `mycode runtime --jsonl --continue` 驱动 Core。Web repo 与 MyCode Core repo 独立维护。
 
 真实 Provider API Key 只由 Host/FastAPI 持有。Docker Sandbox 仅获得内部 Relay token、Relay URL、模型名，以及 Host 明确传入的 MyCode Runtime 参数；Provider 凭据不会进入 Sandbox。
 
@@ -12,10 +12,12 @@
 - Workspace：支持上传、文件树、文本预览、文件/目录删除以及文件和完整 Workspace 下载。
 - Workspace 自动刷新：Agent 修改文件后，页面自动刷新文件树和当前 Preview。
 - Agent Console：同时提供实时增量输出和可持久化、可恢复的聚合历史。
+- Context inspection / Compact：通过 Runtime JSONL Protocol v1 查询 Context 统计，并串行执行手动 Compact。
 - Permission interaction：Browser 提供独立的 Allow/Reject UI，并通过结构化 `permission_request` / `permission_response` 完成同步决策。
 - Runtime Pool / FIFO Queue：在受控资源上管理并发 Session Runtime。
 - Project MCP Trust：Sandbox 启动期间通过 `mcp_trust_request` / `mcp_trust_response` 请求项目级 MCP 信任，不展示 secret value。
 - Session persistence：Runtime 回收后保留 Session 数据，后续通过 `mycode runtime --jsonl --continue` 恢复。
+- Sandbox compatibility smoke：Sandbox rebuild 后以无网络、临时状态执行 `runtime_ready` → `close` → `runtime_closed` 启动握手检查。
 
 ## 架构
 

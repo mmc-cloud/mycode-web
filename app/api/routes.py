@@ -25,6 +25,8 @@ from app.db.database import WebSession, WebUser
 from app.models.api import (
     ConsoleEventResponse,
     ConsoleSnapshotResponse,
+    CompactResultResponse,
+    ContextStatusResponse,
     MCPTrustDecisionRequest,
     MessageRequest,
     PermissionDecisionRequest,
@@ -70,6 +72,8 @@ def _session_response(
         active_turn_id=runtime.active_turn_id(session.id),
         pending_permission=runtime.pending_permission(session.id),
         pending_mcp_trust=runtime.pending_mcp_trust(session.id),
+        pending_control=runtime.pending_control(session.id),
+        context_status=runtime.context_status(session.id),
         event_cursor=event_cursor,
     )
 
@@ -191,6 +195,42 @@ async def send_message(
     except RuntimeUnavailableError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     return {"status": admission, "turn_id": turn_id}
+
+
+@router.post(
+    "/sessions/{session_id}/context-status",
+    response_model=ContextStatusResponse,
+)
+async def context_status(
+    request: Request,
+    context: WebContext = Depends(current_context),
+) -> ContextStatusResponse:
+    try:
+        result = await services(request).runtime.get_context_status(
+            context.session.id
+        )
+    except RuntimeConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except RuntimeUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return ContextStatusResponse.model_validate(result)
+
+
+@router.post(
+    "/sessions/{session_id}/compact",
+    response_model=CompactResultResponse,
+)
+async def compact(
+    request: Request,
+    context: WebContext = Depends(current_context),
+) -> CompactResultResponse:
+    try:
+        result = await services(request).runtime.compact_context(context.session.id)
+    except RuntimeConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except RuntimeUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return CompactResultResponse.model_validate(result)
 
 
 @router.websocket("/sessions/{session_id}/terminal")

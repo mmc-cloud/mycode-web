@@ -12,6 +12,7 @@ from starlette.websockets import WebSocketDisconnect
 from app.config import ServerSettings
 from app.main import create_app
 from app.paths import API_BASE_PATH
+from app.services.runtime import RuntimeConflictError
 
 
 class NoopLauncher:
@@ -477,6 +478,79 @@ def test_activate_api_returns_before_slow_runtime_startup(tmp_path: Path) -> Non
         )
         elapsed = time.monotonic() - started
 
-        assert response.status_code == 202
-        assert response.json() == {"status": "starting"}
-        assert elapsed < 1
+    assert response.status_code == 202
+    assert response.json() == {"status": "starting"}
+    assert elapsed < 1
+
+
+def test_context_status_and_compact_api_keep_session_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = {
+        "estimated": True,
+        "estimated_input_tokens": 120,
+        "context_window_tokens": 1_000,
+        "max_input_tokens": 800,
+        "reserved_output_tokens": 160,
+        "safety_margin_tokens": 40,
+        "estimate_source": "tiktoken",
+        "last_provider_prompt_tokens": None,
+        "source_message_count": 8,
+        "model_visible_message_count": 6,
+        "memory_entry_count": 2,
+        "memory_estimated_tokens": 30,
+        "compact_status": "none",
+        "compact_covered_message_count": 0,
+        "compressed_tool_result_count": 1,
+    }
+    compact_result = {
+        "status": "skipped",
+        "reason": "insufficient_history",
+        "before": context,
+        "after": context,
+    }
+    app = create_test_app(tmp_path)
+
+    async def get_context_status(session_id: str):
+        return context
+
+    async def compact_context(session_id: str):
+        return compact_result
+
+    monkeypatch.setattr(
+        app.state.services.runtime, "get_context_status", get_context_status
+    )
+    monkeypatch.setattr(
+        app.state.services.runtime, "compact_context", compact_context
+    )
+    with TestClient(app) as owner, TestClient(app) as stranger:
+        session_id = owner.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        base = f"{API_BASE_PATH}/sessions/{session_id}"
+        status = owner.post(base + "/context-status")
+        compact = owner.post(base + "/compact")
+        denied = stranger.post(base + "/context-status")
+
+    assert status.status_code == 200
+    assert status.json() == context
+    assert compact.status_code == 200
+    assert compact.json() == compact_result
+    assert denied.status_code == 404
+
+
+def test_context_control_api_maps_runtime_conflict_to_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_test_app(tmp_path)
+
+    async def conflict(session_id: str):
+        raise RuntimeConflictError("Context control is busy.")
+
+    monkeypatch.setattr(app.state.services.runtime, "get_context_status", conflict)
+    with TestClient(app) as client:
+        session_id = client.post(f"{API_BASE_PATH}/sessions").json()["id"]
+        response = client.post(
+            f"{API_BASE_PATH}/sessions/{session_id}/context-status"
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Context control is busy."

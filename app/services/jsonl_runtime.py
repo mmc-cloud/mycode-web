@@ -1,4 +1,4 @@
-"""Thin Web-side adapter for the Core 14.5 runtime JSONL wire protocol."""
+"""Web-side adapter for the MyCode Runtime JSONL Protocol v1."""
 
 from __future__ import annotations
 
@@ -11,6 +11,23 @@ JSONL_PROTOCOL_VERSION = 1
 MAX_JSONL_LINE_BYTES = 8 * 1024 * 1024
 MAX_JSONL_BUFFER_BYTES = 8 * 1024 * 1024
 PermissionDecision = Literal["deny", "once", "task", "session"]
+CONTEXT_STATUS_FIELDS = (
+    "estimated",
+    "estimated_input_tokens",
+    "context_window_tokens",
+    "max_input_tokens",
+    "reserved_output_tokens",
+    "safety_margin_tokens",
+    "estimate_source",
+    "last_provider_prompt_tokens",
+    "source_message_count",
+    "model_visible_message_count",
+    "memory_entry_count",
+    "memory_estimated_tokens",
+    "compact_status",
+    "compact_covered_message_count",
+    "compressed_tool_result_count",
+)
 
 
 class JsonlProtocolError(ValueError):
@@ -100,6 +117,14 @@ class JsonlRuntimeAdapter:
                 "approved": approved,
             }
         )
+
+    def encode_context_status(self) -> bytes:
+        """Request the current content-free Context statistics from Core."""
+        return self._encode({"type": "context_status"})
+
+    def encode_compact(self) -> bytes:
+        """Request one manual Context Compact operation from Core."""
+        return self._encode({"type": "compact"})
 
     @staticmethod
     def _decode_line(line: bytes) -> dict[str, object]:

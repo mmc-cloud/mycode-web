@@ -2498,3 +2498,185 @@ def test_concurrent_admission_never_exceeds_active_limit(tmp_path: Path) -> None
         assert manager.active_count == 0
 
     asyncio.run(scenario())
+
+
+def context_status_wire() -> dict[str, object]:
+    return {
+        "estimated": True,
+        "estimated_input_tokens": 120,
+        "context_window_tokens": 1_000,
+        "max_input_tokens": 800,
+        "reserved_output_tokens": 160,
+        "safety_margin_tokens": 40,
+        "estimate_source": "tiktoken",
+        "last_provider_prompt_tokens": 111,
+        "source_message_count": 8,
+        "model_visible_message_count": 6,
+        "memory_entry_count": 2,
+        "memory_estimated_tokens": 30,
+        "compact_status": "none",
+        "compact_covered_message_count": 0,
+        "compressed_tool_result_count": 1,
+    }
+
+
+def test_context_controls_are_serialized_and_projected(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), runtime_control_timeout_seconds=1)
+        events = EventHub()
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), events, launcher=launcher
+        )
+
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+        context_request = asyncio.create_task(manager.get_context_status("session"))
+        for _ in range(50):
+            if manager.pending_control("session") == "context_status":
+                break
+            await asyncio.sleep(0)
+        assert manager.pending_control("session") == "context_status"
+        with pytest.raises(RuntimeConflictError):
+            await manager.compact_context("session")
+        with pytest.raises(RuntimeConflictError):
+            await manager.send_message("session", "must wait")
+
+        request = json.loads(launcher.process.stdin.raw_writes[-1])
+        assert request == {"version": 1, "type": "context_status"}
+        await launcher.process.stdout.feed(
+            jsonl({"type": "context_status", **context_status_wire(), "ignored": "field"})
+        )
+        result = await asyncio.wait_for(context_request, timeout=1)
+        assert result == context_status_wire()
+        assert manager.context_status("session") == context_status_wire()
+        assert manager.pending_control("session") is None
+        assert manager._sessions["session"].busy is False
+
+        compact_request = asyncio.create_task(manager.compact_context("session"))
+        for _ in range(50):
+            if manager.pending_control("session") == "compact":
+                break
+            await asyncio.sleep(0)
+        assert manager.pending_control("session") == "compact"
+        before = context_status_wire()
+        after = {**before, "estimated_input_tokens": 50, "compact_status": "active"}
+        await launcher.process.stdout.feed(
+            jsonl(
+                {
+                    "type": "compact_result",
+                    "status": "compacted",
+                    "reason": None,
+                    "before": before,
+                    "after": after,
+                }
+            )
+        )
+        compact_result = await asyncio.wait_for(compact_request, timeout=1)
+        assert compact_result["status"] == "compacted"
+        assert compact_result["after"] == after
+        assert manager.context_status("session") == after
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_context_controls_are_rejected_during_turn_permission_and_mcp_trust(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), runtime_control_timeout_seconds=1)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+
+        await manager.send_message("turn", "work")
+        with pytest.raises(RuntimeConflictError):
+            await manager.get_context_status("turn")
+        await launcher.process.stdout.feed(permission_wire())
+        await wait_for_status(manager, "turn", "waiting_permission")
+        with pytest.raises(RuntimeConflictError):
+            await manager.compact_context("turn")
+        await manager.shutdown()
+
+        trust_launcher = FakeLauncher()
+        trust_manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=trust_launcher
+        )
+        await trust_manager.activate("trust")
+        await wait_for_status(trust_manager, "trust", "idle")
+        await trust_launcher.process.stdout.feed(trust_wire())
+        await wait_for_status(trust_manager, "trust", "waiting_mcp_trust")
+        with pytest.raises(RuntimeConflictError):
+            await trust_manager.get_context_status("trust")
+        await trust_manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_context_control_timeout_cleans_pending_state_and_stops_runtime(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), runtime_control_timeout_seconds=0.01)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+
+        with pytest.raises(RuntimeUnavailableError, match="timeout"):
+            await manager.get_context_status("session")
+        assert manager.pending_control("session") is None
+        assert manager.status("session") == "stopped"
+        assert manager._sessions["session"].busy is False
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_context_control_runtime_error_clears_state_and_allows_retry(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), runtime_control_timeout_seconds=1)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+
+        failed = asyncio.create_task(manager.get_context_status("session"))
+        for _ in range(50):
+            if manager.pending_control("session") == "context_status":
+                break
+            await asyncio.sleep(0)
+        await launcher.process.stdout.feed(
+            jsonl(
+                {
+                    "type": "runtime_error",
+                    "code": "context_status_failed",
+                    "message": "Context status inspection failed.",
+                }
+            )
+        )
+        with pytest.raises(RuntimeUnavailableError, match="failed to complete"):
+            await asyncio.wait_for(failed, timeout=1)
+        assert manager.pending_control("session") is None
+        assert manager.status("session") == "idle"
+
+        retried = asyncio.create_task(manager.get_context_status("session"))
+        for _ in range(50):
+            if manager.pending_control("session") == "context_status":
+                break
+            await asyncio.sleep(0)
+        await launcher.process.stdout.feed(
+            jsonl({"type": "context_status", **context_status_wire()})
+        )
+        assert await asyncio.wait_for(retried, timeout=1) == context_status_wire()
+        await manager.shutdown()
+
+    asyncio.run(scenario())

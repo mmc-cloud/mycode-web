@@ -28,6 +28,31 @@ class MCPTrustDecisionRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=200)
 
 
+class ContextStatusResponse(BaseModel):
+    estimated: bool | None = None
+    estimated_input_tokens: int | None = None
+    context_window_tokens: int | None = None
+    max_input_tokens: int | None = None
+    reserved_output_tokens: int | None = None
+    safety_margin_tokens: int | None = None
+    estimate_source: str | None = None
+    last_provider_prompt_tokens: int | None = None
+    source_message_count: int | None = None
+    model_visible_message_count: int | None = None
+    memory_entry_count: int | None = None
+    memory_estimated_tokens: int | None = None
+    compact_status: str | None = None
+    compact_covered_message_count: int | None = None
+    compressed_tool_result_count: int | None = None
+
+
+class CompactResultResponse(BaseModel):
+    status: str
+    reason: str | None = None
+    before: ContextStatusResponse | None = None
+    after: ContextStatusResponse | None = None
+
+
 class UserResponse(BaseModel):
     display_name: str | None
 
@@ -41,6 +66,8 @@ class SessionResponse(BaseModel):
     active_turn_id: str | None = None
     pending_permission: dict[str, object] | None = None
     pending_mcp_trust: dict[str, object] | None = None
+    pending_control: str | None = None
+    context_status: ContextStatusResponse | None = None
     # Detail responses use this as the SSE bootstrap cursor. List/create
     # responses leave it unset because they are not bootstrap snapshots.
     event_cursor: int | None = None

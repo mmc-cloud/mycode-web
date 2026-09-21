@@ -10,6 +10,7 @@ SERVICE="mycode-web"
 HEALTH_URL="http://127.0.0.1:8000/web/api/health"
 NGINX_CONFIG_SOURCE="$WEB_DIR/deploy/nginx/mycode.conf"
 NGINX_CONFIG_TARGET="/etc/nginx/conf.d/mycode.conf"
+SANDBOX_IMAGE="${MYCODE_SANDBOX_IMAGE:-mycode-sandbox:dev}"
 
 # CentOS 7 ships an old Git that does not support `git -C`.
 git_in() {
@@ -80,7 +81,7 @@ if [ "$WEB_OLD" != "$WEB_NEW" ]; then
 
     # Web repo also owns the Sandbox build definition.
     if printf '%s\n' "$WEB_CHANGED_FILES" | \
-        grep -Eq '^(docker/|scripts/build-sandbox\.sh$|scripts/build-sandbox\.ps1$|\.dockerignore$)'; then
+        grep -Eq '^(docker/|scripts/build-sandbox\.sh$|scripts/build-sandbox\.ps1$|scripts/smoke-sandbox-runtime\.py$|\.dockerignore$)'; then
         SANDBOX_DEF_CHANGED=1
     fi
 
@@ -164,7 +165,9 @@ if [ "$MYCODE_CHANGED" -eq 1 ] || [ "$SANDBOX_DEF_CHANGED" -eq 1 ]; then
 
     # The repository may store this script as 0644, so invoke it via bash
     # instead of relying on the executable bit.
-    bash ./scripts/build-sandbox.sh ../mycode
+    bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_IMAGE"
+    echo "==> Running Sandbox compatibility smoke"
+    python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_IMAGE"
 else
     echo "==> Sandbox image unchanged; skipping rebuild"
 fi

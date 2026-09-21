@@ -133,3 +133,16 @@ def test_adapter_encodes_mcp_trust_response() -> None:
         "request_id": "trust-1",
         "approved": True,
     }
+
+
+def test_adapter_encodes_context_controls_without_request_ids() -> None:
+    adapter = JsonlRuntimeAdapter()
+
+    assert json.loads(adapter.encode_context_status()) == {
+        "version": 1,
+        "type": "context_status",
+    }
+    assert json.loads(adapter.encode_compact()) == {
+        "version": 1,
+        "type": "compact",
+    }

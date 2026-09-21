@@ -127,6 +127,9 @@ class ServerSettings:
     runtime_sweep_interval_seconds: int = field(
         default_factory=lambda: _env_int("RUNTIME_SWEEP_INTERVAL_SECONDS", 60)
     )
+    runtime_control_timeout_seconds: int = field(
+        default_factory=lambda: _env_int("RUNTIME_CONTROL_TIMEOUT_SECONDS", 120)
+    )
     session_retention_seconds: int = field(
         default_factory=lambda: _env_int("SESSION_RETENTION_SECONDS", 1209600)
     )

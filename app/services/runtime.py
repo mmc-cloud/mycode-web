@@ -6,13 +6,14 @@ from pathlib import Path
 import logging
 import re
 import time
-from typing import Coroutine, Protocol
+from typing import Coroutine, Literal, Protocol
 from uuid import uuid4
 
 from app.config import ServerSettings
 from app.services.events import EventHub
 from app.services.relay import RuntimeTokenRegistry
 from app.services.jsonl_runtime import (
+    CONTEXT_STATUS_FIELDS,
     JsonlProtocolError,
     JsonlRuntimeAdapter,
     PermissionDecision,
@@ -33,6 +34,9 @@ class RuntimeCapacityError(RuntimeError):
 
 class RuntimeUnavailableError(RuntimeError):
     pass
+
+
+RuntimeControlType = Literal["context_status", "compact"]
 
 
 def _validate_message_content(content: str) -> str:
@@ -231,6 +235,12 @@ class RuntimeTerminalTarget:
 
 
 @dataclass
+class _PendingControl:
+    kind: RuntimeControlType
+    future: asyncio.Future[dict[str, object]]
+
+
+@dataclass
 class _RuntimeSession:
     process: SandboxProcess | None = None
     reader_task: asyncio.Task[None] | None = None
@@ -250,6 +260,8 @@ class _RuntimeSession:
     relay_token: str | None = None
     pending_permission: dict[str, object] | None = None
     pending_mcp_trust: dict[str, object] | None = None
+    pending_control: _PendingControl | None = None
+    last_context_status: dict[str, object] | None = None
     mcp_trust_resume_status: str | None = None
     readiness_pause_started: float | None = None
     readiness_pause_total: float = 0.0
@@ -316,6 +328,137 @@ class RuntimeManager:
     def runtime_generation(self, session_id: str) -> int:
         state = self._sessions.get(session_id)
         return 0 if state is None else state.runtime_generation
+
+    def pending_control(self, session_id: str) -> str | None:
+        state = self._sessions.get(session_id)
+        return None if state is None or state.pending_control is None else state.pending_control.kind
+
+    def context_status(self, session_id: str) -> dict[str, object] | None:
+        state = self._sessions.get(session_id)
+        return None if state is None else _copy_projection(state.last_context_status)
+
+    async def get_context_status(self, session_id: str) -> dict[str, object]:
+        return await self._run_control(session_id, "context_status")
+
+    async def compact_context(self, session_id: str) -> dict[str, object]:
+        return await self._run_control(session_id, "compact")
+
+    async def _run_control(
+        self, session_id: str, control_type: RuntimeControlType
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            state = self._sessions.get(session_id)
+            self._ensure_control_admissible_locked(state)
+            assert state is not None
+            future: asyncio.Future[dict[str, object]] = loop.create_future()
+            state.pending_control = _PendingControl(control_type, future)
+            state.busy = True
+            self._touch(session_id, state)
+
+        await self.events.publish(
+            session_id,
+            "runtime_control",
+            control=control_type,
+            status="started",
+        )
+        encoder = (
+            state.adapter.encode_context_status
+            if control_type == "context_status"
+            else state.adapter.encode_compact
+        )
+        try:
+            await self._write_bytes(state, encoder())
+            result = await asyncio.wait_for(
+                future, timeout=self.settings.runtime_control_timeout_seconds
+            )
+        except asyncio.CancelledError:
+            await self._abort_control(session_id, state)
+            await self.stop_session(session_id)
+            raise
+        except TimeoutError as error:
+            await self._abort_control(session_id, state)
+            await self.stop_session(session_id)
+            await self.events.publish(
+                session_id,
+                "runtime_control",
+                control=control_type,
+                status="failed",
+                reason="timeout",
+            )
+            raise RuntimeUnavailableError(
+                "Runtime control did not return a result before the timeout."
+            ) from error
+        except RuntimeUnavailableError:
+            if self.pending_control(session_id) == control_type:
+                await self._abort_control(session_id, state)
+                await self.stop_session(session_id)
+            await self.events.publish(
+                session_id,
+                "runtime_control",
+                control=control_type,
+                status="failed",
+                reason="runtime_unavailable",
+            )
+            raise
+        except Exception as error:
+            await self._abort_control(session_id, state)
+            await self.stop_session(session_id)
+            await self.events.publish(
+                session_id,
+                "runtime_control",
+                control=control_type,
+                status="failed",
+                reason=type(error).__name__,
+            )
+            raise
+
+        await self.events.publish(
+            session_id,
+            "runtime_control",
+            control=control_type,
+            status="completed",
+        )
+        return result
+
+    def _ensure_control_admissible_locked(
+        self, state: _RuntimeSession | None
+    ) -> None:
+        if self._closed:
+            raise RuntimeUnavailableError("Runtime manager is shutting down.")
+        if state is None or state.status in {"stopped", "error"}:
+            raise RuntimeUnavailableError("Runtime is not active.")
+        if self._is_finalizing(state):
+            raise RuntimeConflictError("Runtime is finalizing and cannot accept a Context control.")
+        if state.status in {"starting", "queued", "stopping"}:
+            raise RuntimeConflictError(
+                "Context controls are only available while the Runtime is safely idle."
+            )
+        if not self._is_live(state):
+            raise RuntimeUnavailableError("Runtime is not active.")
+        if state.pending_control is not None:
+            raise RuntimeConflictError("Another Context control is already in progress.")
+        if (
+            state.status != "idle"
+            or state.active_turn_id is not None
+            or state.busy
+            or state.pending_permission is not None
+            or state.pending_mcp_trust is not None
+        ):
+            raise RuntimeConflictError(
+                "Context controls are only available while the Runtime is safely idle."
+            )
+
+    async def _abort_control(self, session_id: str, state: _RuntimeSession) -> None:
+        async with self._lock:
+            pending = state.pending_control
+            if pending is None:
+                return
+            state.pending_control = None
+            state.busy = False
+            self._touch(session_id, state)
+            if not pending.future.done():
+                pending.future.cancel()
 
     async def get_terminal_target(self, session_id: str) -> RuntimeTerminalTarget:
         """Return the current live generation/container pair as one snapshot."""
@@ -487,6 +630,10 @@ class RuntimeManager:
             if self._is_finalizing(state):
                 raise RuntimeConflictError(
                     "This Session runtime is finalizing and cannot accept a new turn."
+                )
+            if state.pending_control is not None:
+                raise RuntimeConflictError(
+                    "A Context control is in progress; wait for it to finish before sending a turn."
                 )
             if state.status == "stopped":
                 state.startup_error = None
@@ -1231,6 +1378,18 @@ class RuntimeManager:
                 **_turn_payload(state.active_turn_id),
             )
             return
+        if message_type == "context_status":
+            status = _project_context_status(message)
+            await self._complete_control(
+                session_id, state, "context_status", status
+            )
+            await self.events.publish(session_id, "context_status", **status)
+            return
+        if message_type == "compact_result":
+            result = _project_compact_result(message)
+            await self._complete_control(session_id, state, "compact", result)
+            await self.events.publish(session_id, "compact_result", **result)
+            return
         if message_type == "mcp_status":
             await self.events.publish(
                 session_id,
@@ -1352,6 +1511,23 @@ class RuntimeManager:
             )
             return
         if message_type == "runtime_error":
+            pending = state.pending_control
+            code = message.get("code")
+            if (
+                pending is not None
+                and code
+                == (
+                    "context_status_failed"
+                    if pending.kind == "context_status"
+                    else "compact_failed"
+                )
+            ):
+                await self._fail_control(
+                    session_id,
+                    state,
+                    pending.kind,
+                    "Core failed to complete the Context control.",
+                )
             await self.events.publish(
                 session_id,
                 "runtime_error",
@@ -1368,6 +1544,49 @@ class RuntimeManager:
             message=f"Ignored unknown runtime message type: {message_type}",
             **_turn_payload(state.active_turn_id),
         )
+
+    async def _complete_control(
+        self,
+        session_id: str,
+        state: _RuntimeSession,
+        control_type: RuntimeControlType,
+        result: dict[str, object],
+    ) -> None:
+        async with self._lock:
+            pending = state.pending_control
+            if control_type == "context_status":
+                state.last_context_status = dict(result)
+            else:
+                after = result.get("after")
+                before = result.get("before")
+                if isinstance(after, dict):
+                    state.last_context_status = dict(after)
+                elif isinstance(before, dict):
+                    state.last_context_status = dict(before)
+            if pending is None or pending.kind != control_type:
+                return
+            state.pending_control = None
+            state.busy = False
+            self._touch(session_id, state)
+            if not pending.future.done():
+                pending.future.set_result(dict(result))
+
+    async def _fail_control(
+        self,
+        session_id: str,
+        state: _RuntimeSession,
+        control_type: RuntimeControlType,
+        message: str,
+    ) -> None:
+        async with self._lock:
+            pending = state.pending_control
+            if pending is None or pending.kind != control_type:
+                return
+            state.pending_control = None
+            state.busy = False
+            self._touch(session_id, state)
+            if not pending.future.done():
+                pending.future.set_exception(RuntimeUnavailableError(message))
 
     async def _dispatch_from_idle(
         self, session_id: str, state: _RuntimeSession
@@ -1756,11 +1975,20 @@ class RuntimeManager:
                 state.stopping = False
                 state.pending_permission = None
                 state.pending_mcp_trust = None
+                pending_control = state.pending_control
+                state.pending_control = None
+                if pending_control is not None and not pending_control.future.done():
+                    pending_control.future.set_exception(
+                        RuntimeUnavailableError(
+                            "Runtime stopped while a Context control was pending."
+                        )
+                    )
                 state.mcp_trust_resume_status = None
                 state.readiness_pause_started = None
                 state.readiness_pause_total = 0.0
                 state.active_turn_id = None
                 state.container_ref = None
+                state.last_context_status = None
                 state.terminal_lease_ids.clear()
                 effective_status = (
                     "error" if cleanup_errors and final_status == "stopped" else final_status
@@ -1846,6 +2074,8 @@ class RuntimeManager:
         )
         state.pending_permission = None
         state.pending_mcp_trust = None
+        state.pending_control = None
+        state.last_context_status = None
         state.mcp_trust_resume_status = None
         state.readiness_pause_started = None
         state.readiness_pause_total = 0.0
@@ -2033,6 +2263,47 @@ def _bounded_value(value: object, *, depth: int = 0) -> object:
             items.append("[additional values omitted]")
         return items
     return str(value)[:16_000]
+
+
+def _project_context_status(message: dict[str, object]) -> dict[str, object]:
+    """Keep only the stable, content-free Context status contract."""
+    projected = {
+        key: _bounded_value(message[key])
+        for key in CONTEXT_STATUS_FIELDS
+        if key in message
+    }
+    if not projected:
+        raise JsonlProtocolError(
+            "invalid_context_status", "context_status must contain Context statistics."
+        )
+    return projected
+
+
+def _project_compact_result(message: dict[str, object]) -> dict[str, object]:
+    status = message.get("status")
+    if not isinstance(status, str) or not status.strip():
+        raise JsonlProtocolError(
+            "invalid_compact_result", "compact_result requires a status."
+        )
+    reason = message.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        raise JsonlProtocolError(
+            "invalid_compact_result", "compact_result reason must be a string or null."
+        )
+
+    result: dict[str, object] = {
+        "status": status,
+        "reason": reason,
+    }
+    for key in ("before", "after"):
+        value = message.get(key)
+        if value is not None and not isinstance(value, dict):
+            raise JsonlProtocolError(
+                "invalid_compact_result",
+                f"compact_result {key} must be an object or null.",
+            )
+        result[key] = None if value is None else _project_context_status(value)
+    return result
 
 
 def _project_agent_event(event: dict[str, object]) -> dict[str, object]:

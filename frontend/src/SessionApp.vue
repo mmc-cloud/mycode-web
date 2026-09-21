@@ -4,7 +4,12 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "v
 import AppDialog from "./AppDialog.vue"
 import FileTree from "./FileTree.vue"
 import TerminalPanel from "./TerminalPanel.vue"
-import { API_BASE, sessionApiPath } from "./api"
+import {
+  API_BASE,
+  compactApiPath,
+  contextStatusApiPath,
+  sessionApiPath,
+} from "./api"
 
 const LAYOUT_KEY = "mycode.layout.v1"
 const layoutDefaults = {
@@ -69,6 +74,10 @@ const consoleEvents = ref([])
 const liveConsole = ref(null)
 const permission = ref(null)
 const pendingMcpTrust = ref(null)
+const contextStatus = ref(null)
+const contextVisible = ref(false)
+const controlInFlight = ref(null)
+const compactFeedback = ref("")
 const turnStates = ref({})
 const expandedGroups = ref({})
 const sessionHydrating = ref(false)
@@ -98,8 +107,14 @@ const sendDisabled = computed(() =>
   sendingSessionIds.has(currentSession.value?.id) || (
     Boolean(currentSession.value?.active_turn_id) &&
     ACTIVE_TURN_STATUSES.includes(currentSession.value?.runtime_status)
-  ),
+  ) || Boolean(currentSession.value?.pending_control) || Boolean(controlInFlight.value),
 )
+const contextControlDisabled = computed(() => {
+  const session = currentSession.value
+  if (!session || controlInFlight.value || permission.value || pendingMcpTrust.value) return true
+  if (session.pending_control) return true
+  return ACTIVE_TURN_STATUSES.includes(session.runtime_status) || Boolean(session.active_turn_id)
+})
 const executionGroups = computed(() => buildExecutionGroups(
   consoleEvents.value,
   liveConsole.value,
@@ -167,6 +182,10 @@ function clearCurrentSession(replace = true) {
   liveConsole.value = null
   permission.value = null
   pendingMcpTrust.value = null
+  contextStatus.value = null
+  contextVisible.value = false
+  controlInFlight.value = null
+  compactFeedback.value = ""
   turnStates.value = {}
   expandedGroups.value = {}
   sessionMenuId.value = null
@@ -191,6 +210,10 @@ async function openSession(sessionId, replace = false) {
   liveConsole.value = null
   permission.value = null
   pendingMcpTrust.value = null
+  contextStatus.value = null
+  contextVisible.value = false
+  controlInFlight.value = null
+  compactFeedback.value = ""
   turnStates.value = {}
   expandedGroups.value = {}
   const url = new URL(window.location.href)
@@ -228,6 +251,9 @@ async function loadMetadata(sessionId, token) {
   currentSession.value = result
   permission.value = result.pending_permission
   pendingMcpTrust.value = result.pending_mcp_trust
+  contextStatus.value = result.context_status || null
+  contextVisible.value = Boolean(result.context_status)
+  controlInFlight.value = result.pending_control || null
   if (result.active_turn_id) {
     updateTurnStatus(result.active_turn_id, result.runtime_status)
   }
@@ -380,6 +406,7 @@ async function submitDialog() {
 function clearPendingInteractions() {
   permission.value = null
   pendingMcpTrust.value = null
+  controlInFlight.value = null
 }
 
 function applyRuntimeStatus(data) {
@@ -387,6 +414,7 @@ function applyRuntimeStatus(data) {
   currentSession.value.runtime_status = data.status
   if (data.status === "error" || data.status === "stopped") {
     clearPendingInteractions()
+    if (currentSession.value) currentSession.value.pending_control = null
   }
   if (!data.turn_id) return
   updateTurnStatus(data.turn_id, data.status)
@@ -439,6 +467,30 @@ function connectEvents(sessionId, token, after) {
   eventSource.addEventListener("mcp_trust_resolved", (event) => {
     if (generation !== token) return
     pendingMcpTrust.value = null
+  })
+  eventSource.addEventListener("runtime_control", (event) => {
+    if (generation !== token) return
+    const data = JSON.parse(event.data)
+    if (data.status === "started") {
+      controlInFlight.value = data.control || null
+      if (currentSession.value) currentSession.value.pending_control = data.control || null
+    } else if (controlInFlight.value === data.control) {
+      controlInFlight.value = null
+      if (currentSession.value) currentSession.value.pending_control = null
+    }
+  })
+  eventSource.addEventListener("context_status", (event) => {
+    if (generation !== token) return
+    contextStatus.value = JSON.parse(event.data)
+    contextVisible.value = true
+  })
+  eventSource.addEventListener("compact_result", (event) => {
+    if (generation !== token) return
+    const data = JSON.parse(event.data)
+    if (data.after) contextStatus.value = data.after
+    else if (data.before) contextStatus.value = data.before
+    contextVisible.value = true
+    compactFeedback.value = compactFeedbackText(data)
   })
   eventSource.addEventListener("workspace_changed", () => {
     if (generation !== token) return
@@ -576,6 +628,54 @@ async function sendMessage() {
   }
 }
 
+async function inspectContext() {
+  if (contextControlDisabled.value) return
+  const sessionId = currentSession.value?.id
+  const token = generation
+  if (!sessionId) return
+  controlInFlight.value = "context_status"
+  contextVisible.value = true
+  compactFeedback.value = ""
+  try {
+    const result = await request(contextStatusApiPath(sessionId), { method: "POST" })
+    if (generation === token && currentSession.value?.id === sessionId) {
+      contextStatus.value = result
+      currentSession.value.pending_control = null
+    }
+  } catch (reason) {
+    if (generation === token && currentSession.value?.id === sessionId) showError(reason)
+  } finally {
+    if (generation === token && currentSession.value?.id === sessionId) {
+      controlInFlight.value = null
+    }
+  }
+}
+
+async function compactContext() {
+  if (contextControlDisabled.value) return
+  const sessionId = currentSession.value?.id
+  const token = generation
+  if (!sessionId) return
+  controlInFlight.value = "compact"
+  contextVisible.value = true
+  compactFeedback.value = "正在 Compact…"
+  try {
+    const result = await request(compactApiPath(sessionId), { method: "POST" })
+    if (generation === token && currentSession.value?.id === sessionId) {
+      if (result.after) contextStatus.value = result.after
+      else if (result.before) contextStatus.value = result.before
+      compactFeedback.value = compactFeedbackText(result)
+      currentSession.value.pending_control = null
+    }
+  } catch (reason) {
+    if (generation === token && currentSession.value?.id === sessionId) showError(reason)
+  } finally {
+    if (generation === token && currentSession.value?.id === sessionId) {
+      controlInFlight.value = null
+    }
+  }
+}
+
 async function resolvePermission(decision) {
   try {
     await request(scoped("/permission"), {
@@ -611,6 +711,28 @@ function showError(reason) {
 
 function sessionLabel(session) {
   return session.name || "Session"
+}
+
+function formatContextTokens(value) {
+  return Number.isFinite(value) ? value.toLocaleString() : "—"
+}
+
+function contextUsageLabel(status) {
+  if (!status || !Number.isFinite(status.estimated_input_tokens) || !Number.isFinite(status.max_input_tokens) || status.max_input_tokens <= 0) {
+    return "—"
+  }
+  const percentage = (status.estimated_input_tokens / status.max_input_tokens) * 100
+  return `${Math.round(percentage)}%`
+}
+
+function compactFeedbackText(result) {
+  const labels = {
+    compacted: "Compact 完成",
+    skipped: "Compact 跳过",
+    failed: "Compact 失败",
+  }
+  const label = labels[result?.status] || `Compact: ${result?.status || "unknown"}`
+  return result?.reason ? `${label}（${result.reason}）` : label
 }
 
 function handleHistoryNavigation() {
@@ -904,7 +1026,25 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
       <div class="splitter vertical" title="拖动调整 Workspace 宽度" @pointerdown="startResize('workspace', $event)" />
 
       <section class="panel agent-panel">
-        <div class="panel-heading agent-heading"><div><p class="eyebrow">AGENT</p><h2>Agent</h2><small>{{ currentSession ? sessionLabel(currentSession) : "" }} · {{ currentSession?.runtime_status || "stopped" }}</small></div></div>
+        <div class="panel-heading agent-heading"><div><p class="eyebrow">AGENT</p><h2>Agent</h2><small>{{ currentSession ? sessionLabel(currentSession) : "" }} · {{ currentSession?.runtime_status || "stopped" }}</small></div><div class="agent-heading-actions"><button class="secondary compact-button" :disabled="contextControlDisabled" @click="inspectContext">{{ controlInFlight === 'context_status' ? 'Loading…' : 'Context' }}</button><button class="compact-button" :disabled="contextControlDisabled" @click="compactContext">{{ controlInFlight === 'compact' ? 'Compacting…' : 'Compact' }}</button></div></div>
+        <section v-if="contextVisible" class="context-panel">
+          <div class="context-panel-heading"><strong>Context</strong><span>{{ contextUsageLabel(contextStatus) }} used</span></div>
+          <p v-if="compactFeedback" class="context-feedback">{{ compactFeedback }}</p>
+          <dl v-if="contextStatus" class="context-grid">
+            <div><dt>Estimated Input / Max Input</dt><dd>{{ formatContextTokens(contextStatus.estimated_input_tokens) }} / {{ formatContextTokens(contextStatus.max_input_tokens) }}</dd></div>
+            <div><dt>Context Window</dt><dd>{{ formatContextTokens(contextStatus.context_window_tokens) }}</dd></div>
+            <div><dt>Reserved Output</dt><dd>{{ formatContextTokens(contextStatus.reserved_output_tokens) }}</dd></div>
+            <div><dt>Safety Margin</dt><dd>{{ formatContextTokens(contextStatus.safety_margin_tokens) }}</dd></div>
+            <div><dt>Last Provider Prompt Tokens</dt><dd>{{ formatContextTokens(contextStatus.last_provider_prompt_tokens) }}</dd></div>
+            <div><dt>Message Count</dt><dd>{{ formatContextTokens(contextStatus.source_message_count) }} / {{ formatContextTokens(contextStatus.model_visible_message_count) }} visible</dd></div>
+            <div><dt>Memory Count / Tokens</dt><dd>{{ formatContextTokens(contextStatus.memory_entry_count) }} / {{ formatContextTokens(contextStatus.memory_estimated_tokens) }}</dd></div>
+            <div><dt>Compact Status</dt><dd>{{ contextStatus.compact_status || '—' }}</dd></div>
+            <div><dt>Compacted Message Count</dt><dd>{{ formatContextTokens(contextStatus.compact_covered_message_count) }}</dd></div>
+            <div><dt>Compressed Tool Result Count</dt><dd>{{ formatContextTokens(contextStatus.compressed_tool_result_count) }}</dd></div>
+            <div><dt>Estimate Source</dt><dd>{{ contextStatus.estimate_source || '—' }}</dd></div>
+          </dl>
+          <p v-else class="muted">正在加载 Context…</p>
+        </section>
         <div v-if="currentSession" ref="outputElement" class="console-history">
           <section v-for="group in executionGroups" :key="group.key" class="execution-group">
             <article v-if="group.user" class="console-card user-card"><strong>You</strong><pre>{{ group.user.content }}</pre></article>

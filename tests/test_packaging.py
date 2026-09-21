@@ -88,3 +88,14 @@ def test_build_scripts_accept_external_mycode_source() -> None:
         assert "mycode=" in script
         assert "../mycode-project" not in script
         assert "/opt/mycode" not in script
+
+
+def test_deploy_runs_sandbox_smoke_only_after_rebuild() -> None:
+    script = (ROOT / "scripts/deploy-server.sh").read_text(encoding="utf-8")
+    build = 'bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_IMAGE"'
+    smoke = 'python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_IMAGE"'
+    assert build in script
+    assert smoke in script
+    assert script.index(build) < script.index(smoke)
+    rebuild_block = script[script.index('if [ "$MYCODE_CHANGED"'):]
+    assert 'if [ "$MYCODE_CHANGED" -eq 1 ] || [ "$SANDBOX_DEF_CHANGED" -eq 1 ]; then' in rebuild_block
