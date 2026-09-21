@@ -94,7 +94,7 @@ def test_build_scripts_accept_external_mycode_source() -> None:
 def test_deploy_builds_smokes_and_promotes_a_sandbox_candidate() -> None:
     script = (ROOT / "scripts/deploy-server.sh").read_text(encoding="utf-8")
     build = 'bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_CANDIDATE_IMAGE"'
-    smoke = 'python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_CANDIDATE_IMAGE"'
+    smoke = '"$WEB_PYTHON" ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_CANDIDATE_IMAGE"'
     promote = 'docker tag "$SANDBOX_CANDIDATE_IMAGE" "$SANDBOX_IMAGE"'
     assert build in script
     assert smoke in script

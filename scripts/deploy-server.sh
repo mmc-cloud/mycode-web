@@ -12,6 +12,33 @@ NGINX_CONFIG_SOURCE="$WEB_DIR/deploy/nginx/mycode.conf"
 NGINX_CONFIG_TARGET="/etc/nginx/conf.d/mycode.conf"
 SANDBOX_IMAGE="${MYCODE_SANDBOX_IMAGE:-mycode-sandbox:dev}"
 SANDBOX_CANDIDATE_IMAGE=""
+WEB_VENV="/home/mycode/.venvs/mycode-web"
+WEB_PYTHON="$WEB_VENV/bin/python"
+WEB_UV="/home/mycode/.local/bin/uv"
+WEB_DEPENDENCIES_SYNCED=0
+
+sync_web_dependencies() {
+    if [ "$WEB_DEPENDENCIES_SYNCED" -eq 1 ]; then
+        return
+    fi
+    echo "==> Syncing Web backend dependencies"
+    runuser -u mycode -- sh -c "
+        cd '$WEB_DIR' &&
+        UV_PROJECT_ENVIRONMENT='$WEB_VENV' \
+        '$WEB_UV' sync --python 3.11
+    "
+    WEB_DEPENDENCIES_SYNCED=1
+}
+
+ensure_web_python() {
+    if [ ! -x "$WEB_PYTHON" ]; then
+        sync_web_dependencies
+    fi
+    if [ ! -x "$WEB_PYTHON" ]; then
+        echo "ERROR: Web Python is not executable: $WEB_PYTHON"
+        return 1
+    fi
+}
 
 cleanup_sandbox_candidate() {
     if [ -n "$SANDBOX_CANDIDATE_IMAGE" ]; then
@@ -62,6 +89,14 @@ git_in "$WEB_DIR" pull --ff-only
 
 MYCODE_NEW="$(git_in "$MYCODE_DIR" rev-parse HEAD)"
 WEB_NEW="$(git_in "$WEB_DIR" rev-parse HEAD)"
+
+if [ "$WEB_OLD" != "$WEB_NEW" ] && [ "${MYCODE_DEPLOY_REEXECUTED:-0}" != "1" ]; then
+    if [ -n "$(git_in "$WEB_DIR" diff --name-only "$WEB_OLD" "$WEB_NEW" -- scripts/deploy-server.sh)" ]; then
+        echo "==> Deployment script changed; restarting with updated script"
+        export MYCODE_DEPLOY_REEXECUTED=1
+        exec bash "$WEB_DIR/scripts/deploy-server.sh"
+    fi
+fi
 
 MYCODE_CHANGED=0
 WEB_CHANGED=0
@@ -180,8 +215,9 @@ if [ "$MYCODE_CHANGED" -eq 1 ] || [ "$SANDBOX_DEF_CHANGED" -eq 1 ]; then
     # The repository may store this script as 0644, so invoke it via bash
     # instead of relying on the executable bit.
     bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_CANDIDATE_IMAGE"
-    echo "==> Running Sandbox compatibility smoke"
-    python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_CANDIDATE_IMAGE"
+    ensure_web_python
+    echo "==> Running Sandbox compatibility smoke with $WEB_PYTHON"
+    "$WEB_PYTHON" ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_CANDIDATE_IMAGE"
     echo "==> Promoting Sandbox candidate image to $SANDBOX_IMAGE"
     docker tag "$SANDBOX_CANDIDATE_IMAGE" "$SANDBOX_IMAGE"
     cleanup_sandbox_candidate
@@ -191,12 +227,7 @@ fi
 
 # Only runtime-relevant Web changes require Web dependency/build work.
 if [ "$WEB_RUNTIME_CHANGED" -eq 1 ]; then
-    echo "==> Syncing Web backend dependencies"
-    runuser -u mycode -- sh -c "
-        cd '$WEB_DIR' &&
-        UV_PROJECT_ENVIRONMENT=/home/mycode/.venvs/mycode-web \
-        /home/mycode/.local/bin/uv sync --python 3.11
-    "
+    sync_web_dependencies
 
     echo "==> Building Vue frontend"
     docker run --rm \

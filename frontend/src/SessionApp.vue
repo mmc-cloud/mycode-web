@@ -417,6 +417,10 @@ function clearPendingInteractions() {
 function applyRuntimeStatus(data) {
   if (!currentSession.value) return
   currentSession.value.runtime_status = data.status
+  if (data.status !== "idle") {
+    contextStatus.value = null
+    compactFeedback.value = ""
+  }
   if (data.status === "error" || data.status === "stopped") {
     clearPendingInteractions()
     if (currentSession.value) currentSession.value.pending_control = null
