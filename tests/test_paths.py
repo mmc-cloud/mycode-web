@@ -112,6 +112,36 @@ def test_frontend_send_is_disabled_during_request_or_active_agent_turn() -> None
     ) in source
 
 
+def test_frontend_context_controls_are_enabled_only_for_idle_runtime() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    context_controls = source.split(
+        "const contextControlDisabled = computed(() =>", 1
+    )[1].split("const executionGroups", 1)[0]
+    assert 'if (!session) return true' in context_controls
+    assert 'if (session.runtime_status !== "idle") return true' in context_controls
+    assert 'if (controlInFlight.value) return true' in context_controls
+    assert 'if (session.pending_control) return true' in context_controls
+    assert 'if (session.active_turn_id) return true' in context_controls
+    assert 'if (permission.value) return true' in context_controls
+    assert 'if (pendingMcpTrust.value) return true' in context_controls
+    assert 'return false' in context_controls
+
+
+def test_frontend_clears_context_snapshot_after_accepted_turn() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
+    ).read_text(encoding="utf-8")
+
+    send_message = source.split("async function sendMessage()", 1)[1].split(
+        "async function inspectContext", 1
+    )[0]
+    assert "contextStatus.value = null" in send_message
+    assert 'compactFeedback.value = ""' in send_message
+
+
 def test_frontend_uses_session_bootstrap_cursor_for_sse() -> None:
     source = (
         Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"

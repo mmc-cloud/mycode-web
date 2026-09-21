@@ -2581,6 +2581,96 @@ def test_context_controls_are_serialized_and_projected(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_context_snapshot_invalidates_when_agent_turn_is_accepted(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), runtime_control_timeout_seconds=1)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+        context_request = asyncio.create_task(manager.get_context_status("session"))
+        for _ in range(50):
+            if manager.pending_control("session") == "context_status":
+                break
+            await asyncio.sleep(0)
+        await launcher.process.stdout.feed(
+            jsonl({"type": "context_status", **context_status_wire()})
+        )
+        assert await asyncio.wait_for(context_request, timeout=1) == context_status_wire()
+        assert manager.context_status("session") == context_status_wire()
+
+        assert await manager.send_message("session", "new turn") == "running"
+        assert manager.context_status("session") is None
+        await launcher.process.stdout.feed(FINISH_WIRE)
+        await wait_for_status(manager, "session", "idle")
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_context_snapshot_invalidates_when_turn_is_queued(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), sandbox_max_active=1)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+
+        assert await manager.send_message("busy", "first") == "running"
+        assert await manager.activate("queued") == "stopped"
+        manager._sessions["queued"].last_context_status = context_status_wire()
+
+        assert await manager.send_message("queued", "second") == "queued"
+        assert manager.context_status("queued") is None
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_rejected_turn_preserves_context_snapshot(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = replace(settings(tmp_path), runtime_control_timeout_seconds=1)
+        launcher = FakeLauncher()
+        manager = RuntimeManager(
+            config, WorkspaceService(config), EventHub(), launcher=launcher
+        )
+
+        await manager.activate("session")
+        await wait_for_status(manager, "session", "idle")
+        first_context = asyncio.create_task(manager.get_context_status("session"))
+        for _ in range(50):
+            if manager.pending_control("session") == "context_status":
+                break
+            await asyncio.sleep(0)
+        await launcher.process.stdout.feed(
+            jsonl({"type": "context_status", **context_status_wire()})
+        )
+        await asyncio.wait_for(first_context, timeout=1)
+        snapshot = manager.context_status("session")
+
+        second_context = asyncio.create_task(manager.get_context_status("session"))
+        for _ in range(50):
+            if manager.pending_control("session") == "context_status":
+                break
+            await asyncio.sleep(0)
+        with pytest.raises(RuntimeConflictError):
+            await manager.send_message("session", "rejected")
+        assert manager.context_status("session") == snapshot
+
+        await launcher.process.stdout.feed(
+            jsonl({"type": "context_status", **context_status_wire()})
+        )
+        await asyncio.wait_for(second_context, timeout=1)
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_context_controls_are_rejected_during_turn_permission_and_mcp_trust(
     tmp_path: Path,
 ) -> None:

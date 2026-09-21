@@ -11,6 +11,16 @@ HEALTH_URL="http://127.0.0.1:8000/web/api/health"
 NGINX_CONFIG_SOURCE="$WEB_DIR/deploy/nginx/mycode.conf"
 NGINX_CONFIG_TARGET="/etc/nginx/conf.d/mycode.conf"
 SANDBOX_IMAGE="${MYCODE_SANDBOX_IMAGE:-mycode-sandbox:dev}"
+SANDBOX_CANDIDATE_IMAGE=""
+
+cleanup_sandbox_candidate() {
+    if [ -n "$SANDBOX_CANDIDATE_IMAGE" ]; then
+        docker image rm -f "$SANDBOX_CANDIDATE_IMAGE" >/dev/null 2>&1 || true
+        SANDBOX_CANDIDATE_IMAGE=""
+    fi
+}
+
+trap cleanup_sandbox_candidate EXIT
 
 # CentOS 7 ships an old Git that does not support `git -C`.
 git_in() {
@@ -163,11 +173,18 @@ if [ "$MYCODE_CHANGED" -eq 1 ] || [ "$SANDBOX_DEF_CHANGED" -eq 1 ]; then
     echo "==> Rebuilding Sandbox image"
     cd "$WEB_DIR"
 
+    SANDBOX_REPOSITORY="${SANDBOX_IMAGE%:*}"
+    SANDBOX_CANDIDATE_IMAGE="${SANDBOX_REPOSITORY}:candidate-${MYCODE_NEW:0:12}-${WEB_NEW:0:12}-$$"
+    echo "==> Building Sandbox candidate image: $SANDBOX_CANDIDATE_IMAGE"
+
     # The repository may store this script as 0644, so invoke it via bash
     # instead of relying on the executable bit.
-    bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_IMAGE"
+    bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_CANDIDATE_IMAGE"
     echo "==> Running Sandbox compatibility smoke"
-    python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_IMAGE"
+    python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_CANDIDATE_IMAGE"
+    echo "==> Promoting Sandbox candidate image to $SANDBOX_IMAGE"
+    docker tag "$SANDBOX_CANDIDATE_IMAGE" "$SANDBOX_IMAGE"
+    cleanup_sandbox_candidate
 else
     echo "==> Sandbox image unchanged; skipping rebuild"
 fi

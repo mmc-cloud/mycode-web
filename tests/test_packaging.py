@@ -29,6 +29,7 @@ def test_gitignore_excludes_private_and_runtime_web_files() -> None:
         "data/",
         "frontend/node_modules/",
         "frontend/dist/",
+        "/.pnpm-store/",
         "**/__pycache__/",
         "**/*.pyc",
         "**/.pytest_cache/",
@@ -90,12 +91,23 @@ def test_build_scripts_accept_external_mycode_source() -> None:
         assert "/opt/mycode" not in script
 
 
-def test_deploy_runs_sandbox_smoke_only_after_rebuild() -> None:
+def test_deploy_builds_smokes_and_promotes_a_sandbox_candidate() -> None:
     script = (ROOT / "scripts/deploy-server.sh").read_text(encoding="utf-8")
-    build = 'bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_IMAGE"'
-    smoke = 'python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_IMAGE"'
+    build = 'bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_CANDIDATE_IMAGE"'
+    smoke = 'python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_CANDIDATE_IMAGE"'
+    promote = 'docker tag "$SANDBOX_CANDIDATE_IMAGE" "$SANDBOX_IMAGE"'
     assert build in script
     assert smoke in script
-    assert script.index(build) < script.index(smoke)
+    assert promote in script
+    assert 'trap cleanup_sandbox_candidate EXIT' in script
+    assert 'docker image rm -f "$SANDBOX_CANDIDATE_IMAGE" >/dev/null 2>&1 || true' in script
+    assert (
+        'SANDBOX_CANDIDATE_IMAGE="${SANDBOX_REPOSITORY}:candidate-'
+        '${MYCODE_NEW:0:12}-${WEB_NEW:0:12}-$$"'
+    ) in script
+    assert 'bash ./scripts/build-sandbox.sh ../mycode "$SANDBOX_IMAGE"' not in script
+    assert 'python3 ./scripts/smoke-sandbox-runtime.py --image "$SANDBOX_IMAGE"' not in script
     rebuild_block = script[script.index('if [ "$MYCODE_CHANGED"'):]
     assert 'if [ "$MYCODE_CHANGED" -eq 1 ] || [ "$SANDBOX_DEF_CHANGED" -eq 1 ]; then' in rebuild_block
+    assert rebuild_block.index(build) < rebuild_block.index(smoke) < rebuild_block.index(promote)
+    assert rebuild_block.index(promote) < rebuild_block.index("    cleanup_sandbox_candidate\n")

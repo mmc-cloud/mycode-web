@@ -18,6 +18,7 @@ data/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+/.pnpm-store/
 
 # Docs site
 docs-site/node_modules/

@@ -1,3 +1,4 @@
+import asyncio
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
@@ -41,3 +42,19 @@ def test_smoke_rejects_incomplete_or_failed_process(
 def test_smoke_rejects_invalid_jsonl() -> None:
     with pytest.raises(SMOKE.SmokeError, match="valid UTF-8 JSONL"):
         SMOKE.parse_smoke_jsonl([b"not-json\n"])
+
+
+def test_smoke_process_exit_timeout_has_clear_error() -> None:
+    class HangingProcess:
+        async def wait(self) -> int:
+            await asyncio.sleep(1)
+            return 0
+
+    async def scenario() -> None:
+        with pytest.raises(
+            SMOKE.SmokeError,
+            match="timed out waiting for process exit",
+        ):
+            await SMOKE._wait_for_process_exit(HangingProcess(), 0.001)
+
+    asyncio.run(scenario())

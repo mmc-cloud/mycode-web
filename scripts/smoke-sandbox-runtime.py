@@ -113,6 +113,17 @@ async def _remove_container(docker_command: str, container_name: str) -> None:
         pass
 
 
+async def _wait_for_process_exit(
+    process: asyncio.subprocess.Process, timeout: float
+) -> int:
+    try:
+        return await asyncio.wait_for(process.wait(), timeout)
+    except TimeoutError as error:
+        raise SmokeError(
+            "Sandbox smoke timed out waiting for process exit."
+        ) from error
+
+
 async def run_smoke(
     *,
     image: str,
@@ -226,7 +237,7 @@ async def run_smoke(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise SmokeError("Sandbox smoke timed out waiting for process exit.")
-            return_code = await asyncio.wait_for(process.wait(), remaining)
+            return_code = await _wait_for_process_exit(process, remaining)
             if stderr_task is not None:
                 captured_stderr = await stderr_task
             messages = parse_smoke_jsonl(captured_lines)

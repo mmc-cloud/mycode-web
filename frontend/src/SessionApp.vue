@@ -111,9 +111,14 @@ const sendDisabled = computed(() =>
 )
 const contextControlDisabled = computed(() => {
   const session = currentSession.value
-  if (!session || controlInFlight.value || permission.value || pendingMcpTrust.value) return true
+  if (!session) return true
+  if (session.runtime_status !== "idle") return true
+  if (controlInFlight.value) return true
   if (session.pending_control) return true
-  return ACTIVE_TURN_STATUSES.includes(session.runtime_status) || Boolean(session.active_turn_id)
+  if (session.active_turn_id) return true
+  if (permission.value) return true
+  if (pendingMcpTrust.value) return true
+  return false
 })
 const executionGroups = computed(() => buildExecutionGroups(
   consoleEvents.value,
@@ -618,6 +623,8 @@ async function sendMessage() {
     currentSession.value.runtime_status = result.status
     currentSession.value.active_turn_id = result.turn_id
     updateTurnStatus(result.turn_id, result.status)
+    contextStatus.value = null
+    compactFeedback.value = ""
     message.value = ""
   } catch (reason) {
     if (generation === token && currentSession.value?.id === sessionId) {
@@ -1043,7 +1050,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
             <div><dt>Compressed Tool Result Count</dt><dd>{{ formatContextTokens(contextStatus.compressed_tool_result_count) }}</dd></div>
             <div><dt>Estimate Source</dt><dd>{{ contextStatus.estimate_source || '—' }}</dd></div>
           </dl>
-          <p v-else class="muted">正在加载 Context…</p>
+          <p v-else class="muted">{{ controlInFlight ? '正在加载 Context…' : 'Context 已变化，请重新查询' }}</p>
         </section>
         <div v-if="currentSession" ref="outputElement" class="console-history">
           <section v-for="group in executionGroups" :key="group.key" class="execution-group">

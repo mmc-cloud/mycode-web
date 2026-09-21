@@ -663,6 +663,7 @@ class RuntimeManager:
                 pass
             elif state.status == "starting":
                 state.active_turn_id = turn_id
+                self._invalidate_context_snapshot_locked(state)
                 waiting_start_state = state
             elif state.status in {
                 "queued",
@@ -679,11 +680,13 @@ class RuntimeManager:
                 state.busy = True
                 state.ready.clear()
                 state.active_turn_id = turn_id
+                self._invalidate_context_snapshot_locked(state)
                 self._touch(session_id, state)
                 reuse_state = state
             elif waiting_start_state is None and self._can_start_locked(session_id):
                 self._prepare_start_locked(session_id, state)
                 state.active_turn_id = turn_id
+                self._invalidate_context_snapshot_locked(state)
                 start_state = state
             elif waiting_start_state is None:
                 victim = self._oldest_evictable_idle_locked(session_id)
@@ -699,6 +702,7 @@ class RuntimeManager:
                     victim = (victim_id, victim_state, victim_generation)
                     self._prepare_start_locked(session_id, state)
                     state.active_turn_id = turn_id
+                    self._invalidate_context_snapshot_locked(state)
                     start_state = state
                 if victim is None:
                     if len(self._queue) >= self.settings.sandbox_queue_max:
@@ -706,6 +710,7 @@ class RuntimeManager:
                     self._set_status_locked(state, "queued")
                     state.busy = False
                     state.active_turn_id = turn_id
+                    self._invalidate_context_snapshot_locked(state)
                     self._touch(session_id, state)
                     self._queue.append(
                         _QueuedTurn(
@@ -2055,6 +2060,11 @@ class RuntimeManager:
             errors.append(error)
             logger.exception("Sandbox process wait() failed after kill()")
         return errors
+
+    @staticmethod
+    def _invalidate_context_snapshot_locked(state: _RuntimeSession) -> None:
+        """Context status is valid only until the next accepted Agent turn."""
+        state.last_context_status = None
 
     def _prepare_start_locked(
         self, session_id: str, state: _RuntimeSession
