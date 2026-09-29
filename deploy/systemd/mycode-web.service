@@ -1,0 +1,21 @@
+[Unit]
+Description=MyCode Web FastAPI
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=mycode
+Group=mycode
+SupplementaryGroups=docker
+
+WorkingDirectory=/opt/mycode-web
+EnvironmentFile=/opt/mycode-web/.env
+
+ExecStart=/home/mycode/.venvs/mycode-web/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
