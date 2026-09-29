@@ -37,22 +37,27 @@
     systemctl is-active docker nginx mycode-web mycode-certbot-renew.timer
     curl -fsS https://mycode.icu/web/api/health
 
-为了得到一致的 SQLite / Session 数据，备份前停止 MyCode Web；如果备份 Syncthing，也同时停止容器：
+先做 dry-run，确认脚本找到的状态目录符合预期；这一步不会停止服务：
 
-    systemctl stop mycode-web
-    docker stop syncthing 2>/dev/null || true
+    cd /opt/mycode-web
+    bash ./scripts/backup-server.sh --dry-run
 
-    STAMP="$(date +%Y%m%d-%H%M%S)"
-    tar -C / -czpf "/root/mycode-server-backup-$STAMP.tar.gz" \
-      opt/mycode-web/.env \
-      opt/mycode-web/data \
-      etc/letsencrypt \
-      home/syncthing_data
+正式备份：
 
-    sha256sum "/root/mycode-server-backup-$STAMP.tar.gz"
+    bash ./scripts/backup-server.sh
 
-    systemctl start mycode-web
-    docker start syncthing 2>/dev/null || true
+脚本会：
+
+- 强制要求 root 执行，并要求 `/opt/mycode-web/.env` 与 `/opt/mycode-web/data` 存在。
+- 自动包含 Let's Encrypt 与 Syncthing 数据（目录存在时）。
+- 只在原本处于运行状态时停止 MyCode Web / Syncthing，生成一致的 SQLite、Session 与 Syncthing 快照。
+- 无论备份成功或失败，都尝试恢复备份前处于运行状态的服务。
+- 在 `/root` 生成 `mycode-server-backup-YYYYMMDD-HHMMSS.tar.gz` 和对应的 `.sha256` 文件。
+- 以私有权限创建备份，并输出文件大小、SHA256 和包含路径。
+
+如需写到其他磁盘：
+
+    bash ./scripts/backup-server.sh --output-dir /path/to/private-backups
 
 备份包含 API Key、证书私钥和业务数据，按敏感文件处理，不上传到公开仓库。
 
@@ -85,7 +90,8 @@ bootstrap 会完成：
 
 把备份传到新服务器后，以 root 解压：
 
-    tar -C / -xzpf /root/mycode-server-backup-YYYYMMDD-HHMMSS.tar.gz
+    sha256sum -c /root/mycode-server-backup-YYYYMMDD-HHMMSS.tar.gz.sha256
+    tar --numeric-owner -C / -xzpf /root/mycode-server-backup-YYYYMMDD-HHMMSS.tar.gz
 
     chown mycode:mycode /opt/mycode-web/.env
     chmod 0600 /opt/mycode-web/.env
