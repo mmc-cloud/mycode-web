@@ -1,0 +1,15 @@
+[Unit]
+Description=Renew MyCode Let's Encrypt certificate with Docker Certbot
+After=docker.service nginx.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker run --rm \
+-v /etc/letsencrypt:/etc/letsencrypt \
+-v /var/lib/letsencrypt:/var/lib/letsencrypt \
+-v /var/log/letsencrypt:/var/log/letsencrypt \
+-v /var/www/certbot:/var/www/certbot \
+certbot/certbot:latest renew --quiet
+ExecStartPost=/usr/sbin/nginx -t
+ExecStartPost=/usr/bin/systemctl reload nginx
