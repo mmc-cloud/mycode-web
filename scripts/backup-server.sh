@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 BACKUP_DIR="${BACKUP_DIR:-/root}"
 WEB_SERVICE="${WEB_SERVICE:-mycode-web}"
@@ -103,7 +104,9 @@ restore_services() {
 
     return "$rc"
 }
-trap restore_services EXIT INT TERM
+trap restore_services EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if systemctl is-active --quiet "$WEB_SERVICE"; then
     web_was_active=1
