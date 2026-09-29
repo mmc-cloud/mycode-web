@@ -1,4 +1,4 @@
-# MCP
+# MCP/Skill
 
 MyCode 通过 MCP（Model Context Protocol）接入外部工具与数据源，从而在不修改 Agent 自身的前提下扩展可用能力。
 

@@ -32,20 +32,20 @@ export default withMermaid(defineConfig({
         text: '开始',
         items: [
           { text: '文档首页', link: '/' },
-          { text: '快速开始', link: '/getting-started/' }
+          { text: '快速开始', link: '/00-getting-started/' }
         ]
       },
       {
         text: '项目拆解',
         items: [
-          { text: '项目总览', link: '/overview/' },
-          { text: 'Agent 与 Runtime', link: '/agent/' },
-          { text: 'Tool 系统', link: '/tools/' },
-          { text: 'Context / Memory', link: '/context/' },
-          { text: 'SubAgent / Session', link: '/subagent/' },
-          { text: 'MCP', link: '/mcp/' },
-          { text: 'Evaluation / Harbor', link: '/evaluation/' },
-          { text: 'MyCode 演进与设计取舍', link: '/evolution/' }
+          { text: '项目总览', link: '/01-overview/' },
+          { text: 'Agent 与 Runtime', link: '/02-agent/' },
+          { text: 'Tool 系统', link: '/03-tools/' },
+          { text: 'Context / Memory / Session', link: '/04-context/' },
+          { text: 'SubAgent ', link: '/05-subagent/' },
+          { text: 'MCP/Skill', link: '/06-mcp-skill/' },
+          { text: 'Evaluation / Harbor', link: '/07-evaluation/' },
+          { text: 'MyCode 演进与设计取舍', link: '/08-evolution/' }
         ]
       }
     ],
