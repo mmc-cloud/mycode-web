@@ -29,6 +29,10 @@ defineEmits(["open", "delete", "toggle"])
         <button class="file-button" :title="entry.path" :class="{ selected: selected === entry.path }" :aria-pressed="selected === entry.path" @click="$emit('open', entry.path)"><svg class="tree-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h9l5 5v13H5z M14 3v6h5 M8 13h8 M8 17h6" /></svg><span class="entry-name">{{ entry.name }}</span><small>{{ entry.size }} B</small></button>
         <button class="tree-delete" title="删除文件" :aria-label="`删除文件 ${entry.name}`" @click="$emit('delete', entry)">×</button>
       </div>
+      <span v-else-if="entry.kind === 'symlink'" class="link-entry" title="符号链接：出于安全考虑，不支持预览目标">
+        <svg class="tree-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></svg>
+        <span class="entry-name">{{ entry.name }}</span><small>符号链接</small>
+      </span>
       <span v-else class="unsafe-entry">⛔ {{ entry.name }}</span>
     </li>
   </ul>

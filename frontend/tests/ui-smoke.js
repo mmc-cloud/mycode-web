@@ -24,6 +24,7 @@ async (page) => {
   let holdContext = false
   let releaseContext = null
   const heldContents = new Map()
+  const permissionFixtures = new Map()
   const contextFixture = { estimated_input_tokens: 1000, max_input_tokens: 10000, context_window_tokens: 12000, source_message_count: 4, model_visible_message_count: 4 }
   const waitForFixture = async (ready) => {
     const deadline = Date.now() + 5000
@@ -63,7 +64,7 @@ async (page) => {
   }
   const requests = []
   const longFileName = 'long_filename_'.repeat(35) + '.md'
-  const fileEntries = [{ name: 'README.md', path: 'README.md', kind: 'file', size: 20 }, { name: 'src', path: 'src', kind: 'directory', children: [{ name: 'index.js', path: 'src/index.js', kind: 'file', size: 40 }, { name: longFileName, path: 'src/' + longFileName, kind: 'file', size: 60 }] }]
+  const fileEntries = [{ name: 'README.md', path: 'README.md', kind: 'file', size: 20 }, { name: 'src', path: 'src', kind: 'directory', children: [{ name: 'index.js', path: 'src/index.js', kind: 'file', size: 40 }, { name: longFileName, path: 'src/' + longFileName, kind: 'file', size: 60 }] }, { name: 'npm', path: 'npm', kind: 'symlink' }]
   await page.route('**/web/api/**', async (route) => {
     const url = new URL(route.request().url())
     const path = url.pathname.replace('/web/api', '')
@@ -121,7 +122,16 @@ async (page) => {
         }
         data = { status: 'running', turn_id: 'stream-turn' }
       }
-      else if (suffix === '/permission' || suffix === '/mcp-trust') data = { ok: true }
+      else if (suffix === '/permission') {
+        const requestId = JSON.parse(route.request().postData()).request_id
+        const fixture = permissionFixtures.get(id + ':' + requestId)
+        if (fixture?.hold) await new Promise((resolve) => { fixture.release = resolve })
+        if (fixture?.status) {
+          await route.fulfill({ status: fixture.status, contentType: 'application/json', body: JSON.stringify({ detail: '权限提交失败测试' }) }); return
+        }
+        data = { ok: true }
+      }
+      else if (suffix === '/mcp-trust') data = { ok: true }
       else if (suffix === '/context-status') {
         if (holdContext) await new Promise((resolve) => { releaseContext = resolve })
         if (failContext) {
@@ -262,6 +272,7 @@ async (page) => {
   await showSidebar('Workspace')
   check(await page.locator('.preview, .workspace-splitter').count() === 0 && await page.locator('.tree-pane').evaluate((el) => Math.abs(el.getBoundingClientRect().height - el.parentElement.getBoundingClientRect().height) < 1), '未选文件时无预览及分割条，文件树占满高度')
   check(await page.locator('.file-tree > li > details').first().evaluate((el) => !el.open), '目录默认折叠')
+  check(await page.locator('.link-entry').count() === 1 && (await page.locator('.link-entry').innerText()).includes('符号链接') && await page.locator('.link-entry button, .link-entry a').count() === 0, '符号链接用链接标识且不提供预览入口')
   await page.locator('.file-button').filter({ hasText: 'README.md' }).click()
   await page.waitForFunction(() => document.querySelector('.preview pre')?.textContent === '# workspace preview')
   check(await page.locator('.preview pre').innerText() === '# workspace preview', 'Workspace 文件预览')
@@ -914,7 +925,7 @@ async (page) => {
   await page.waitForFunction(() => document.querySelector('.permission-step[data-status="waiting"]'))
   check(await page.locator('.context-panel').count() === 0 && await page.locator('.agent-heading-actions button:disabled').count() === 2, 'Permission 到达关闭 Context，保持 Context 与 Compact 禁用规则')
   check(await page.locator('.permission-step').isVisible() && await page.getByRole('button', { name: '仅本次', exact: true }).isVisible(), '等待权限及操作按钮保持可见')
-  check((await page.locator('.permission-step p').textContent()).includes('**plain text**') && await page.locator('.permission-step strong').count() === 0, '权限内容保持纯文本')
+  check((await page.locator('.permission-step p:not(.permission-target)').textContent()).includes('**plain text**') && await page.locator('.permission-step strong').count() === 0, '权限内容保持纯文本')
   await page.getByRole('button', { name: '仅本次', exact: true }).click()
   check(requests.some((request) => request.path.endsWith('/permission') && JSON.parse(request.body).decision === 'once'), 'Permission 确认 API 参数保留')
   await emit('permission_resolved', { turn_id: 'permission-turn', request_id: 'permission-1' })
@@ -1014,6 +1025,312 @@ async (page) => {
   await page.getByRole('dialog', { name: '删除会话？', exact: true }).getByRole('button', { name: '删除会话', exact: true }).click()
   await page.getByRole('heading', { name: '实现完成', exact: true }).waitFor()
   check(await page.evaluate(() => new URL(location.href).searchParams.get('session')) === 'ui-alpha' && await renamedEntry.count() === 0, 'Session 删除后切回存量会话并恢复历史')
+  // Batch 3: chronological execution records, conservative correlation and folds.
+  const thirdEvents = []
+  const toolEvent = (id, turn, type, payload) => ({ id, kind: 'tool', content: type, data: { turn_id: turn, event_type: type, event: { type, ...payload } } })
+  const thirdEmit = async (event) => { thirdEvents.push(event); await emit('console_event', event) }
+  const turnGroup = (turn) => page.locator('.execution-group').filter({ has: page.locator('#execution-' + turn) })
+  const thirdCall = (id, turn, callId, name = 'read_file', args = { path: 'README.md' }) => toolEvent(id, turn, 'tool_call', { tool_call: { ...(callId ? { id: callId } : {}), name, arguments: args } })
+  const thirdResult = (id, turn, callId, ok, extra = {}) => toolEvent(id, turn, 'tool_result', { tool_result: { ...(callId ? { tool_call_id: callId } : {}), ok, content: 'available output', ...extra } })
+  await emit('runtime_status', { status: 'running', turn_id: 'third-success' })
+  await thirdEmit(thirdCall(100, 'third-success', 'call-read'))
+  const successGroup = turnGroup('third-success')
+  check(await successGroup.locator('.execution-header').getAttribute('aria-expanded') === 'true' && await successGroup.locator('.execution-step[data-status="running"]').isVisible(), '第三批：新执行自动展开且 Call 只显示运行图标')
+  await thirdEmit(thirdResult(101, 'third-success', 'call-read', true, { content: '<img src=x onerror="window.__toolXss=1"> **literal**' }))
+  check(await successGroup.locator('.execution-step').count() === 1 && (await successGroup.locator('.execution-header').innerText()).includes('2 steps'), '第三批：明确 ID 合并 Call/Result，摘要仍计算两个原始步骤')
+  check(await successGroup.locator('.execution-step .step-icon').innerText() === '✓' && (await successGroup.locator('.step-target').innerText()) === 'README.md', '第三批：仅 ok true 显示成功，可靠目标显示在摘要')
+  await successGroup.locator('.execution-step > summary').click()
+  check((await successGroup.locator('.step-details').innerText()).includes('Arguments') && (await successGroup.locator('.step-details').innerText()).includes('Result'), '第三批：参数与结果在同一条工具详情内')
+  check(await successGroup.locator('img, script').count() === 0 && (await successGroup.locator('.step-details').innerText()).includes('**literal**') && !await page.evaluate(() => window.__toolXss), '第三批：工具 HTML、JSON 和日志以纯文本展示，无 XSS')
+  await emit('console_event', { ...thirdEvents[1], id: 9000, console_id: 101 })
+  check(await successGroup.locator('.execution-step').count() === 1 && (await successGroup.locator('.execution-header').innerText()).includes('2 steps'), '第三批：console_id 重放更新同一条步骤，不重复计数')
+  await emit('runtime_status', { status: 'idle', turn_id: 'third-success' })
+  check(await successGroup.locator('.execution-header').getAttribute('aria-expanded') === 'false', '第三批：正常结束默认收起，不保留自动展开状态')
+  await successGroup.locator('.execution-header').click()
+  await emit('runtime_status', { status: 'idle', turn_id: 'third-success' })
+  check(await successGroup.locator('.execution-header').getAttribute('aria-expanded') === 'true', '第三批：完成后用户手动展开不被 SSE idle 覆盖')
+
+  await emit('runtime_status', { status: 'running', turn_id: 'third-order' })
+  await thirdEmit(thirdCall(102, 'third-order', 'first'))
+  await thirdEmit(toolEvent(103, 'third-order', 'progress', { content: '真实运行进度' }))
+  await thirdEmit(thirdCall(104, 'third-order', 'second', 'run_command', { command: 'pytest' }))
+  await thirdEmit(thirdResult(105, 'third-order', 'second', false, { error: 'actual command failure <script>plain</script>' }))
+  await thirdEmit(thirdResult(106, 'third-order', 'first', true))
+  const orderGroup = turnGroup('third-order')
+  check(JSON.stringify(await orderGroup.locator('.execution-content > [data-event-id]').evaluateAll((rows) => rows.map((row) => row.dataset.eventId))) === JSON.stringify(['event-102', 'event-103', 'event-104']), '第三批：明确 ID 的交错结果合并，记录按调用和运行事件的原始顺序展示')
+  check(await orderGroup.locator('[data-event-id="event-104"]').getAttribute('open') !== null && (await orderGroup.locator('.step-error').innerText()).includes('actual command failure'), '第三批：失败工具详情自动展开并显示实际原因')
+  check(await orderGroup.locator('.execution-header').getAttribute('data-status') === 'running', '第三批：工具失败不将运行中的 Turn 标记成 Error')
+  await orderGroup.locator('[data-event-id="event-104"] > summary').click()
+  await thirdEmit(toolEvent(107, 'third-order', 'model_retry', { content: '模型正在重试' }))
+  check(await orderGroup.locator('[data-event-id="event-104"]').getAttribute('open') === null, '第三批：工具详情手动收起后不被后续 SSE 打开')
+  await orderGroup.locator('.execution-header').click()
+  await thirdEmit(toolEvent(108, 'third-order', 'artifact_warning', { content: '结果文件不可用' }))
+  check(await orderGroup.locator('.execution-header').getAttribute('aria-expanded') === 'false', '第三批：执行中手动折叠不被新运行事件改变')
+  await emit('runtime_status', { status: 'idle', turn_id: 'third-order' })
+  check(await orderGroup.locator('.execution-header').getAttribute('aria-expanded') === 'false' && (await orderGroup.locator('.execution-header').innerText()).includes('Completed · 有工具失败'), '第三批：完成和工具失败独立显示，保留用户折叠偏好')
+  await orderGroup.locator('.execution-header').click()
+  check((await orderGroup.locator('.runtime-preview').first().innerText()).includes('真实运行进度'), '第三批：运行提示默认显示简短实际信息，完整内容留在详情')
+  check(await orderGroup.locator('.runtime-step').count() === 3 && (await orderGroup.locator('.execution-header').innerText()).includes('7 steps'), '第三批：progress、model_retry、artifact_warning 保留为轻量事件且计数正确')
+
+  await thirdEmit(thirdCall(109, 'third-adjacent', 'legacy-id'))
+  await thirdEmit(thirdResult(110, 'third-adjacent', null, true))
+  const adjacentGroup = turnGroup('third-adjacent')
+  await adjacentGroup.locator('.execution-header').click()
+  check(await adjacentGroup.locator('.execution-step').count() === 1 && await adjacentGroup.locator('.execution-step').getAttribute('data-status') === 'success', '第三批：现有无结果 ID 协议仅在相邻唯一调用时保守合并')
+  for (const fixture of [
+    ['third-batch', [thirdCall(111, 'third-batch', 'a'), thirdCall(112, 'third-batch', 'b'), thirdResult(113, 'third-batch', null, true), thirdResult(114, 'third-batch', null, false)]],
+    ['third-gap', [thirdCall(115, 'third-gap', 'gap'), thirdResult(117, 'third-gap', null, true)]],
+    ['third-interleaved', [thirdCall(118, 'third-interleaved', 'cross'), toolEvent(119, 'third-interleaved', 'context', { content: '输入上下文' }), thirdResult(120, 'third-interleaved', null, true)]],
+    ['third-missing', [thirdCall(121, 'third-missing', 'missing')]],
+    ['third-unknown', [thirdResult(122, 'third-unknown', null, 'true', { content: 'All tests passed' })]],
+  ]) {
+    for (const event of fixture[1]) await thirdEmit(event)
+    const current = turnGroup(fixture[0])
+    await current.locator('.execution-header').click()
+    check(await current.locator('.execution-step').count() === fixture[1].length, '第三批：' + fixture[0] + ' 不错误关联')
+    check(await current.locator('.execution-step[data-status="unknown"]').count() >= 1, '第三批：' + fixture[0] + ' 存在中性未知状态，不根据自然语言猜成功')
+  }
+  await thirdEmit(thirdCall(123, 'third-failed', 'fail'))
+  await thirdEmit(thirdResult(124, 'third-failed', 'fail', false, { error: 'explicit failure' }))
+  check(await turnGroup('third-failed').locator('.execution-header').getAttribute('aria-expanded') === 'true' && await turnGroup('third-failed').locator('.step-error').isVisible(), '第三批：工具失败默认展开相关错误，历史 Turn 仍为 Completed')
+  await thirdEmit({ id: 125, kind: 'error', content: 'Runtime stopped unexpectedly <img onerror=alert(1)>', data: { turn_id: 'third-runtime' } })
+  check(await turnGroup('third-runtime').locator('.execution-header').getAttribute('data-status') === 'error' && await turnGroup('third-runtime').locator('.error-card').isVisible(), '第三批：真实 Runtime 错误独立标记 Error 并展开')
+
+  await emit('runtime_status', { status: 'running', turn_id: 'third-permission' })
+  await thirdEmit(thirdCall(126, 'third-permission', 'write', 'write_file'))
+  const permissionGroup = turnGroup('third-permission')
+  await permissionGroup.locator('.execution-header').click()
+  const pendingThird = { turn_id: 'third-permission', request_id: 'third-p', tool_name: 'write_file', target: 'README.md', prompt: '需要写入权限 <b>纯文本</b>' }
+  await emit('permission_request', pendingThird)
+  check(await permissionGroup.locator('.execution-header').getAttribute('aria-expanded') === 'false' && await permissionGroup.getByRole('button', { name: '当前任务', exact: true }).isVisible(), '第三批：新权限出现在手动折叠区域外，按钮仍可操作')
+  await thirdEmit({ id: 127, kind: 'permission', content: 'write_file: write · README.md', data: pendingThird })
+  await emit('console_event', thirdEvents.at(-1))
+  check(await permissionGroup.locator('.permission-actions').count() === 1 && await permissionGroup.locator('.permission-step').count() === 1, '第三批：权限请求从 pending 到持久事件及重放只显示一套按钮')
+  check(await permissionGroup.locator('.permission-step').getAttribute('data-status') === 'waiting' && (await permissionGroup.locator('.permission-target').innerText()).includes('write_file · README.md'), '第三批：权限卡展示实际工具及目标')
+  for (const decision of ['deny', 'once', 'task', 'session']) {
+    const scopedRequest = { ...pendingThird, request_id: 'scope-' + decision }
+    await emit('permission_request', scopedRequest)
+    const buttonText = { deny: '拒绝', once: '仅本次', task: '当前任务', session: '当前会话' }[decision]
+    await permissionGroup.getByRole('button', { name: buttonText, exact: true }).click()
+    await page.waitForFunction(() => document.querySelector('.permission-feedback')?.textContent.includes('已提交'))
+    check(requests.some((request) => request.path.endsWith('/permission') && JSON.parse(request.body).request_id === scopedRequest.request_id && JSON.parse(request.body).decision === decision), '第三批：' + decision + ' 权限作用域及 request_id 参数保持')
+    await emit('permission_resolved', { ...scopedRequest, decision })
+  }
+  await emit('permission_request', pendingThird)
+  await thirdEmit({ id: 128, kind: 'permission', content: '已允许（当前任务）', data: { ...pendingThird, decision: 'task', allowed: true } })
+  await emit('permission_resolved', { ...pendingThird, decision: 'task' })
+  check(await permissionGroup.locator('.permission-actions').count() === 0 && await permissionGroup.locator('.execution-header').getAttribute('aria-expanded') === 'false', '第三批：权限已解决后移除按钮，不改变用户折叠')
+  await permissionGroup.locator('.execution-header').click()
+  await thirdEmit(thirdResult(129, 'third-permission', 'write', true))
+  check(JSON.stringify(await permissionGroup.locator('.execution-content > [data-event-id]').evaluateAll((rows) => rows.map((row) => row.dataset.eventId))) === JSON.stringify(['event-126', 'event-127', 'event-128']), '第三批：请求与批准各保留真实事件位置，Call/Result 可靠合并')
+  check(await permissionGroup.locator('.permission-step[data-status="allowed"]').count() === 2 && (await permissionGroup.locator('.execution-header').innerText()).includes('3 steps'), '第三批：权限状态正确更新，生命周期计一个步骤')
+  await emit('runtime_status', { status: 'idle', turn_id: 'third-permission' })
+  check(await permissionGroup.locator('.execution-header').getAttribute('aria-expanded') === 'true', '第三批：用户展开的执行过程在完成后仍展开')
+
+  const thirdSnapshot = () => page.evaluate(() => [...document.querySelectorAll('.execution-group')].filter((group) => group.querySelector('[id^="execution-third-"]')).map((group) => ({ summary: group.querySelector('.execution-header > span:last-child').textContent.trim(), status: group.querySelector('.execution-header').dataset.status, rows: [...group.querySelectorAll('.execution-content > [data-event-id]')].map((row) => ({ id: row.dataset.eventId, status: row.dataset.status })) })))
+  const beforeThirdReload = await thirdSnapshot()
+  histories['ui-alpha'].push(...thirdEvents)
+  await page.reload()
+  await turnGroup('third-permission').waitFor()
+  check(JSON.stringify(await thirdSnapshot()) === JSON.stringify(beforeThirdReload), '第三批：历史重载与 SSE 时间线顺序、状态、计数一致')
+  for (const viewport of [{ width: 900, height: 720 }, { width: 1440, height: 1000 }, { width: 1920, height: 1080 }]) {
+    await page.setViewportSize(viewport)
+    const resizedPermission = turnGroup('third-permission')
+    if (await resizedPermission.locator('.execution-header').getAttribute('aria-expanded') === 'false') await resizedPermission.locator('.execution-header').click()
+    check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth && document.querySelector('.console-history').scrollWidth <= document.querySelector('.console-history').clientWidth + 1), '第三批：' + viewport.width + '×' + viewport.height + ' 时间线详情不撑破工作台')
+    assertWorkbench(await workbenchGeometry(), '第三批：' + viewport.width + '×' + viewport.height + ' 原工作台布局保持')
+  }
+  await turnGroup('third-permission').scrollIntoViewIfNeeded()
+  await page.screenshot({ path: 'output/playwright/mycode-ui-third-timeline.png' })
+  // Review fixes: messages remain outside folds and retain their event positions.
+  const reviewEvents = []
+  const reviewEmit = async (event) => { reviewEvents.push(event); await emit('console_event', event) }
+  const reviewMessage = (id, turn, kind, content) => ({ id, kind, content, data: { turn_id: turn } })
+  const visualOrder = (group) => group.evaluate((element) => [...element.children].filter((child) => child.matches('.chat-message, .execution-header')).map((child) => child.matches('.execution-header') ? 'execution' : (child.classList.contains('chat-message-user') ? 'user:' : 'assistant:') + child.dataset.eventId))
+  await emit('runtime_status', { status: 'running', turn_id: 'review-order' })
+  await reviewEmit(reviewMessage(200, 'review-order', 'user', '检查 README.md'))
+  await reviewEmit(reviewMessage(201, 'review-order', 'assistant', '## 先读取文件\n\n我先读取文件内容。'))
+  await reviewEmit(thirdCall(202, 'review-order', 'review-read'))
+  await reviewEmit(thirdResult(203, 'review-order', 'review-read', true))
+  await reviewEmit(reviewMessage(204, 'review-order', 'assistant', '## 第一段完成\n\n检查完成，继续执行命令。'))
+  const reviewOrder = turnGroup('review-order')
+  check(JSON.stringify(await visualOrder(reviewOrder)) === JSON.stringify(['user:200', 'assistant:201', 'execution', 'assistant:204']), '审查修复：Assistant → Tool → Assistant 按真实事件顺序显示')
+  await reviewOrder.locator('.execution-header').first().click()
+  await reviewEmit(thirdCall(205, 'review-order', 'review-command', 'run_command', { command: 'pytest' }))
+  await reviewEmit(thirdResult(206, 'review-order', 'review-command', true))
+  await reviewEmit(reviewMessage(207, 'review-order', 'assistant', '## 多段执行完成\n\n两段工具操作均有真实结果。'))
+  check(JSON.stringify(await visualOrder(reviewOrder)) === JSON.stringify(['user:200', 'assistant:201', 'execution', 'assistant:204', 'execution', 'assistant:207']), '审查修复：同一 Turn 多段工具与 Assistant 正确交替，结果合并不重复')
+  check(await reviewOrder.locator('.execution-header').first().getAttribute('aria-expanded') === 'false' && await reviewOrder.locator('.execution-header').nth(1).getAttribute('aria-expanded') === 'true', '审查修复：新增执行区块默认展开，保留前一区块手动折叠')
+  check((await reviewOrder.locator('.execution-header').first().innerText()).includes('4 steps') && (await reviewOrder.locator('.execution-header').first().innerText()).includes('本段 2 steps') && (await reviewOrder.locator('.execution-header').nth(1).innerText()).includes('2 steps') && (await reviewOrder.locator('.execution-header').nth(1).innerText()).includes('同一轮执行'), '审查修复：全 Turn 摘要只出现一次，后续区块使用局部步骤及同一轮标记')
+  await reviewOrder.locator('.execution-header').nth(1).click()
+  for (const title of ['先读取文件', '第一段完成', '多段执行完成']) check(await reviewOrder.getByRole('heading', { name: title, exact: true }).isVisible(), '审查修复：折叠全部工具仍可阅读 ' + title)
+  await emit('console_event', reviewEvents[2])
+  await emit('console_event', reviewEvents[4])
+  check(await reviewOrder.locator('.execution-step').count() === 2 && await reviewOrder.locator('.chat-message-assistant').count() === 3, '审查修复：SSE 重放 Call/Assistant 不重复且不改变顺序')
+  await emit('console_live', { active: true, kind: 'assistant', turn_id: 'review-order', content: '## 顺序流式回复\n\n正式落盘之前的回答。' })
+  await reviewOrder.getByRole('heading', { name: '顺序流式回复', exact: true }).waitFor()
+  check(await reviewOrder.locator('.chat-message-assistant[aria-busy="true"]').isVisible() && (await visualOrder(reviewOrder)).at(-1) === 'assistant:undefined', '审查修复：流式回复在末尾，工具折叠不会隐藏它')
+  await reviewEmit(reviewMessage(208, 'review-order', 'assistant', '## 顺序流式回复\n\n正式落盘之前的回答。'))
+  await emit('runtime_status', { status: 'idle', turn_id: 'review-order' })
+  check(await reviewOrder.getByRole('heading', { name: '顺序流式回复', exact: true }).count() === 1 && await reviewOrder.locator('.chat-message-assistant[aria-busy="true"]').count() === 0, '审查修复：流式转正式消息去重，位置保持在执行区块之后')
+  check(await reviewOrder.locator('.execution-header[aria-expanded="false"]').count() === 2, '审查修复：多区块手动折叠在完成后的状态更新中保持')
+  await reviewEmit(reviewMessage(210, 'review-cross', 'assistant', '## 跨消息关联前\n\n先执行一次工具。'))
+  await reviewEmit(thirdCall(211, 'review-cross', 'review-cross-call'))
+  await reviewEmit(reviewMessage(212, 'review-cross', 'assistant', '## 跨消息关联中\n\n结果稍后到达。'))
+  await reviewEmit(thirdResult(213, 'review-cross', 'review-cross-call', true))
+  await reviewEmit(thirdCall(214, 'review-cross', 'review-adjacent'))
+  await reviewEmit(thirdResult(215, 'review-cross', null, true))
+  await reviewEmit(reviewMessage(216, 'review-cross', 'assistant', '## 跨消息关联后\n\n两种关联规则均保留。'))
+  const crossGroup = turnGroup('review-cross')
+  check(JSON.stringify(await visualOrder(crossGroup)) === JSON.stringify(['assistant:210', 'execution', 'assistant:212', 'execution', 'assistant:216']) && await crossGroup.locator('.execution-step').count() === 2, '审查修复：跨 Assistant 的可靠 Result 仍锚定 Call，无 ID 的相邻关联保持')
+  check(await crossGroup.locator('[data-event-id="event-211"]').getAttribute('data-status') === 'success' && await crossGroup.locator('[data-event-id="event-213"]').count() === 0, '审查修复：跨区块关联更新调用状态，不另行显示结果')
+  await reviewEmit(thirdCall(220, 'review-unsafe', 'review-unmatched'))
+  await reviewEmit(reviewMessage(221, 'review-unsafe', 'assistant', '中间真实文本'))
+  await reviewEmit(thirdResult(222, 'review-unsafe', null, true))
+  await reviewEmit(reviewMessage(223, 'review-unsafe', 'assistant', '未强制匹配的最终文本'))
+  check(JSON.stringify(await visualOrder(turnGroup('review-unsafe'))) === JSON.stringify(['execution', 'assistant:221', 'execution', 'assistant:223']) && await turnGroup('review-unsafe').locator('.execution-step').count() === 2, '审查修复：不可靠的跨消息 Call/Result 保持独立顺序和归属')
+  const reviewSnapshot = () => page.evaluate(() => [...document.querySelectorAll('.execution-group')].filter((element) => element.querySelector('[id^="execution-review-"]')).map((element) => ({ order: [...element.children].filter((child) => child.matches('.chat-message, .execution-header')).map((child) => ({ kind: child.classList.contains('execution-header') ? 'execution' : child.classList.contains('chat-message-user') ? 'user' : 'assistant', id: child.dataset.eventId, summary: child.classList.contains('execution-header') ? child.querySelector('span:last-child').textContent : null })), rows: [...element.querySelectorAll('.execution-content > [data-event-id]')].map((row) => ({ id: row.dataset.eventId, status: row.dataset.status })) })))
+  const beforeReviewReload = await reviewSnapshot()
+  histories['ui-alpha'].push(...reviewEvents)
+  await page.reload()
+  await turnGroup('review-unsafe').waitFor()
+  check(JSON.stringify(await reviewSnapshot()) === JSON.stringify(beforeReviewReload), '审查修复：历史恢复与 SSE 增量的消息、区块、结果状态和计数一致')
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await reviewOrder.scrollIntoViewIfNeeded()
+  await page.screenshot({ path: 'output/playwright/mycode-ui-review-order.png' })
+
+  // Review fixes: one submission per request, including the HTTP-success gap.
+  const pendingReview = (requestId) => ({ turn_id: 'review-permission', request_id: requestId, tool_name: 'write_file', target: 'README.md', prompt: '审查权限请求 ' + requestId })
+  const requestReviewPermission = async (requestId) => {
+    await emit('runtime_status', { status: 'waiting_permission', turn_id: 'review-permission' })
+    await emit('permission_request', pendingReview(requestId))
+    await page.locator('.permission-actions').waitFor()
+  }
+  const resolveReviewPermission = async (requestId) => emit('permission_resolved', { ...pendingReview(requestId), decision: 'once', allowed: true })
+  const postsFor = (sessionId, requestId) => requests.filter((request) => request.path === '/sessions/' + sessionId + '/permission' && JSON.parse(request.body).request_id === requestId)
+  const decisions = page.locator('.permission-actions button')
+  const feedback = page.locator('.permission-feedback')
+  const waitSubmitted = () => page.waitForFunction(() => document.querySelector('.permission-feedback')?.textContent.includes('已提交'))
+  const waitPermissionResponse = (sessionId, requestId) => page.waitForResponse((response) => new URL(response.url()).pathname.endsWith('/sessions/' + sessionId + '/permission') && response.request().postDataJSON()?.request_id === requestId)
+  const finishPermissionResponse = async (responsePromise) => {
+    await (await responsePromise).finished()
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  }
+  const rapid = { hold: true }
+  permissionFixtures.set('ui-alpha:review-rapid', rapid)
+  await requestReviewPermission('review-rapid')
+  await decisions.evaluateAll((buttons) => { for (const button of buttons) { button.click(); button.click() } })
+  await waitForFixture(() => rapid.release)
+  check(await page.locator('.permission-actions button:disabled').count() === 4 && (await feedback.innerText()) === '处理中…', '审查修复：首次权限点击立即锁定全部四个按钮并显示处理中')
+  check(postsFor('ui-alpha', 'review-rapid').length === 1, '审查修复：同一帧连续点击四种按钮仅发送一个 POST')
+  const reviewPermissions = turnGroup('review-permission')
+  if (await reviewPermissions.locator('.execution-header').getAttribute('aria-expanded') === 'true') await reviewPermissions.locator('.execution-header').click()
+  check(await feedback.isVisible() && await decisions.first().isVisible(), '审查修复：手动折叠后提交状态与权限按钮仍可见')
+  rapid.release()
+  await waitSubmitted()
+  await emit('permission_request', pendingReview('review-rapid'))
+  await decisions.evaluateAll((buttons) => buttons.forEach((button) => button.dispatchEvent(new MouseEvent('click', { bubbles: true }))))
+  check(await page.locator('.permission-actions button:disabled').count() === 4 && postsFor('ui-alpha', 'review-rapid').length === 1, '审查修复：HTTP 成功和相同权限 SSE 重放均不重新开放提交')
+  await requestReviewPermission('review-new')
+  check(await page.locator('.permission-actions button:enabled').count() === 4, '审查修复：新 request_id 不受旧请求等待同步状态锁定')
+  await decisions.nth(1).click()
+  await waitSubmitted()
+  await resolveReviewPermission('review-rapid')
+  check(await page.locator('.permission-actions button:disabled').count() === 4, '审查修复：旧 request_id 的迟到 resolved 不清理新请求的提交状态')
+  await resolveReviewPermission('review-new')
+  check(await page.locator('.permission-actions').count() === 0 && await feedback.count() === 0, '审查修复：权限 resolved 清理按钮和提交反馈')
+  permissionFixtures.set('ui-alpha:review-retry', { status: 500 })
+  await requestReviewPermission('review-retry')
+  await decisions.nth(1).click()
+  await page.getByText('权限提交失败测试', { exact: true }).waitFor()
+  check(await page.locator('.permission-actions button:enabled').count() === 4, '审查修复：权限 API 失败显示错误并恢复全部决策按钮')
+  permissionFixtures.delete('ui-alpha:review-retry')
+  await decisions.nth(2).click()
+  await waitSubmitted()
+  check(postsFor('ui-alpha', 'review-retry').length === 2 && JSON.parse(postsFor('ui-alpha', 'review-retry')[1].body).decision === 'task', '审查修复：失败后可重试且保留新的 decision 和原 request_id')
+  await resolveReviewPermission('review-retry')
+  await page.getByText('权限提交失败测试', { exact: true }).waitFor({ state: 'detached', timeout: 10000 })
+
+  const oldRequest = { hold: true, status: 500 }, newRequest = { hold: true }
+  permissionFixtures.set('ui-alpha:review-old', oldRequest)
+  permissionFixtures.set('ui-alpha:review-current', newRequest)
+  await requestReviewPermission('review-old')
+  await decisions.nth(1).click()
+  await waitForFixture(() => oldRequest.release)
+  await requestReviewPermission('review-current')
+  check(await page.locator('.permission-actions button:enabled').count() === 4, '审查修复：旧 POST 尚未返回时新权限仍可提交')
+  await decisions.nth(2).click()
+  await waitForFixture(() => newRequest.release)
+  const oldRequestResponse = waitPermissionResponse('ui-alpha', 'review-old')
+  oldRequest.release()
+  await finishPermissionResponse(oldRequestResponse)
+  check(await page.locator('.permission-actions button:disabled').count() === 4 && (await feedback.innerText()) === '处理中…' && await page.locator('.error-banner').count() === 0, '审查修复：旧请求迟到失败不解锁新请求或污染错误提示')
+  newRequest.release()
+  await waitSubmitted()
+  await resolveReviewPermission('review-current')
+
+  const switchReviewSession = async (name, heading) => {
+    await showSidebar('Sessions')
+    await page.locator('.session-item').filter({ hasText: name }).click()
+    await page.getByRole('heading', { name: heading, exact: true }).waitFor()
+  }
+  const oldSession = { hold: true }, betaSubmission = { hold: true }
+  permissionFixtures.set('ui-alpha:review-session', oldSession)
+  permissionFixtures.set('ui-beta:review-session', betaSubmission)
+  await requestReviewPermission('review-session')
+  await decisions.nth(1).click()
+  await waitForFixture(() => oldSession.release)
+  await switchReviewSession('历史会话', '历史记录')
+  await requestReviewPermission('review-session')
+  check(await page.locator('.permission-actions button:enabled').count() === 4, '审查修复：切换 Session 后相同 request_id 的新权限不被旧提交锁定')
+  await decisions.nth(2).click()
+  await waitForFixture(() => betaSubmission.release)
+  const oldSessionResponse = waitPermissionResponse('ui-alpha', 'review-session')
+  oldSession.release()
+  await finishPermissionResponse(oldSessionResponse)
+  check((await feedback.innerText()) === '处理中…' && await page.locator('.permission-actions button:disabled').count() === 4 && postsFor('ui-alpha', 'review-session').length === 1 && postsFor('ui-beta', 'review-session').length === 1, '审查修复：旧 Session 迟到成功不改变新 Session 状态，POST 路径隔离')
+  betaSubmission.release()
+  await waitSubmitted()
+  await resolveReviewPermission('review-session')
+  await switchReviewSession('UI 重构演示', '实现完成')
+  const staleGeneration = { hold: true, status: 500 }
+  permissionFixtures.set('ui-alpha:review-generation', staleGeneration)
+  await requestReviewPermission('review-generation')
+  await decisions.nth(1).click()
+  await waitForFixture(() => staleGeneration.release)
+  await switchReviewSession('历史会话', '历史记录')
+  await switchReviewSession('UI 重构演示', '实现完成')
+  const latestGeneration = { hold: true }
+  permissionFixtures.set('ui-alpha:review-generation', latestGeneration)
+  await requestReviewPermission('review-generation')
+  await decisions.nth(2).click()
+  await waitForFixture(() => latestGeneration.release)
+  const staleGenerationResponse = waitPermissionResponse('ui-alpha', 'review-generation')
+  staleGeneration.release()
+  await finishPermissionResponse(staleGenerationResponse)
+  check((await feedback.innerText()) === '处理中…' && await page.locator('.permission-actions button:disabled').count() === 4 && await page.locator('.error-banner').count() === 0, '审查修复：切回同一 Session 后相同 request_id 的旧代次响应仍被隔离')
+  latestGeneration.release()
+  await waitSubmitted()
+  await resolveReviewPermission('review-generation')
+  for (const [kind, data] of [
+    ['permission_resolved', { ...pendingReview('review-expired'), allowed: false, expired: true }],
+    ['runtime_status', { status: 'stopped', turn_id: 'review-permission' }],
+    ['runtime_status', { status: 'error', turn_id: 'review-permission' }],
+    ['runtime_expired', { message: '模拟 Sandbox 过期' }],
+  ]) {
+    const requestId = kind === 'permission_resolved' ? 'review-expired' : 'review-cleanup-' + (data.status || kind)
+    await requestReviewPermission(requestId)
+    await decisions.nth(1).click()
+    await waitSubmitted()
+    await emit(kind, data)
+    check(await page.locator('.permission-actions').count() === 0 && await feedback.count() === 0, '审查修复：' + requestId + ' 清理提交状态与操作按钮')
+  }
+  await requestReviewPermission('review-after-cleanup')
+  check(await page.locator('.permission-actions button:enabled').count() === 4, '审查修复：过期、停止和 Runtime error 后的新权限可正常操作')
+  await decisions.nth(1).click()
+  await waitSubmitted()
+  await resolveReviewPermission('review-after-cleanup')
+  await emit('runtime_status', { status: 'idle', turn_id: 'review-permission' })
   // Empty bootstrap -> new Session -> asynchronously loaded long Markdown history.
   sessions.splice(0)
   nextCreatedHistory = [{ id: 1, kind: 'assistant', content: '## 新会话历史\n\n' + '初始化长历史内容。\n\n'.repeat(240), data: { turn_id: 'created-history' } }]

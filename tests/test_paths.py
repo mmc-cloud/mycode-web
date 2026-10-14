@@ -215,10 +215,14 @@ def test_execution_group_completed_turns_keep_user_toggle_state() -> None:
         Path(__file__).resolve().parents[1] / "frontend/src/SessionApp.vue"
     ).read_text(encoding="utf-8")
 
-    assert "const explicitExpanded = expanded[group.key]" in source
+    projection = (
+        Path(__file__).resolve().parents[1] / "frontend/src/execution.js"
+    ).read_text(encoding="utf-8")
+    assert 'import { buildExecutionGroups } from "./execution.js"' in source
+    assert "const explicitExpanded = expanded[group.key]" in projection
     assert "expandedGroups.value[group.key] = !group.expanded" in source
-    assert "if (ACTIVE_TURN_STATUSES.includes(previous) && status === \"idle\")" in source
-    assert "expandedGroups.value[turnId] = false" in source
+    assert "expandedGroups.value[turnId] = false" not in source
+    assert "explicitExpanded === undefined" in projection
     assert "expandedGroups.value = {}" in source
 
 
@@ -228,12 +232,18 @@ def test_permission_frontend_uses_scoped_decisions_and_runtime_session_hint() ->
     ).read_text(encoding="utf-8")
 
     assert "async function resolvePermission(decision)" in source
-    assert "body: JSON.stringify({ decision, request_id: permission.value?.request_id })" in source
-    assert "resolvePermission('deny')" in source
-    assert "resolvePermission('once')" in source
-    assert "resolvePermission('task')" in source
-    assert "resolvePermission('session')" in source
-    assert "Runtime 重启后失效" in source
+    assert "body: JSON.stringify({ decision, request_id: requestId })" in source
+    assert "if (!sessionId || !requestId || permissionSubmissionStatus.value) return" in source
+    assert 'submission.status = "awaiting_sync"' in source
+    assert "generation === token" in source
+    card = (
+        Path(__file__).resolve().parents[1] / "frontend/src/PermissionStep.vue"
+    ).read_text(encoding="utf-8")
+    assert '@resolve="resolvePermission"' in source
+    for decision in ("deny", "once", "task", "session"):
+        assert f"$emit('resolve', '{decision}')" in card
+    assert "Runtime 重启后失效" in card
+    assert ':disabled="Boolean(submissionState)"' in card
     assert "async function resolveMcpTrust(approved)" in source
     assert "request_id: pendingMcpTrust.value.request_id" in source
     assert "resolvePermission(false)" not in source

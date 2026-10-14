@@ -6,6 +6,8 @@ import ActivityBar from "./ActivityBar.vue"
 import ChatMessage from "./ChatMessage.vue"
 import Composer from "./Composer.vue"
 import FileTree from "./FileTree.vue"
+import ExecutionTimeline from "./ExecutionTimeline.vue"
+import { buildExecutionGroups } from "./execution.js"
 import TerminalPanel from "./TerminalPanel.vue"
 import { LAYOUT_KEY, loadLayout } from "./layout"
 import { useConsoleScroll } from "./useConsoleScroll"
@@ -43,6 +45,13 @@ const fileContent = ref("")
 const consoleEvents = ref([])
 const liveConsole = ref(null)
 const permission = ref(null)
+const permissionSubmission = ref(null)
+const permissionSubmissionStatus = computed(() => {
+  const submission = permissionSubmission.value
+  if (!submission) return ""
+  return submission?.sessionId === currentSession.value?.id && submission?.requestId === permission.value?.request_id
+    ? submission.status : ""
+})
 const pendingMcpTrust = ref(null)
 const contextStatus = ref(null)
 const contextVisible = ref(false)
@@ -182,6 +191,7 @@ function clearCurrentSession(replace = true) {
   consoleEvents.value = []
   liveConsole.value = null
   permission.value = null
+  permissionSubmission.value = null
   pendingMcpTrust.value = null
   contextStatus.value = null
   contextVisible.value = false
@@ -212,6 +222,7 @@ async function openSession(sessionId, replace = false) {
   consoleEvents.value = []
   liveConsole.value = null
   permission.value = null
+  permissionSubmission.value = null
   pendingMcpTrust.value = null
   contextStatus.value = null
   contextVisible.value = false
@@ -408,6 +419,7 @@ async function submitDialog() {
 
 function clearPendingInteractions() {
   permission.value = null
+  permissionSubmission.value = null
   pendingMcpTrust.value = null
   controlInFlight.value = null
 }
@@ -453,13 +465,17 @@ function connectEvents(sessionId, token, after) {
   eventSource.addEventListener("permission_request", (event) => {
     if (generation !== token) return
     const data = JSON.parse(event.data)
+    if (permission.value?.request_id !== data.request_id) permissionSubmission.value = null
     permission.value = data
     if (data.turn_id) updateTurnStatus(data.turn_id, "waiting_permission")
   })
   eventSource.addEventListener("permission_resolved", (event) => {
     if (generation !== token) return
     const data = JSON.parse(event.data)
+    // A late resolution for an older request must not unlock/clear a new one.
+    if (permission.value && data.request_id !== permission.value.request_id) return
     permission.value = null
+    permissionSubmission.value = null
     if (data.turn_id) {
       const status = currentSession.value?.runtime_status === "idle"
         ? "idle"
@@ -537,11 +553,7 @@ function upsertConsole(event) {
 }
 
 function updateTurnStatus(turnId, status) {
-  const previous = turnStates.value[turnId]?.status
   turnStates.value[turnId] = { status }
-  if (ACTIVE_TURN_STATUSES.includes(previous) && status === "idle") {
-    expandedGroups.value[turnId] = false
-  }
 }
 
 function scrollConsole() {
@@ -779,13 +791,28 @@ async function compactContext(event) {
 }
 
 async function resolvePermission(decision) {
+  const sessionId = currentSession.value?.id
+  const requestId = permission.value?.request_id
+  if (!sessionId || !requestId || permissionSubmissionStatus.value) return
+  const token = generation
+  permissionSubmission.value = { sessionId, requestId, status: "submitting" }
+  const submission = permissionSubmission.value
+  const isCurrent = () => generation === token && currentSession.value?.id === sessionId &&
+    permission.value?.request_id === requestId && permissionSubmission.value === submission
   try {
-    await request(scoped("/permission"), {
+    await request(scoped("/permission", sessionId), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision, request_id: permission.value?.request_id }),
+      body: JSON.stringify({ decision, request_id: requestId }),
     })
-  } catch (reason) { showError(reason) }
+    // HTTP success is not the permission lifecycle resolution. Stay locked
+    // until SSE/state synchronization, a new request or session cleanup.
+    if (isCurrent()) submission.status = "awaiting_sync"
+  } catch (reason) {
+    if (!isCurrent()) return
+    permissionSubmission.value = null
+    showError(reason)
+  }
 }
 
 async function resolveMcpTrust(approved) {
@@ -927,144 +954,6 @@ onBeforeUnmount(() => {
   if (workspaceTimer) window.clearTimeout(workspaceTimer)
 })
 
-function clip(value, limit = 120) {
-  const text = String(value || "").trim()
-  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text
-}
-
-function turnKeyForEvent(event, fallback) {
-  return typeof event.data?.turn_id === "string" && event.data.turn_id
-    ? event.data.turn_id
-    : fallback || "runtime"
-}
-
-function permissionStepFor(event, turnId) {
-  const data = event.data || {}
-  const detail = data.target || data.action || data.tool_name || event.content
-  const resolved = event.data?.decision
-  return {
-    id: `permission-${event.id}`,
-    key: `${turnId}:${data.request_id || data.tool_name || data.action || "permission"}`,
-    label: clip(detail),
-    status: resolved && resolved !== "deny" ? "allowed" : resolved === "deny" ? "denied" : "waiting",
-    statusLabel: resolved && resolved !== "deny" ? "Allowed" : resolved === "deny" ? "Denied" : "Waiting for permission",
-    detail: event.content,
-    data,
-  }
-}
-
-function structuredToolStep(event, index) {
-  const data = event.data || {}
-  const payload = data.event || {}
-  const type = data.event_type || payload.type || "runtime_event"
-  if (type === "tool_call") {
-    const call = payload.tool_call || {}
-    return {
-      id: `tool-${event.id}-${index}`,
-      label: `${call.name || "tool"} · call`,
-      statusLabel: "Started",
-      detail: JSON.stringify(call.arguments || {}, null, 2),
-      data,
-    }
-  }
-  if (type === "tool_result") {
-    const result = payload.tool_result || {}
-    return {
-      id: `tool-${event.id}-${index}`,
-      label: `${result.ok ? "✓" : "!"} ${type}`,
-      statusLabel: result.ok ? "Completed" : "Failed",
-      detail: result.content || result.error || event.content,
-      data,
-    }
-  }
-  return {
-    id: `tool-${event.id}-${index}`,
-    label: type,
-    statusLabel: type === "error" ? "Failed" : "Info",
-    detail: event.content,
-    data,
-  }
-}
-
-function buildExecutionGroups(events, live, pendingPermission, session, states, expanded) {
-  const groups = new Map()
-  let fallbackTurn = null
-  for (const event of events) {
-    const key = turnKeyForEvent(event, fallbackTurn)
-    if (event.kind === "user") fallbackTurn = key
-    if (!groups.has(key)) groups.set(key, { key, events: [], user: null })
-    const group = groups.get(key)
-    group.events.push(event)
-    if (event.kind === "user" && !group.user) group.user = event
-  }
-  const activeTurn = session?.active_turn_id
-  if (activeTurn && !groups.has(activeTurn)) groups.set(activeTurn, { key: activeTurn, events: [], user: null })
-  const liveTurn = live?.turn_id || activeTurn
-  if (live?.active && liveTurn && !groups.has(liveTurn)) groups.set(liveTurn, { key: liveTurn, events: [], user: null })
-  const pendingTurn = pendingPermission?.turn_id || activeTurn
-  if (pendingPermission && pendingTurn && !groups.has(pendingTurn)) groups.set(pendingTurn, { key: pendingTurn, events: [], user: null })
-
-  return [...groups.values()].map((group) => {
-    const tools = []
-    const permissions = []
-    const assistants = []
-    const errors = []
-    for (const event of group.events) {
-      if (event.kind === "tool") {
-        tools.push(structuredToolStep(event, 0))
-      } else if (event.kind === "permission") {
-        const step = permissionStepFor(event, group.key)
-        const existing = permissions.find((item) => item.key === step.key && item.status === "waiting")
-        if (existing && step.status !== "waiting") Object.assign(existing, step)
-        else permissions.push(step)
-      } else if (event.kind === "assistant") assistants.push(event)
-      else if (event.kind === "error") errors.push(event)
-    }
-    const groupPending = pendingPermission && pendingTurn === group.key ? pendingPermission : null
-    if (groupPending) {
-      const key = `${group.key}:${groupPending.request_id || groupPending.tool_name || groupPending.action || "permission"}`
-      if (!permissions.some((item) => item.key === key && item.status === "waiting")) {
-        permissions.push({
-          id: `pending-${group.key}`,
-          key,
-          label: clip(groupPending.target || groupPending.action || groupPending.tool_name),
-          status: "waiting",
-          statusLabel: "Waiting for permission",
-          detail: groupPending.prompt || groupPending.reason || "Agent 请求权限",
-          data: groupPending,
-        })
-      }
-    }
-    const groupLive = live?.active && liveTurn === group.key ? live : null
-    const state = states[group.key]?.status
-    const hasError = errors.length > 0 || state === "error" || groupLive?.kind === "error"
-    const active = ["starting", "queued", "running", "waiting_permission", "waiting_mcp_trust"].includes(state) ||
-      (group.key === activeTurn && !hasError && session?.runtime_status !== "idle" && session?.runtime_status !== "stopped")
-    const status = hasError ? "error" : active && (state === "waiting_permission" || state === "waiting_mcp_trust" || groupPending) ? "waiting" : active ? (state === "queued" ? "queued" : "running") : "completed"
-    const statusLabel = status === "waiting" && state === "waiting_mcp_trust"
-      ? "Waiting for MCP trust"
-      : { running: "Running", waiting: "Waiting for permission", queued: "Queued", error: "Error", completed: "Completed" }[status]
-    const stepCount = tools.length + permissions.length
-    const explicitExpanded = expanded[group.key]
-    const groupExpanded = explicitExpanded === undefined
-      ? ["running", "waiting", "queued", "error"].includes(status)
-      : explicitExpanded
-    return {
-      ...group,
-      tools,
-      permissions,
-      assistants,
-      errors,
-      live: groupLive,
-      pendingPermission: groupPending,
-      status,
-      statusLabel,
-      stepCount,
-      expanded: groupExpanded,
-      summary: `${stepCount} steps · ${statusLabel}`,
-    }
-  })
-}
 </script>
 
 <template>
@@ -1177,16 +1066,10 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
           <div ref="outputElement" class="console-history" tabindex="0" aria-label="Agent 消息历史">
             <div ref="outputContent" class="console-history-content">
             <section v-for="group in executionGroups" :key="group.key" class="execution-group">
-              <ChatMessage v-if="group.user" role="user" :content="group.user.content" />
-              <button class="execution-header" :data-status="group.status" :aria-expanded="group.expanded" @click="toggleGroup(group)"><span>{{ group.expanded ? '▼' : '▶' }} 执行过程</span><span>{{ group.summary }}</span></button>
-              <div v-show="group.expanded" class="execution-content">
-                <details v-for="step in group.tools" :key="step.id" class="execution-step"><summary><span class="step-icon">✓</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></summary><pre>{{ step.detail }}</pre><pre v-if="Object.keys(step.data).length" class="step-data">{{ JSON.stringify(step.data, null, 2) }}</pre></details>
-                <div v-for="step in group.permissions" :key="step.id" class="permission-step" :data-status="step.status"><div><span class="step-icon">{{ step.status === 'waiting' ? '●' : step.status === 'allowed' ? '✓' : '!' }}</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></div><p>{{ step.detail }}</p><dl v-if="Object.keys(step.data).length"><template v-for="(value, key) in step.data" :key="key"><template v-if="key !== 'turn_id'"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></template></dl><div v-if="step.status === 'waiting' && group.pendingPermission" class="permission-actions"><button class="danger" title="拒绝此次操作" @click="resolvePermission('deny')">拒绝</button><button title="仅批准当前这一次操作" @click="resolvePermission('once')">仅本次</button><button title="本次 Agent 任务内后续需要确认的操作自动批准" @click="resolvePermission('task')">当前任务</button><button title="当前运行会话内后续需要确认的操作自动批准；Runtime 重启后失效" @click="resolvePermission('session')">当前会话</button></div></div>
-                <article v-for="event in group.errors" :key="`error-${event.id}`" class="console-card error-card"><strong>Error</strong><pre>{{ event.content }}</pre></article>
-                <article v-if="group.live && group.live.kind !== 'assistant'" class="console-card live-card" :data-kind="group.live.kind"><strong>{{ group.live.kind }}</strong><pre>{{ group.live.content }}</pre></article>
-              </div>
-              <ChatMessage v-for="event in group.assistants" :key="`assistant-${event.id}`" role="assistant" :content="event.content" />
-              <ChatMessage v-if="group.live && group.live.kind === 'assistant'" role="assistant" :content="group.live.content" streaming />
+              <template v-for="item in group.items" :key="item.id">
+                <ExecutionTimeline v-if="item.kind === 'execution'" :group="item.block" :permission-submission="permissionSubmissionStatus" @toggle="toggleGroup" @resolve="resolvePermission" />
+                <ChatMessage v-else :role="item.kind" :content="item.content" :streaming="Boolean(item.streaming)" :data-event-id="item.eventId" />
+              </template>
             </section>
             <p v-if="sessionHydrating || !executionGroups.length" class="muted console-empty-state">{{ emptyConsoleText }}</p>
             </div>
