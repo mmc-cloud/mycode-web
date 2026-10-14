@@ -175,8 +175,10 @@ def test_frontend_distinguishes_session_history_hydration_from_empty_history() -
     assert "sessionHydrating.value = false" in open_session
     assert "sessionHydrating.value = false" in clear_session
     assert '正在加载会话历史…' in source
-    assert '<p v-if="sessionHydrating"' in source
-    assert '<p v-else-if="!executionGroups.length"' in source
+    assert 'if (sessionHydrating.value) return "正在加载会话历史…"' in source
+    assert 'sessionHydrating || !executionGroups.length' in source
+    assert '{{ emptyConsoleText }}' in source
+    assert 'currentSession.value?.runtime_status === "idle"' in source
 
 
 def test_terminal_clipboard_ux_uses_xterm_paste_and_cleans_listeners() -> None:
