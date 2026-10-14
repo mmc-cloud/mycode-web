@@ -1,9 +1,14 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue"
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue"
 
 import AppDialog from "./AppDialog.vue"
+import ActivityBar from "./ActivityBar.vue"
+import ChatMessage from "./ChatMessage.vue"
+import Composer from "./Composer.vue"
 import FileTree from "./FileTree.vue"
 import TerminalPanel from "./TerminalPanel.vue"
+import { LAYOUT_KEY, loadLayout } from "./layout"
+import { useConsoleScroll } from "./useConsoleScroll"
 import {
   API_BASE,
   compactApiPath,
@@ -11,49 +16,13 @@ import {
   sessionApiPath,
 } from "./api"
 
-const LAYOUT_KEY = "mycode.layout.v1"
-const layoutDefaults = {
-  sessionsWidth: 220,
-  workspaceWidth: 390,
-  workspaceTreeHeight: 260,
-  terminalHeight: 280,
-  sessionsCollapsed: false,
-  workspaceCollapsed: false,
-  terminalCollapsed: false,
-}
 const ACTIVE_TURN_STATUSES = ["starting", "queued", "running", "waiting_permission", "waiting_mcp_trust"]
-
-function defaultLayout() {
-  return { ...layoutDefaults }
-}
-
-function loadLayout() {
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(LAYOUT_KEY) || "")
-    if (
-      !parsed ||
-      !Number.isFinite(parsed.sessionsWidth) ||
-      parsed.sessionsWidth < 160 || parsed.sessionsWidth > 360 ||
-      !Number.isFinite(parsed.workspaceWidth) ||
-      parsed.workspaceWidth < 260 || parsed.workspaceWidth > 720 ||
-      !Number.isFinite(parsed.workspaceTreeHeight) ||
-      parsed.workspaceTreeHeight < 120 || parsed.workspaceTreeHeight > 600 ||
-      !Number.isFinite(parsed.terminalHeight) ||
-      parsed.terminalHeight < 160 || parsed.terminalHeight > 560 ||
-      typeof parsed.sessionsCollapsed !== "boolean" ||
-      typeof parsed.workspaceCollapsed !== "boolean" ||
-      typeof parsed.terminalCollapsed !== "boolean"
-    ) throw new Error("invalid layout")
-    return { ...layoutDefaults, ...parsed }
-  } catch (_) {
-    return defaultLayout()
-  }
-}
 
 const layout = reactive(loadLayout())
 const layoutStyle = computed(() => ({
-  "--sessions-width": `${layout.sessionsCollapsed ? 48 : layout.sessionsWidth}px`,
-  "--workspace-width": `${layout.workspaceCollapsed ? 48 : layout.workspaceWidth}px`,
+  "--sidebar-width": `${layout.sidebarOpen ? layout.sidebarWidth : 0}px`,
+  "--sidebar-splitter-width": `${layout.sidebarOpen ? 8 : 0}px`,
+  "--terminal-splitter-height": `${layout.terminalCollapsed ? 0 : 8}px`,
   "--terminal-height": `${layout.terminalCollapsed ? 44 : layout.terminalHeight}px`,
   "--workspace-tree-height": `${layout.workspaceTreeHeight}px`,
 }))
@@ -98,6 +67,11 @@ const dialog = reactive({
   busy: false,
 })
 const outputElement = ref(null)
+const outputContent = ref(null)
+const consoleScroll = useConsoleScroll(outputElement, outputContent)
+const { showJump: showScrollJump } = consoleScroll
+const sidebarElement = ref(null)
+const activityBar = ref(null)
 let eventSource = null
 let workspaceTimer = null
 let generation = 0
@@ -173,6 +147,7 @@ async function initialize() {
 
 function clearCurrentSession(replace = true) {
   generation += 1
+  consoleScroll.reset()
   sessionHydrating.value = false
   closeDialog()
   eventSource?.close()
@@ -201,6 +176,7 @@ function clearCurrentSession(replace = true) {
 
 async function openSession(sessionId, replace = false) {
   const token = ++generation
+  consoleScroll.reset()
   sessionHydrating.value = true
   closeDialog()
   eventSource?.close()
@@ -277,6 +253,7 @@ async function loadConsole(sessionId, token, bootstrapCursor) {
   const merged = new Map(result.events.map((event) => [event.id, event]))
   for (const event of consoleEvents.value) merged.set(event.id, event)
   consoleEvents.value = [...merged.values()].sort((left, right) => left.id - right.id)
+  scrollConsole()
   connectEvents(sessionId, token, bootstrapCursor)
 }
 
@@ -549,9 +526,7 @@ function updateTurnStatus(turnId, status) {
 }
 
 function scrollConsole() {
-  nextTick(() => {
-    if (outputElement.value) outputElement.value.scrollTop = outputElement.value.scrollHeight
-  })
+  consoleScroll.afterUpdate()
 }
 
 async function refreshWorkspaceAfterChange(sessionId, token) {
@@ -753,21 +728,38 @@ function handleHistoryNavigation() {
   }
 }
 
-function togglePanel(name) {
-  layout[`${name}Collapsed`] = !layout[`${name}Collapsed`]
+function selectSidebar(view) {
+  layout.sidebarOpen = layout.sidebarView !== view || !layout.sidebarOpen
+  layout.sidebarView = view
+  sessionMenuId.value = null
+  if (resizeState?.kind === "sidebar" || resizeState?.kind === "workspaceTree") stopResize()
+  saveLayout()
+}
+
+function closeSidebar() {
+  layout.sidebarOpen = false
+  sessionMenuId.value = null
+  if (resizeState?.kind === "sidebar" || resizeState?.kind === "workspaceTree") stopResize()
+  saveLayout()
+  activityBar.value?.focusView(layout.sidebarView)
+}
+
+function toggleTerminal() {
+  layout.terminalCollapsed = !layout.terminalCollapsed
+  if (layout.terminalCollapsed && resizeState?.kind === "terminal") stopResize()
   saveLayout()
 }
 
 function startResize(kind, event) {
   if (event.button !== 0) return
+  if (kind === "terminal" && layout.terminalCollapsed) return
   event.preventDefault()
   resizeState = {
     kind,
     startX: event.clientX,
     startY: event.clientY,
     initial: {
-      sessionsWidth: layout.sessionsWidth,
-      workspaceWidth: layout.workspaceWidth,
+      sidebarWidth: sidebarElement.value?.getBoundingClientRect().width || layout.sidebarWidth,
       workspaceTreeHeight: layout.workspaceTreeHeight,
       terminalHeight: layout.terminalHeight,
     },
@@ -781,8 +773,7 @@ function resize(event) {
   const dx = event.clientX - resizeState.startX
   const dy = event.clientY - resizeState.startY
   const initial = resizeState.initial
-  if (resizeState.kind === "sessions") layout.sessionsWidth = clamp(initial.sessionsWidth + dx, 160, 360)
-  if (resizeState.kind === "workspace") layout.workspaceWidth = clamp(initial.workspaceWidth + dx, 260, 720)
+  if (resizeState.kind === "sidebar") layout.sidebarWidth = clamp(initial.sidebarWidth + dx, 220, window.innerWidth <= 1000 ? 280 : 520)
   if (resizeState.kind === "workspaceTree") layout.workspaceTreeHeight = clamp(initial.workspaceTreeHeight + dy, 120, 600)
   if (resizeState.kind === "terminal") {
     const max = Math.min(560, Math.max(180, window.innerHeight * 0.65))
@@ -802,6 +793,7 @@ function clamp(value, minimum, maximum) {
 }
 
 onMounted(() => {
+  saveLayout()
   window.addEventListener("popstate", handleHistoryNavigation)
   void initialize()
 })
@@ -955,7 +947,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
 <template>
   <main class="shell ide-shell" :style="layoutStyle">
     <header class="app-header">
-      <div class="brand"><p class="eyebrow">LOCAL WEB DEMO</p><h1>MyCode</h1></div>
+      <div class="brand"><h1>MyCode</h1><span class="brand-caption">Web Demo</span></div>
       <div class="header-session">
         <span class="session-name">{{ currentSession ? sessionLabel(currentSession) : "No session" }}</span>
         <span class="status" :data-status="currentSession?.runtime_status || 'stopped'">{{ currentSession?.runtime_status || "stopped" }}</span>
@@ -966,126 +958,135 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
         </div>
       </div>
     </header>
-    <div class="notice-area">
-      <p v-if="error" class="error-banner">{{ error }}</p>
-      <p v-if="lifecycleNotice" class="queue-notice global-notice">{{ lifecycleNotice }}</p>
-      <section v-if="pendingMcpTrust" class="mcp-trust-card">
-        <strong>MCP Trust required</strong>
-        <p>该 Project 请求使用以下 MCP Server。只展示 Core 提供的安全摘要，不包含 secret value。</p>
-        <ul>
-          <li v-for="server in pendingMcpTrust.servers" :key="`${server.alias}-${server.transport}`">
-            <b>{{ server.alias }}</b> · {{ server.transport }}
-            <span v-if="server.command"> · {{ server.command }} {{ (server.args || []).join(' ') }}</span>
-            <span v-if="server.url_template"> · {{ server.url_template }}</span>
-            <small v-if="server.env_keys?.length"> · env: {{ server.env_keys.join(', ') }}</small>
-            <small v-if="server.header_keys?.length"> · headers: {{ server.header_keys.join(', ') }}</small>
-          </li>
-        </ul>
-        <div class="permission-actions">
-          <button class="danger" @click="resolveMcpTrust(false)">Reject</button>
-          <button @click="resolveMcpTrust(true)">Allow</button>
-        </div>
-      </section>
-    </div>
-
     <section class="main-area">
-      <aside class="panel sessions-panel" :class="{ collapsed: layout.sessionsCollapsed }">
-        <div class="panel-heading">
-          <div v-if="!layout.sessionsCollapsed"><p class="eyebrow">SESSIONS</p><h2>Sessions</h2></div>
-          <button class="icon-button" :title="layout.sessionsCollapsed ? '展开 Sessions' : '折叠 Sessions'" @click="togglePanel('sessions')">{{ layout.sessionsCollapsed ? '›' : '‹' }}</button>
-        </div>
-        <div v-if="!layout.sessionsCollapsed" class="session-list">
-          <div v-for="session in sessions" :key="session.id" class="session-entry">
-            <button class="session-item" :class="{ active: currentSession?.id === session.id }" @click="openSession(session.id)">
-              <span>{{ sessionLabel(session) }}</span><small>{{ session.runtime_status }}</small>
-            </button>
-            <button class="more-button" title="会话菜单" @click.stop="sessionMenuId = sessionMenuId === session.id ? null : session.id">⋯</button>
-            <div v-if="sessionMenuId === session.id" class="session-menu">
-              <button @click="openRenameDialog(session)">Rename</button>
-              <button class="menu-danger" @click="openRemoveSessionDialog(session)">Delete</button>
+      <ActivityBar ref="activityBar" :active-view="layout.sidebarView" :sidebar-open="layout.sidebarOpen" @select="selectSidebar" />
+      <aside v-show="layout.sidebarOpen" id="workbench-sidebar" ref="sidebarElement" class="panel sidebar" :aria-label="`${layout.sidebarView === 'sessions' ? 'Sessions' : 'Workspace'} 侧栏`">
+        <section v-show="layout.sidebarView === 'sessions'" class="sidebar-view sessions-panel">
+          <div class="panel-heading">
+            <h2>Sessions</h2>
+            <button class="icon-button" title="收起 Sidebar" aria-label="收起 Sidebar" @click="closeSidebar">‹</button>
+          </div>
+          <div class="session-list">
+            <div v-for="session in sessions" :key="session.id" class="session-entry">
+              <button class="session-item" :class="{ active: currentSession?.id === session.id }" @click="openSession(session.id)">
+                <span>{{ sessionLabel(session) }}</span><small>{{ session.runtime_status }}</small>
+              </button>
+              <button class="more-button" title="会话菜单" @click.stop="sessionMenuId = sessionMenuId === session.id ? null : session.id">⋯</button>
+              <div v-if="sessionMenuId === session.id" class="session-menu">
+                <button @click="openRenameDialog(session)">Rename</button>
+                <button class="menu-danger" @click="openRemoveSessionDialog(session)">Delete</button>
+              </div>
             </div>
+            <button @click="createSession">New Session</button>
           </div>
-          <button @click="createSession">New Session</button>
-        </div>
-      </aside>
-      <div class="splitter vertical" title="拖动调整 Sessions 宽度" @pointerdown="startResize('sessions', $event)" />
+        </section>
 
-      <section class="panel workspace-panel" :class="{ collapsed: layout.workspaceCollapsed }">
-        <div class="panel-heading">
-          <div v-if="!layout.workspaceCollapsed"><p class="eyebrow">WORKSPACE</p><h2>Workspace</h2></div>
-          <div class="panel-actions"><button v-if="!layout.workspaceCollapsed" class="secondary compact-button" @click="refreshTree()">↻</button><button class="icon-button" :title="layout.workspaceCollapsed ? '展开 Workspace' : '折叠 Workspace'" @click="togglePanel('workspace')">{{ layout.workspaceCollapsed ? '›' : '‹' }}</button></div>
-        </div>
-        <template v-if="!layout.workspaceCollapsed">
+        <section v-show="layout.sidebarView === 'workspace'" class="sidebar-view workspace-panel">
+          <div class="panel-heading">
+            <h2>Workspace</h2>
+            <div class="panel-actions"><button class="secondary compact-button" title="刷新 Workspace" @click="refreshTree()">↻</button><button class="icon-button" title="收起 Sidebar" aria-label="收起 Sidebar" @click="closeSidebar">‹</button></div>
+          </div>
           <template v-if="currentSession">
-          <div class="workspace-toolbar">
-            <label class="button-label">Upload<input type="file" @change="upload($event, false)" /></label>
-            <label class="button-label secondary" title="Upload ZIP and extract into Workspace root (/)" aria-label="Upload ZIP and extract into Workspace root (/)">Extract ZIP<input type="file" accept=".zip" @change="upload($event, true)" /></label>
-            <a v-if="currentSession" class="button-link" :href="API_BASE + scoped('/workspace/download')">Download</a>
-          </div>
-          <div class="workspace-body">
-            <nav class="tree-pane"><FileTree :entries="entries" :selected="selectedPath" @open="openFile" @delete="openDeleteEntryDialog" /><p v-if="!entries.length" class="muted">Workspace 为空</p></nav>
-            <div class="splitter horizontal inner workspace-splitter" title="拖动调整 File Tree 高度" @pointerdown="startResize('workspaceTree', $event)" />
-            <article class="preview"><div class="preview-title"><span>{{ selectedPath || "选择一个文本文件" }}</span><a v-if="selectedPath" :href="`${API_BASE}${scoped('/files/download')}?path=${encodeURIComponent(selectedPath)}`">Download</a></div><pre>{{ fileContent }}</pre></article>
-          </div>
+            <div class="workspace-toolbar">
+              <label class="button-label">Upload<input type="file" @change="upload($event, false)" /></label>
+              <label class="button-label secondary" title="Upload ZIP and extract into Workspace root (/)" aria-label="Upload ZIP and extract into Workspace root (/)">Extract ZIP<input type="file" accept=".zip" @change="upload($event, true)" /></label>
+              <a v-if="currentSession" class="button-link" :href="API_BASE + scoped('/workspace/download')">Download</a>
+            </div>
+            <div class="workspace-body">
+              <nav class="tree-pane"><FileTree :entries="entries" :selected="selectedPath" @open="openFile" @delete="openDeleteEntryDialog" /><p v-if="!entries.length" class="muted">Workspace 为空</p></nav>
+              <div class="splitter horizontal inner workspace-splitter" title="拖动调整 File Tree 高度" @pointerdown="startResize('workspaceTree', $event)" />
+              <article class="preview"><div class="preview-title"><span>{{ selectedPath || "选择一个文本文件" }}</span><a v-if="selectedPath" :href="`${API_BASE}${scoped('/files/download')}?path=${encodeURIComponent(selectedPath)}`">Download</a></div><pre>{{ fileContent }}</pre></article>
+            </div>
           </template>
           <div v-else class="workspace-empty-state">
             <strong>No session selected</strong>
             <p>创建一个 Session 后即可开始使用 Workspace。</p>
           </div>
-        </template>
-      </section>
-      <div class="splitter vertical" title="拖动调整 Workspace 宽度" @pointerdown="startResize('workspace', $event)" />
-
-      <section class="panel agent-panel">
-        <div class="panel-heading agent-heading"><div><p class="eyebrow">AGENT</p><h2>Agent</h2><small>{{ currentSession ? sessionLabel(currentSession) : "" }} · {{ currentSession?.runtime_status || "stopped" }}</small></div><div class="agent-heading-actions"><button class="secondary compact-button" :disabled="contextControlDisabled" @click="inspectContext">{{ controlInFlight === 'context_status' ? 'Loading…' : 'Context' }}</button><button class="compact-button" :disabled="contextControlDisabled" @click="compactContext">{{ controlInFlight === 'compact' ? 'Compacting…' : 'Compact' }}</button></div></div>
-        <section v-if="contextVisible" class="context-panel">
-          <div class="context-panel-heading"><strong>Context</strong><span>{{ contextUsageLabel(contextStatus) }} used</span></div>
-          <p v-if="compactFeedback" class="context-feedback">{{ compactFeedback }}</p>
-          <dl v-if="contextStatus" class="context-grid">
-            <div><dt>Estimated Input / Max Input</dt><dd>{{ formatContextTokens(contextStatus.estimated_input_tokens) }} / {{ formatContextTokens(contextStatus.max_input_tokens) }}</dd></div>
-            <div><dt>Context Window</dt><dd>{{ formatContextTokens(contextStatus.context_window_tokens) }}</dd></div>
-            <div><dt>Reserved Output</dt><dd>{{ formatContextTokens(contextStatus.reserved_output_tokens) }}</dd></div>
-            <div><dt>Safety Margin</dt><dd>{{ formatContextTokens(contextStatus.safety_margin_tokens) }}</dd></div>
-            <div><dt>Last Provider Prompt Tokens</dt><dd>{{ formatContextTokens(contextStatus.last_provider_prompt_tokens) }}</dd></div>
-            <div><dt>Message Count</dt><dd>{{ formatContextTokens(contextStatus.source_message_count) }} / {{ formatContextTokens(contextStatus.model_visible_message_count) }} visible</dd></div>
-            <div><dt>Memory Count / Tokens</dt><dd>{{ formatContextTokens(contextStatus.memory_entry_count) }} / {{ formatContextTokens(contextStatus.memory_estimated_tokens) }}</dd></div>
-            <div><dt>Compact Status</dt><dd>{{ contextStatus.compact_status || '—' }}</dd></div>
-            <div><dt>Compacted Message Count</dt><dd>{{ formatContextTokens(contextStatus.compact_covered_message_count) }}</dd></div>
-            <div><dt>Compressed Tool Result Count</dt><dd>{{ formatContextTokens(contextStatus.compressed_tool_result_count) }}</dd></div>
-            <div><dt>Estimate Source</dt><dd>{{ contextStatus.estimate_source || '—' }}</dd></div>
-          </dl>
-          <p v-else class="muted">{{ controlInFlight ? '正在加载 Context…' : 'Context 已变化，请重新查询' }}</p>
         </section>
-        <div v-if="currentSession" ref="outputElement" class="console-history">
-          <section v-for="group in executionGroups" :key="group.key" class="execution-group">
-            <article v-if="group.user" class="console-card user-card"><strong>You</strong><pre>{{ group.user.content }}</pre></article>
-            <button class="execution-header" @click="toggleGroup(group)"><span>{{ group.expanded ? '▼' : '▶' }} 执行过程</span><span>{{ group.summary }}</span></button>
-            <div v-show="group.expanded" class="execution-content">
-              <details v-for="step in group.tools" :key="step.id" class="execution-step"><summary><span class="step-icon">✓</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></summary><pre>{{ step.detail }}</pre><pre v-if="Object.keys(step.data).length" class="step-data">{{ JSON.stringify(step.data, null, 2) }}</pre></details>
-              <div v-for="step in group.permissions" :key="step.id" class="permission-step" :data-status="step.status"><div><span class="step-icon">{{ step.status === 'waiting' ? '●' : step.status === 'allowed' ? '✓' : '!' }}</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></div><p>{{ step.detail }}</p><dl v-if="Object.keys(step.data).length"><template v-for="(value, key) in step.data" :key="key"><template v-if="key !== 'turn_id'"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></template></dl><div v-if="step.status === 'waiting' && group.pendingPermission" class="permission-actions"><button class="danger" title="拒绝此次操作" @click="resolvePermission('deny')">拒绝</button><button title="仅批准当前这一次操作" @click="resolvePermission('once')">仅本次</button><button title="本次 Agent 任务内后续需要确认的操作自动批准" @click="resolvePermission('task')">当前任务</button><button title="当前运行会话内后续需要确认的操作自动批准；Runtime 重启后失效" @click="resolvePermission('session')">当前会话</button></div></div>
-              <article v-for="event in group.errors" :key="`error-${event.id}`" class="console-card error-card"><strong>Error</strong><pre>{{ event.content }}</pre></article>
-              <article v-if="group.live && group.live.kind !== 'assistant'" class="console-card live-card" :data-kind="group.live.kind"><strong>{{ group.live.kind }}</strong><pre>{{ group.live.content }}</pre></article>
-            </div>
-            <article v-for="event in group.assistants" :key="`assistant-${event.id}`" class="console-card assistant-card"><strong>Assistant</strong><pre>{{ event.content }}</pre></article>
-            <article v-if="group.live && group.live.kind === 'assistant'" class="console-card assistant-card live-card"><strong>Assistant</strong><pre>{{ group.live.content }}</pre></article>
-          </section>
-          <p v-if="sessionHydrating" class="muted">正在加载会话历史…</p>
-          <p v-else-if="!executionGroups.length" class="muted">等待 Agent 输出…</p>
-        </div>
-        <div v-else class="session-empty-state">
-          <strong>No session selected</strong>
-          <p>Create a session to start working with MyCode.</p>
-          <button @click="createSession">New Session</button>
-        </div>
-        <p v-if="currentSession?.runtime_status === 'queued' && currentSession?.active_turn_id" class="queue-notice">当前 Sandbox 已满，正在排队</p>
-        <form v-if="currentSession" class="composer" @submit.prevent="sendMessage"><textarea v-model="message" rows="3" placeholder="告诉 MyCode 要完成什么…" @keydown.ctrl.enter="sendMessage" /><button type="submit" :disabled="sendDisabled">Send</button></form>
-      </section>
-    </section>
+      </aside>
+      <div v-if="layout.sidebarOpen" class="splitter vertical sidebar-splitter" title="拖动调整 Sidebar 宽度" role="separator" aria-label="Sidebar 宽度" aria-orientation="vertical" @pointerdown="startResize('sidebar', $event)" />
 
-    <div class="splitter horizontal terminal-splitter" title="拖动调整 Terminal 高度" @pointerdown="startResize('terminal', $event)" />
-    <section class="panel terminal-drawer" :class="{ collapsed: layout.terminalCollapsed }">
-      <div class="panel-heading terminal-heading" @click="layout.terminalCollapsed && togglePanel('terminal')"><div><p class="eyebrow">TERMINAL</p><h2>Terminal <small>{{ layout.terminalCollapsed ? '▲' : '▼' }}</small></h2></div><button class="icon-button" :title="layout.terminalCollapsed ? '展开 Terminal' : '折叠 Terminal'" @click.stop="togglePanel('terminal')">{{ layout.terminalCollapsed ? '▲' : '▼' }}</button></div>
-      <TerminalPanel v-if="!layout.terminalCollapsed && currentSession" :session-id="currentSession.id" :collapsed="layout.terminalCollapsed" />
+      <div class="workbench-main" :class="{ 'has-notice': error || lifecycleNotice || pendingMcpTrust }">
+        <div v-if="error || lifecycleNotice || pendingMcpTrust" class="notice-area">
+          <p v-if="error" class="error-banner">{{ error }}</p>
+          <p v-if="lifecycleNotice" class="queue-notice global-notice">{{ lifecycleNotice }}</p>
+          <section v-if="pendingMcpTrust" class="mcp-trust-card">
+            <strong>MCP Trust required</strong>
+            <p>该 Project 请求使用以下 MCP Server。只展示 Core 提供的安全摘要，不包含 secret value。</p>
+            <ul>
+              <li v-for="server in pendingMcpTrust.servers" :key="`${server.alias}-${server.transport}`">
+                <b>{{ server.alias }}</b> · {{ server.transport }}
+                <span v-if="server.command"> · {{ server.command }} {{ (server.args || []).join(' ') }}</span>
+                <span v-if="server.url_template"> · {{ server.url_template }}</span>
+                <small v-if="server.env_keys?.length"> · env: {{ server.env_keys.join(', ') }}</small>
+                <small v-if="server.header_keys?.length"> · headers: {{ server.header_keys.join(', ') }}</small>
+              </li>
+            </ul>
+            <div class="permission-actions">
+              <button class="danger" @click="resolveMcpTrust(false)">Reject</button>
+              <button @click="resolveMcpTrust(true)">Allow</button>
+            </div>
+          </section>
+        </div>
+        <section class="panel agent-panel">
+          <div class="panel-heading agent-heading"><div><h2>Agent</h2><small>{{ currentSession ? sessionLabel(currentSession) : "" }} · {{ currentSession?.runtime_status || "stopped" }}</small></div><div class="agent-heading-actions"><button class="secondary compact-button" :disabled="contextControlDisabled" @click="inspectContext">{{ controlInFlight === 'context_status' ? 'Loading…' : 'Context' }}</button><button class="compact-button" :disabled="contextControlDisabled" @click="compactContext">{{ controlInFlight === 'compact' ? 'Compacting…' : 'Compact' }}</button></div></div>
+          <section v-if="contextVisible" class="context-panel">
+            <div class="context-panel-heading"><strong>Context</strong><span>{{ contextUsageLabel(contextStatus) }} used</span></div>
+            <p v-if="compactFeedback" class="context-feedback">{{ compactFeedback }}</p>
+            <dl v-if="contextStatus" class="context-grid">
+              <div><dt>Estimated Input / Max Input</dt><dd>{{ formatContextTokens(contextStatus.estimated_input_tokens) }} / {{ formatContextTokens(contextStatus.max_input_tokens) }}</dd></div>
+              <div><dt>Context Window</dt><dd>{{ formatContextTokens(contextStatus.context_window_tokens) }}</dd></div>
+              <div><dt>Reserved Output</dt><dd>{{ formatContextTokens(contextStatus.reserved_output_tokens) }}</dd></div>
+              <div><dt>Safety Margin</dt><dd>{{ formatContextTokens(contextStatus.safety_margin_tokens) }}</dd></div>
+              <div><dt>Last Provider Prompt Tokens</dt><dd>{{ formatContextTokens(contextStatus.last_provider_prompt_tokens) }}</dd></div>
+              <div><dt>Message Count</dt><dd>{{ formatContextTokens(contextStatus.source_message_count) }} / {{ formatContextTokens(contextStatus.model_visible_message_count) }} visible</dd></div>
+              <div><dt>Memory Count / Tokens</dt><dd>{{ formatContextTokens(contextStatus.memory_entry_count) }} / {{ formatContextTokens(contextStatus.memory_estimated_tokens) }}</dd></div>
+              <div><dt>Compact Status</dt><dd>{{ contextStatus.compact_status || '—' }}</dd></div>
+              <div><dt>Compacted Message Count</dt><dd>{{ formatContextTokens(contextStatus.compact_covered_message_count) }}</dd></div>
+              <div><dt>Compressed Tool Result Count</dt><dd>{{ formatContextTokens(contextStatus.compressed_tool_result_count) }}</dd></div>
+              <div><dt>Estimate Source</dt><dd>{{ contextStatus.estimate_source || '—' }}</dd></div>
+            </dl>
+            <p v-else class="muted">{{ controlInFlight ? '正在加载 Context…' : 'Context 已变化，请重新查询' }}</p>
+          </section>
+          <div v-if="currentSession" class="console-viewport">
+          <div ref="outputElement" class="console-history" tabindex="0" aria-label="Agent 消息历史">
+            <div ref="outputContent" class="console-history-content">
+            <section v-for="group in executionGroups" :key="group.key" class="execution-group">
+              <ChatMessage v-if="group.user" role="user" :content="group.user.content" />
+              <button class="execution-header" :data-status="group.status" :aria-expanded="group.expanded" @click="toggleGroup(group)"><span>{{ group.expanded ? '▼' : '▶' }} 执行过程</span><span>{{ group.summary }}</span></button>
+              <div v-show="group.expanded" class="execution-content">
+                <details v-for="step in group.tools" :key="step.id" class="execution-step"><summary><span class="step-icon">✓</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></summary><pre>{{ step.detail }}</pre><pre v-if="Object.keys(step.data).length" class="step-data">{{ JSON.stringify(step.data, null, 2) }}</pre></details>
+                <div v-for="step in group.permissions" :key="step.id" class="permission-step" :data-status="step.status"><div><span class="step-icon">{{ step.status === 'waiting' ? '●' : step.status === 'allowed' ? '✓' : '!' }}</span><span>{{ step.label }}</span><small>{{ step.statusLabel }}</small></div><p>{{ step.detail }}</p><dl v-if="Object.keys(step.data).length"><template v-for="(value, key) in step.data" :key="key"><template v-if="key !== 'turn_id'"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></template></dl><div v-if="step.status === 'waiting' && group.pendingPermission" class="permission-actions"><button class="danger" title="拒绝此次操作" @click="resolvePermission('deny')">拒绝</button><button title="仅批准当前这一次操作" @click="resolvePermission('once')">仅本次</button><button title="本次 Agent 任务内后续需要确认的操作自动批准" @click="resolvePermission('task')">当前任务</button><button title="当前运行会话内后续需要确认的操作自动批准；Runtime 重启后失效" @click="resolvePermission('session')">当前会话</button></div></div>
+                <article v-for="event in group.errors" :key="`error-${event.id}`" class="console-card error-card"><strong>Error</strong><pre>{{ event.content }}</pre></article>
+                <article v-if="group.live && group.live.kind !== 'assistant'" class="console-card live-card" :data-kind="group.live.kind"><strong>{{ group.live.kind }}</strong><pre>{{ group.live.content }}</pre></article>
+              </div>
+              <ChatMessage v-for="event in group.assistants" :key="`assistant-${event.id}`" role="assistant" :content="event.content" />
+              <ChatMessage v-if="group.live && group.live.kind === 'assistant'" role="assistant" :content="group.live.content" streaming />
+            </section>
+            <p v-if="sessionHydrating" class="muted">正在加载会话历史…</p>
+            <p v-else-if="!executionGroups.length" class="muted">等待 Agent 输出…</p>
+            </div>
+          </div>
+          <button v-if="showScrollJump" class="scroll-jump" type="button" aria-label="回到底部，继续跟随 Agent 输出" @click="consoleScroll.jump">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m-6-6 6 6 6-6" /></svg>
+            回到底部
+          </button>
+          </div>
+          <div v-else class="session-empty-state">
+            <strong>No session selected</strong>
+            <p>Create a session to start working with MyCode.</p>
+            <button @click="createSession">New Session</button>
+          </div>
+          <p v-if="currentSession?.runtime_status === 'queued' && currentSession?.active_turn_id" class="queue-notice">当前 Sandbox 已满，正在排队</p>
+          <Composer v-if="currentSession" v-model="message" :disabled="sendDisabled" :sending="sendingSessionIds.has(currentSession.id)" @send="sendMessage" />
+        </section>
+
+        <div v-if="!layout.terminalCollapsed" class="splitter horizontal terminal-splitter" title="拖动调整 Terminal 高度" role="separator" aria-label="Terminal 高度" aria-orientation="horizontal" @pointerdown="startResize('terminal', $event)" />
+        <section class="panel terminal-drawer" :class="{ collapsed: layout.terminalCollapsed }">
+          <div class="panel-heading terminal-heading" @click="layout.terminalCollapsed && toggleTerminal()"><h2 class="terminal-title"><span class="terminal-icon" aria-hidden="true">&gt;_</span>Terminal</h2><button class="icon-button" :title="layout.terminalCollapsed ? '展开 Terminal' : '折叠 Terminal'" @click.stop="toggleTerminal">{{ layout.terminalCollapsed ? '▲' : '▼' }}</button></div>
+          <TerminalPanel v-if="!layout.terminalCollapsed && currentSession" :session-id="currentSession.id" :collapsed="layout.terminalCollapsed" />
+        </section>
+      </div>
     </section>
   </main>
   <AppDialog
