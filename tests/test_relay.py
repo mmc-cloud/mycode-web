@@ -33,7 +33,7 @@ class FakeResponse:
         }
         self.closed = False
 
-    async def aiter_raw(self):
+    async def aiter_bytes(self):
         yield self.content
 
     async def aclose(self) -> None:

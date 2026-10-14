@@ -183,7 +183,9 @@ class LLMRelay:
 
         async def chunks() -> AsyncIterator[bytes]:
             try:
-                async for chunk in response.aiter_raw():
+                # Decode Content-Encoding incrementally; the allowlist omits
+                # encoded length/encoding and hop-by-hop transfer headers.
+                async for chunk in response.aiter_bytes():
                     yield chunk
             finally:
                 await response.aclose()
