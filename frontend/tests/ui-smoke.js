@@ -18,6 +18,20 @@ async (page) => {
   let holdMessage = false
   let releaseMessage = null
   let nextCreatedHistory = []
+  let holdHistory = false
+  let releaseHistory = null
+  let failContext = false
+  let holdContext = false
+  let releaseContext = null
+  const heldContents = new Map()
+  const contextFixture = { estimated_input_tokens: 1000, max_input_tokens: 10000, context_window_tokens: 12000, source_message_count: 4, model_visible_message_count: 4 }
+  const waitForFixture = async (ready) => {
+    const deadline = Date.now() + 5000
+    while (!ready()) {
+      if (Date.now() > deadline) throw new Error('Fixture request did not arrive')
+      await page.waitForTimeout(10)
+    }
+  }
   const activity = (view) => page.locator('.activity-bar').getByRole('button', { name: view, exact: true })
   const showSidebar = async (view) => {
     if (await activity(view).getAttribute('aria-expanded') !== 'true') await activity(view).click()
@@ -33,7 +47,7 @@ async (page) => {
   const code = 'const message = "<hello> & world";\nconsole.log(message);\n'
   const markdown = '# 实现完成\n\n这里是 **重点** 和 *说明*，包含 `inline_code`。\n\n## 修改内容\n\n- 浅色工作台\n- Markdown 阅读\n\n1. 安装依赖\n2. 执行构建\n\n> 保留业务数据流。\n\n---\n\n| 文件 | 说明 |\n| --- | --- |\n| SessionApp.vue | 消息展示组件接入 |\n| style.css | 统一设计变量 |\n\n```javascript\n' + code + '```\n\n```unknown-language\n<untrusted> & raw_text\n```\n\n[安全链接](https://example.com)\n\n<script>window.__xss=1</script>\n<img src=x onerror="window.__xss=2">\n[恶意链接](javascript:alert(1))\n\n![跟踪图片](https://markdown-image-test.invalid/tracker.png)\n\n![参考图片][tracking]\n\n[tracking]: https://markdown-image-test.invalid/reference.png\n\n[![徽章](https://markdown-image-test.invalid/badge.png)](https://example.com)\n'
   const sessions = [
-    { id: 'ui-alpha', name: 'UI 重构演示', runtime_status: 'idle', active_turn_id: null, event_cursor: 10 },
+    { id: 'ui-alpha', name: 'UI 重构演示', runtime_status: 'idle', active_turn_id: null, event_cursor: 10, context_status: contextFixture },
     { id: 'ui-beta', name: '历史会话', runtime_status: 'idle', active_turn_id: null, event_cursor: 20 },
   ]
   const histories = {
@@ -53,7 +67,7 @@ async (page) => {
   await page.route('**/web/api/**', async (route) => {
     const url = new URL(route.request().url())
     const path = url.pathname.replace('/web/api', '')
-    requests.push({ path, method: route.request().method(), body: route.request().postData() })
+    requests.push({ path, query: url.search, method: route.request().method(), body: route.request().postData() })
     const match = /^\/sessions\/([^/]+)(.*)$/.exec(path)
     let data
     if (path === '/sessions') {
@@ -73,9 +87,20 @@ async (page) => {
         if (route.request().method() === 'PATCH') data.name = JSON.parse(route.request().postData()).name
       }
       else if (suffix === '/activate') data = { status: 'idle' }
-      else if (suffix === '/console') data = { events: histories[id] }
-      else if (suffix === '/files/tree') data = { entries: fileEntries }
-      else if (suffix === '/files/content') data = { content: '# workspace preview' }
+      else if (suffix === '/console') {
+        if (holdHistory) await new Promise((resolve) => { releaseHistory = resolve })
+        data = { events: histories[id] }
+      }
+      else if (suffix === '/files/tree') data = { entries: id === 'ui-beta' ? [{ name: 'beta.txt', path: 'beta.txt', kind: 'file', size: 10 }] : fileEntries }
+      else if (suffix === '/files/content') {
+        const held = heldContents.get(id + ':' + url.searchParams.get('path'))
+        if (held) {
+          heldContents.delete(id + ':' + url.searchParams.get('path'))
+          await new Promise((resolve) => { held.release = resolve })
+          if (held.status) { await route.fulfill({ status: held.status, contentType: 'application/json', body: JSON.stringify({ detail: '文件不存在' }) }); return }
+        }
+        data = { content: held?.content || '# workspace preview' }
+      }
       else if (suffix === '/files/upload') {
         fileEntries.push({ name: 'note.txt', path: 'note.txt', kind: 'file', size: 15 }); data = { ok: true }
       }
@@ -97,7 +122,14 @@ async (page) => {
         data = { status: 'running', turn_id: 'stream-turn' }
       }
       else if (suffix === '/permission' || suffix === '/mcp-trust') data = { ok: true }
-      else if (suffix === '/context-status') data = { estimated_input_tokens: 1000, max_input_tokens: 10000, context_window_tokens: 12000, source_message_count: 4, model_visible_message_count: 4 }
+      else if (suffix === '/context-status') {
+        if (holdContext) await new Promise((resolve) => { releaseContext = resolve })
+        if (failContext) {
+          failContext = false
+          await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: 'Context 查询失败测试' }) }); return
+        }
+        data = contextFixture
+      }
       else if (suffix === '/compact') data = { status: 'compacted', reason: '测试完成' }
     }
     if (!data) throw new Error('Unexpected API: ' + path)
@@ -146,6 +178,7 @@ async (page) => {
   await page.evaluate((legacy) => { localStorage.removeItem('mycode.layout.v2'); localStorage.setItem('mycode.layout.v1', legacy) }, legacyLayout)
   await page.reload()
   await page.getByRole('heading', { name: '实现完成', exact: true }).waitFor()
+  check(await page.locator('.context-panel').count() === 0, 'metadata Context 状态不自动打开浮动面板')
   await page.locator('.terminal-status[data-status="ready"]').waitFor()
   await page.waitForFunction(() => { const el = document.querySelector('.console-history'); return el.scrollHeight - el.clientHeight - el.scrollTop <= 2 })
   check(true, '初始历史异步加载后实际定位底部')
@@ -227,7 +260,9 @@ async (page) => {
   await page.getByRole('button', { name: 'UI 重构演示 idle' }).click()
   await page.getByRole('heading', { name: '实现完成', exact: true }).waitFor()
   await showSidebar('Workspace')
-  await page.getByRole('button', { name: /README.md/ }).click()
+  check(await page.locator('.preview, .workspace-splitter').count() === 0 && await page.locator('.tree-pane').evaluate((el) => Math.abs(el.getBoundingClientRect().height - el.parentElement.getBoundingClientRect().height) < 1), '未选文件时无预览及分割条，文件树占满高度')
+  check(await page.locator('.file-tree > li > details').first().evaluate((el) => !el.open), '目录默认折叠')
+  await page.locator('.file-button').filter({ hasText: 'README.md' }).click()
   await page.waitForFunction(() => document.querySelector('.preview pre')?.textContent === '# workspace preview')
   check(await page.locator('.preview pre').innerText() === '# workspace preview', 'Workspace 文件预览')
   await page.locator('.file-tree > li > details > summary').first().click()
@@ -239,12 +274,83 @@ async (page) => {
   const switchRequestCount = requests.length
   await showSidebar('Sessions')
   await showSidebar('Workspace')
-  check(await page.evaluate(() => window.__retainedPreview === document.querySelector('.preview') && window.__retainedDirectory === document.querySelector('.file-tree > li > details') && !window.__retainedDirectory.open && window.__retainedMessage === document.querySelector('.chat-message-assistant')), 'Sidebar 切换保留文件树展开状态与展示 DOM')
+  check(await page.evaluate(() => window.__retainedPreview === document.querySelector('.preview') && window.__retainedDirectory === document.querySelector('.file-tree > li > details') && window.__retainedDirectory.open && window.__retainedMessage === document.querySelector('.chat-message-assistant')), 'Sidebar 切换保留文件树展开状态与展示 DOM')
   check(await page.locator('.file-button.selected').count() === 1 && await page.locator('.preview pre').innerText() === '# workspace preview' && requests.length === switchRequestCount, 'Sidebar 切换保留已选文件、预览且不请求业务 API')
   await page.locator('.workspace-panel').getByRole('button', { name: '收起 Sidebar', exact: true }).click()
   check(!await page.locator('.sidebar').isVisible() && await activity('Workspace').evaluate((el) => el === document.activeElement), 'Sidebar 标题按钮收起后焦点返回活动栏')
   await activity('Workspace').click()
+  check(await page.locator('.file-tree > li > details').first().evaluate((el) => el.open) && await page.locator('.preview pre').innerText() === '# workspace preview' && requests.length === switchRequestCount, 'Sidebar 折叠恢复保留展开目录与预览且不重复请求')
+  await Promise.all([page.waitForResponse((response) => response.url().includes('/files/tree')), page.getByTitle('刷新 Workspace', { exact: true }).click()])
+  check(await page.locator('.file-tree > li > details').first().evaluate((el) => el.open), '刷新文件树保留仍存在的目录展开状态')
+  await page.getByRole('button', { name: '关闭文件预览', exact: true }).click()
+  check(await page.locator('.preview, .workspace-splitter, .file-button.selected').count() === 0, '关闭预览清除选择并移除分割条')
+  const holdFile = async (path, options = {}, sessionId = 'ui-alpha') => {
+    const held = { content: 'STALE_FILE_CONTENT', ...options }
+    heldContents.set(sessionId + ':' + path, held)
+    await page.locator('.file-button').filter({ hasText: path.split('/').pop() }).click()
+    await waitForFixture(() => held.release)
+    return async () => {
+      const response = page.waitForResponse((response) => response.url().includes('/files/content') && new URL(response.url()).searchParams.get('path') === path)
+      held.release()
+      await response
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    }
+  }
+  const releaseClosed = await holdFile('README.md')
+  await page.getByRole('button', { name: '关闭文件预览', exact: true }).click()
+  await releaseClosed()
+  check(await page.locator('.preview, .file-button.selected').count() === 0, '关闭预览后延迟响应不能重新打开预览')
+  const releaseOldFile = await holdFile('README.md', { status: 404 })
+  await page.locator('.file-button').filter({ hasText: 'index.js' }).click()
+  await page.waitForFunction(() => document.querySelector('.preview pre')?.textContent === '# workspace preview')
+  await releaseOldFile()
+  check(await page.locator('.preview-title > span').textContent() === 'src/index.js', '快速切换文件后旧 404 不清除新预览')
+  const releaseSuccess = await holdFile('README.md')
+  await page.locator('.file-button').filter({ hasText: 'index.js' }).click()
+  await page.waitForFunction(() => document.querySelector('.preview pre')?.textContent === '# workspace preview')
+  await releaseSuccess()
+  check(await page.locator('.preview pre').textContent() === '# workspace preview', '快速切换文件后旧内容不覆盖新预览')
+  const releaseSessionFile = await holdFile('README.md')
+  await showSidebar('Sessions')
+  await page.getByRole('button', { name: '历史会话 idle' }).click()
+  await page.getByRole('heading', { name: '历史记录' }).waitFor()
+  await releaseSessionFile()
+  await showSidebar('Workspace')
+  check(await page.locator('.preview').count() === 0 && await page.locator('.file-button').count() === 1 && await page.locator('.file-button').textContent() === 'beta.txt10 B', 'Session 切换隔离旧预览响应与 Workspace 数据')
+  await showSidebar('Sessions')
+  await page.getByRole('button', { name: 'UI 重构演示 idle' }).click()
+  await page.getByRole('heading', { name: '实现完成', exact: true }).waitFor()
+  await showSidebar('Workspace')
+  check(await page.locator('.file-tree details').first().evaluate((el) => !el.open), '切换 Session 清理目录展开状态')
+  await page.locator('.file-button').filter({ hasText: 'README.md' }).click()
+  await page.waitForFunction(() => document.querySelector('.preview pre')?.textContent === '# workspace preview')
+  check(true, '关闭后重新打开文件正常')
   const emit = (type, data) => page.evaluate(({ type, data }) => window.__uiTest.emit(type, data), { type, data })
+  const contentRequestsBeforeChange = requests.filter((item) => item.path.endsWith('/files/content')).length
+  await Promise.all([page.waitForResponse((response) => response.url().includes('/files/content')), emit('workspace_changed', {})])
+  check(requests.filter((item) => item.path.endsWith('/files/content')).length === contentRequestsBeforeChange + 1 && await page.locator('.preview-title > span').textContent() === 'README.md', '真实 Workspace 变动刷新当前预览')
+  const releaseMissing = await holdFile('README.md', { status: 404 })
+  await releaseMissing()
+  check(await page.locator('.preview, .workspace-splitter, .file-button.selected').count() === 0, '当前文件不存在时清除失效预览')
+  await page.locator('.file-tree > li > details > summary').first().click()
+  await page.locator('.file-button').filter({ hasText: 'index.js' }).click()
+  await page.waitForFunction(() => document.querySelector('.preview-title > span')?.textContent === 'src/index.js')
+  const directory = fileEntries.find((entry) => entry.path === 'src')
+  await page.locator('.file-tree > li > details > summary').first().getByTitle('删除目录', { exact: true }).click()
+  const deleteDirectoryDialog = page.getByRole('dialog', { name: '删除目录？', exact: true })
+  check((await deleteDirectoryDialog.textContent()).includes('递归删除'), '目录删除保留递归删除确认')
+  await deleteDirectoryDialog.getByRole('button', { name: '删除', exact: true }).click()
+  await page.locator('.file-tree details').waitFor({ state: 'detached' })
+  check(await page.locator('.preview, .file-button.selected').count() === 0, '删除目录时清除其中所选文件的预览')
+  fileEntries.push(directory)
+  await Promise.all([page.waitForResponse((response) => response.url().includes('/files/tree')), page.getByTitle('刷新 Workspace', { exact: true }).click()])
+  await page.locator('.file-tree details').waitFor()
+  check(await page.locator('.file-tree details').evaluate((el) => !el.open), '删除再创建同路径目录时已清理展开状态')
+  await page.mouse.move(890, 10)
+  check(await page.locator('.file-row .tree-delete').first().evaluate((el) => getComputedStyle(el).opacity === '0'), '鼠标未悬停时删除按钮弱化隐藏')
+  await page.locator('.file-row .tree-delete').first().focus()
+  check(await page.locator('.file-row .tree-delete').first().evaluate((el) => getComputedStyle(el).opacity === '1'), '删除按钮仍可通过键盘聚焦发现并操作')
+  await page.locator('.file-button').filter({ hasText: 'README.md' }).click()
   const input = page.locator('.composer textarea')
   const sendButton = page.getByRole('button', { name: '发送消息', exact: true })
   const messageRequests = () => requests.filter((item) => item.path.endsWith('/message')).length
@@ -355,7 +461,7 @@ async (page) => {
   const beforeStream = await position('流式增长前')
   const observersBefore = await page.evaluate(() => window.__uiTest.scrollObservers.length)
   await page.locator('.error-banner').waitFor({ state: 'hidden', timeout: 12000 })
-  await page.getByRole('button', { name: /README.md/ }).click()
+  await page.locator('.file-button').filter({ hasText: 'README.md' }).click()
   await page.locator('.file-tree > li > details').first().evaluate((el) => { el.open = false })
   await emit('console_event', { id: 1001, kind: 'user', content: '验证智能滚动：我会向上阅读历史，请保留阅读位置。', data: { turn_id: 'scroll-turn' } })
   await emit('console_live', { active: true, turn_id: 'scroll-turn', kind: 'assistant', content: '## 智能滚动检查\n\n开始输出。' })
@@ -468,12 +574,20 @@ async (page) => {
   await page.setViewportSize({ width: 900, height: 1000 })
   await input.fill('窄面板长草稿\n'.repeat(20))
   await settle()
+  await page.locator('.agent-heading-actions button').filter({ hasText: 'Context' }).click()
+  await page.locator('.context-grid').waitFor()
   check(await page.locator('.composer').evaluate((el) => el.scrollWidth <= el.clientWidth && el.getBoundingClientRect().bottom <= document.querySelector('.agent-panel').getBoundingClientRect().bottom) && await height() <= composerHeights.maximum, '900px 输入上限、发送栏无溢出或重叠')
   check(await jump.evaluate((el) => { const rect = el.getBoundingClientRect(), viewport = document.querySelector('.console-viewport').getBoundingClientRect(), composer = document.querySelector('.composer').getBoundingClientRect(); return rect.top >= viewport.top && rect.bottom <= viewport.bottom && rect.bottom < composer.top }), '长草稿及 Context 展开时回底按钮仍在聊天区内')
   check((await position('900px 重排及 Composer 增高')).top === layoutReading.top && await jump.isVisible(), '浏览器尺寸与 Composer 增高不抢夺阅读位置')
   await page.screenshot({ path: 'output/playwright/mycode-composer-narrow.png', animations: 'disabled' })
   await page.setViewportSize({ width: 900, height: 720 })
   await settle()
+  await page.locator('.context-grid').waitFor()
+  check(await page.locator('.context-panel').evaluate((el) => {
+    const rect = el.getBoundingClientRect(), composer = document.querySelector('.composer').getBoundingClientRect()
+    return rect.left >= 0 && rect.right <= innerWidth && rect.bottom <= composer.top && el.scrollHeight > el.clientHeight
+  }), '900×720 Context 位于视口和 Composer 上方，长指标独立滚动')
+  await page.screenshot({ path: 'output/playwright/mycode-context-900x720.png', animations: 'disabled' })
   check(await page.locator('.composer').evaluate((el) => el.getBoundingClientRect().bottom <= document.querySelector('.agent-panel').getBoundingClientRect().bottom + 1) && await jump.evaluate((el) => { const rect = el.getBoundingClientRect(), viewport = document.querySelector('.console-viewport').getBoundingClientRect(); return rect.top >= viewport.top && rect.bottom <= viewport.bottom }), '900×720 Context 与长草稿同时存在时仍保留聊天和回底入口')
   await input.fill('')
   await page.setViewportSize({ width: 1440, height: 1000 })
@@ -520,10 +634,42 @@ async (page) => {
   await page.locator('.agent-heading-actions button').filter({ hasText: 'Context' }).click()
   await page.waitForFunction(() => document.querySelector('.context-grid'))
   check((await page.locator('.context-panel-heading').innerText()).includes('10%'), 'Context 查询可用')
+  const contextButton = page.locator('.agent-heading-actions button').first()
+  const chatBounds = () => page.locator('.console-viewport').evaluate((el) => ({ y: el.getBoundingClientRect().y, height: el.getBoundingClientRect().height }))
+  const contextOpenBounds = await chatBounds()
+  check(await contextButton.getAttribute('aria-expanded') === 'true' && await page.getByRole('button', { name: '关闭 Context', exact: true }).evaluate((el) => el === document.activeElement), 'Context 打开具有 ARIA 状态并聚焦关闭按钮')
+  await page.screenshot({ path: 'output/playwright/mycode-context-1440.png', animations: 'disabled' })
+  await page.keyboard.press('Escape')
+  check(await page.locator('.context-panel').count() === 0 && await contextButton.evaluate((el) => el === document.activeElement) && JSON.stringify(await chatBounds()) === JSON.stringify(contextOpenBounds), 'Esc 关闭 Context 恢复焦点且不改变聊天区几何')
+  await emit('context_status', { ...contextFixture, estimated_input_tokens: 2000 })
+  await emit('compact_result', { status: 'compacted', after: contextFixture })
+  check(await page.locator('.context-panel').count() === 0, '关闭后 Context 与 Compact 状态事件仅更新数据，不重新弹出')
+  await contextButton.click()
+  await page.locator('.context-grid').waitFor()
+  check(JSON.stringify(await chatBounds()) === JSON.stringify(contextOpenBounds), '重新打开 Context 不挤压聊天主布局')
+  await page.getByRole('button', { name: '关闭 Context', exact: true }).click()
+  await contextButton.click()
+  await page.locator('.context-grid').waitFor()
+  await input.click()
+  check(await page.locator('.context-panel').count() === 0 && await input.evaluate((el) => el === document.activeElement), '点击外部关闭 Context，不抢夺 Composer 焦点')
+  holdContext = true
+  await contextButton.click()
+  await waitForFixture(() => releaseContext)
+  await page.getByRole('button', { name: '关闭 Context', exact: true }).click()
+  holdContext = false
+  releaseContext()
+  await page.waitForFunction(() => !document.querySelector('.agent-heading-actions button').disabled)
+  check(await page.locator('.context-panel').count() === 0, '查询进行中关闭 Context，迟到的 API 响应不重新打开')
+  failContext = true
+  await contextButton.click()
+  await page.locator('.context-error').waitFor()
+  check(await page.locator('.context-error').textContent() === 'Context 查询失败测试', 'Context API 错误状态保留')
+  await page.getByRole('button', { name: '关闭 Context', exact: true }).click()
   await page.locator('.agent-heading-actions button').filter({ hasText: 'Compact' }).click()
   await page.waitForFunction(() => document.querySelector('.context-feedback')?.textContent.includes('Compact 完成'))
   check(true, 'Compact 操作可用')
-  // Hide Context by switching sessions, matching the existing business flow.
+  await page.getByRole('button', { name: '关闭 Context', exact: true }).click()
+  check(await page.locator('.context-panel').count() === 0 && requests.some((item) => item.path.endsWith('/compact') && item.method === 'POST'), '独立 Compact 按钮主动展示真实 API 结果且可以关闭')
   await showSidebar('Sessions')
   await page.getByRole('button', { name: '历史会话 idle' }).click()
   await page.getByRole('heading', { name: '历史记录' }).waitFor()
@@ -651,10 +797,17 @@ async (page) => {
   }
   await drag('拖动调整 Sidebar 宽度', 70, 0)
   await showSidebar('Workspace')
+  await page.locator('.file-button').filter({ hasText: 'README.md' }).click()
+  await page.waitForFunction(() => document.querySelector('.preview pre')?.textContent === '# workspace preview')
   await drag('拖动调整 File Tree 高度', 0, -35)
   await drag('拖动调整 Terminal 高度', 0, 30)
   const layout = await page.evaluate(() => JSON.parse(localStorage.getItem('mycode.layout.v2')))
   check(layout.sidebarWidth === 390 && layout.workspaceTreeHeight === 205 && layout.terminalHeight === 270 && layout.sidebarView === 'workspace', 'Sidebar、文件树与 Terminal 拖动并保存 v2 布局')
+  check(await page.locator('.tree-pane').evaluate((el) => Math.abs(el.getBoundingClientRect().height - 205) < 1), '预览展开时拖动实际改变文件树高度')
+  await page.getByRole('button', { name: '关闭文件预览', exact: true }).click()
+  await page.locator('.file-button').filter({ hasText: 'README.md' }).click()
+  await page.waitForFunction(() => document.querySelector('.preview pre')?.textContent === '# workspace preview')
+  check(await page.locator('.tree-pane').evaluate((el) => Math.abs(el.getBoundingClientRect().height - 205) < 1), '关闭并重新打开预览保留拖动高度')
   await page.getByTitle('折叠 Terminal', { exact: true }).click()
   const collapsedTerminal = await page.locator('.terminal-drawer').evaluate((el) => ({ height: el.getBoundingClientRect().height, background: getComputedStyle(el).backgroundColor, lines: el.querySelectorAll('h2').length, terminal: Boolean(el.querySelector('.xterm')) }))
   check(collapsedTerminal.height === 44 && collapsedTerminal.background === 'rgb(255, 255, 255)' && collapsedTerminal.lines === 1 && !collapsedTerminal.terminal, 'Terminal 收起为 44px 浅色单行工具栏')
@@ -669,6 +822,7 @@ async (page) => {
   await page.reload()
   await page.getByRole('heading', { name: '实现完成', exact: true }).waitFor()
   check(await page.evaluate(() => JSON.parse(localStorage.getItem('mycode.layout.v2')).sidebarWidth === 390) && await page.locator('.workspace-panel').isVisible() && await page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().width === 390), '刷新后恢复 Sidebar 视图与拖动宽度')
+  check(await page.locator('.preview, .workspace-splitter').count() === 0 && await page.evaluate(() => JSON.parse(localStorage.getItem('mycode.layout.v2')).workspaceTreeHeight) === 205, '页面刷新清空文件选择，仍保留预览分割高度配置')
   check(await page.locator('.eyebrow').count() === 0, '移除重复面板标题')
   const preview = '## 工作台布局完成\n\nSessions 与 Workspace 共用一个 Sidebar，Terminal 仅位于右侧。\n\n| 区域 | 布局 |\n| --- | --- |\n| Activity Bar | 始终可见，图标切换 Sidebar |\n| Agent | 主工作区，正文独立限宽 |\n\n```javascript\nconst sidebarView = "workspace";\n```'
   await emit('console_event', { id: 3, kind: 'assistant', content: preview, data: { turn_id: 'turn-a' } })
@@ -692,8 +846,9 @@ async (page) => {
   await page.locator('.execution-header').first().click()
   check(Math.abs((await trackGeometry()).contentLeftGap) < 1, '展开后的工具详情与执行条左边界对齐')
   await page.locator('.execution-header').first().click()
-  await page.getByRole('button', { name: /README.md/ }).click()
+  await page.locator('.file-button').filter({ hasText: 'README.md' }).click()
   await page.waitForFunction(() => document.querySelector('.preview pre')?.textContent === '# workspace preview')
+  check(await page.locator('.tree-pane').evaluate((el) => Math.abs(el.getBoundingClientRect().height - 205) < 1), '刷新后打开文件恢复持久化的文件树高度')
   await page.locator('.file-tree > li > details').first().evaluate((el) => { el.open = false })
   await page.locator('.console-history').evaluate((el) => { el.scrollTop = 0 })
   const workbenchGeometry = () => page.evaluate(() => {
@@ -752,21 +907,30 @@ async (page) => {
   await showSidebar('Workspace')
   assertWorkbench(await workbenchGeometry(), '1920px 工作台布局与 Terminal 范围正确')
   check(await page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().width === 390), '返回桌面宽度后恢复 Sidebar 偏好')
+  await page.locator('.agent-heading-actions button').first().click()
+  await page.locator('.context-panel').waitFor()
   await emit('runtime_status', { status: 'waiting_permission', turn_id: 'permission-turn' })
   await emit('permission_request', { turn_id: 'permission-turn', request_id: 'permission-1', target: 'D:\\' + 'directory\\'.repeat(50), tool_name: 'write_file', prompt: '允许写入 **plain text** 吗？' })
   await page.waitForFunction(() => document.querySelector('.permission-step[data-status="waiting"]'))
+  check(await page.locator('.context-panel').count() === 0 && await page.locator('.agent-heading-actions button:disabled').count() === 2, 'Permission 到达关闭 Context，保持 Context 与 Compact 禁用规则')
   check(await page.locator('.permission-step').isVisible() && await page.getByRole('button', { name: '仅本次', exact: true }).isVisible(), '等待权限及操作按钮保持可见')
   check((await page.locator('.permission-step p').textContent()).includes('**plain text**') && await page.locator('.permission-step strong').count() === 0, '权限内容保持纯文本')
   await page.getByRole('button', { name: '仅本次', exact: true }).click()
   check(requests.some((request) => request.path.endsWith('/permission') && JSON.parse(request.body).decision === 'once'), 'Permission 确认 API 参数保留')
   await emit('permission_resolved', { turn_id: 'permission-turn', request_id: 'permission-1' })
+  await emit('runtime_status', { status: 'idle', turn_id: 'permission-turn' })
+  await page.locator('.agent-heading-actions button').first().click()
+  await page.locator('.context-panel').waitFor()
   await emit('runtime_status', { status: 'waiting_mcp_trust', turn_id: 'permission-turn' })
   await emit('mcp_trust_request', { request_id: 'trust-1', servers: [{ alias: 'test-server', transport: 'stdio', command: 'python', args: ['server.py'], env_keys: ['TEST_KEY'] }] })
   await page.locator('.mcp-trust-card').waitFor()
+  check(await page.locator('.context-panel').count() === 0, 'MCP Trust 到达关闭浮动面板，不遮挡重要操作')
   check(await page.getByRole('button', { name: 'Reject', exact: true }).isVisible() && await page.getByRole('button', { name: 'Allow', exact: true }).isVisible(), 'MCP Trust 安全摘要和确认操作可见')
   await page.getByRole('button', { name: 'Allow', exact: true }).click()
   check(requests.some((request) => request.path.endsWith('/mcp-trust') && JSON.parse(request.body).approved === true), 'MCP Trust API 参数保留')
   await emit('mcp_trust_resolved', { request_id: 'trust-1' })
+  const permissionExecution = page.locator('.execution-header[data-status="waiting"]').last()
+  if (await permissionExecution.getAttribute('aria-expanded') === 'false') await permissionExecution.click()
   await emit('console_live', { active: true, turn_id: 'permission-turn', kind: 'tool', content: '工具日志 **必须为原文**\n{"value":"<img src=x onerror=alert(1)>"}' })
   await page.locator('.live-card[data-kind="tool"]').waitFor()
   check((await page.locator('.live-card pre').textContent()).includes('**必须为原文**'), '实时工具日志保持原文')
@@ -794,7 +958,7 @@ async (page) => {
     input.files = transfer.files
     input.dispatchEvent(new Event('change', { bubbles: true }))
   })
-  const uploaded = page.getByRole('button', { name: /note.txt/ })
+  const uploaded = page.locator('.file-button').filter({ hasText: 'note.txt' })
   await uploaded.waitFor()
   check(requests.some((item) => item.path.endsWith('/files/upload') && item.method === 'POST' && item.body.includes('note.txt') && item.body.includes('false')), 'Workspace 上传发送原有 multipart API 并刷新树')
   await uploaded.click()
@@ -806,10 +970,35 @@ async (page) => {
   await page.locator('.file-row').filter({ has: uploaded }).getByTitle('删除文件', { exact: true }).click()
   await page.getByRole('dialog', { name: '删除文件？', exact: true }).getByRole('button', { name: '删除', exact: true }).click()
   await uploaded.waitFor({ state: 'detached' })
-  check(await page.locator('.preview pre').textContent() === '' && requests.some((item) => item.path.endsWith('/files') && item.method === 'DELETE'), '删除文件保留确认流程并清空被删文件预览')
+  check(await page.locator('.preview, .workspace-splitter, .file-button.selected').count() === 0 && requests.some((item) => item.path.endsWith('/files') && item.method === 'DELETE'), '删除文件保留确认流程并移除被删文件预览')
   await showSidebar('Sessions')
+  holdHistory = true
   await page.locator('.sessions-panel').getByRole('button', { name: 'New Session', exact: true }).click()
-  await page.getByText('等待 Agent 输出…', { exact: true }).waitFor()
+  await page.getByText('正在加载会话历史…', { exact: true }).waitFor()
+  check(!await page.getByText('开始与 MyCode 对话，或描述你希望完成的任务。', { exact: true }).isVisible(), '加载历史时显示加载文案而非空闲引导')
+  await waitForFixture(() => releaseHistory)
+  holdHistory = false
+  releaseHistory()
+  await page.getByText('开始与 MyCode 对话，或描述你希望完成的任务。', { exact: true }).waitFor()
+  check(true, '空闲且没有聊天记录时显示任务引导')
+  await page.locator('.agent-heading-actions button').first().click()
+  await page.locator('.context-panel').waitFor()
+  check(await page.getByText('开始与 MyCode 对话，或描述你希望完成的任务。', { exact: true }).isVisible(), '空闲 Context 查询不将空会话误判为 Agent 执行中')
+  await page.getByRole('button', { name: '关闭 Context', exact: true }).click()
+  for (const status of ['starting', 'queued', 'running']) {
+    await emit('runtime_status', { status })
+    await page.getByText('等待 Agent 输出…', { exact: true }).waitFor()
+    check(!await page.getByText('开始与 MyCode 对话，或描述你希望完成的任务。', { exact: true }).isVisible(), status + ' 无消息时不显示空闲引导')
+  }
+  for (const [status, prompt] of [
+    ['stopped', 'Agent 已停止。'],
+    ['error', 'Agent 运行出错，请查看错误提示。'],
+  ]) {
+    await emit('runtime_status', { status })
+    await page.getByText(prompt, { exact: true }).waitFor()
+    check(await page.getByText('等待 Agent 输出…', { exact: true }).count() === 0, status + ' 无消息时不再提示等待输出')
+  }
+  await emit('runtime_status', { status: 'idle' })
   check(await page.evaluate(() => new URL(location.href).searchParams.get('session')) === 'ui-created', 'Session 创建与自动打开正常')
   const createdEntry = page.locator('.session-entry').filter({ has: page.getByRole('button', { name: 'Session idle', exact: true }) })
   await createdEntry.getByTitle('会话菜单').click()

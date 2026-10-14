@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue"
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue"
 
 import AppDialog from "./AppDialog.vue"
 import ActivityBar from "./ActivityBar.vue"
@@ -37,6 +37,7 @@ const displayName = ref("")
 const settingsOpen = ref(false)
 const sessionMenuId = ref(null)
 const entries = ref([])
+const expandedDirectories = reactive(new Set())
 const selectedPath = ref("")
 const fileContent = ref("")
 const consoleEvents = ref([])
@@ -45,6 +46,14 @@ const permission = ref(null)
 const pendingMcpTrust = ref(null)
 const contextStatus = ref(null)
 const contextVisible = ref(false)
+const contextError = ref("")
+const contextPanel = ref(null)
+const contextHeading = ref(null)
+const contextActions = ref(null)
+const contextCloseButton = ref(null)
+const contextMaxHeight = ref(360)
+let contextOpener = null
+let contextResizeObserver = null
 const controlInFlight = ref(null)
 const compactFeedback = ref("")
 const turnStates = ref({})
@@ -75,6 +84,8 @@ const activityBar = ref(null)
 let eventSource = null
 let workspaceTimer = null
 let generation = 0
+let previewRequest = 0
+let treeRequest = 0
 let resizeState = null
 
 const sendDisabled = computed(() =>
@@ -107,6 +118,16 @@ const dialogMode = computed(() => dialog.type === "rename" ? "input" : "confirm"
 const dialogConfirmDisabled = computed(() => (
   dialog.type === "rename" && !dialog.inputValue.trim()
 ))
+const emptyConsoleText = computed(() => {
+  if (sessionHydrating.value) return "正在加载会话历史…"
+  if (currentSession.value?.runtime_status === "stopped") return "Agent 已停止。"
+  if (currentSession.value?.runtime_status === "error") return "Agent 运行出错，请查看错误提示。"
+  if (currentSession.value?.runtime_status === "idle" && !currentSession.value.active_turn_id &&
+      !sendingSessionIds.has(currentSession.value.id)) {
+    return "开始与 MyCode 对话，或描述你希望完成的任务。"
+  }
+  return "等待 Agent 输出…"
+})
 
 async function request(path, options = {}) {
   const response = await fetch(API_BASE + path, options)
@@ -156,14 +177,15 @@ function clearCurrentSession(replace = true) {
   workspaceTimer = null
   currentSession.value = null
   entries.value = []
-  selectedPath.value = ""
-  fileContent.value = ""
+  expandedDirectories.clear()
+  closePreview()
   consoleEvents.value = []
   liveConsole.value = null
   permission.value = null
   pendingMcpTrust.value = null
   contextStatus.value = null
   contextVisible.value = false
+  contextError.value = ""
   controlInFlight.value = null
   compactFeedback.value = ""
   turnStates.value = {}
@@ -185,14 +207,15 @@ async function openSession(sessionId, replace = false) {
   const listed = sessions.value.find((item) => item.id === sessionId)
   currentSession.value = listed || { id: sessionId, name: null, runtime_status: "stopped", active_turn_id: null }
   entries.value = []
-  selectedPath.value = ""
-  fileContent.value = ""
+  expandedDirectories.clear()
+  closePreview()
   consoleEvents.value = []
   liveConsole.value = null
   permission.value = null
   pendingMcpTrust.value = null
   contextStatus.value = null
   contextVisible.value = false
+  contextError.value = ""
   controlInFlight.value = null
   compactFeedback.value = ""
   turnStates.value = {}
@@ -233,7 +256,6 @@ async function loadMetadata(sessionId, token) {
   permission.value = result.pending_permission
   pendingMcpTrust.value = result.pending_mcp_trust
   contextStatus.value = result.context_status || null
-  contextVisible.value = Boolean(result.context_status)
   controlInFlight.value = result.pending_control || null
   if (result.active_turn_id) {
     updateTurnStatus(result.active_turn_id, result.runtime_status)
@@ -373,8 +395,7 @@ async function submitDialog() {
       await request(`${scoped("/files", target.sessionId)}?path=${encodeURIComponent(target.path)}`, { method: "DELETE" })
       const wasCurrent = currentSession.value?.id === target.sessionId
       if (wasCurrent && (selectedPath.value === target.path || selectedPath.value.startsWith(`${target.path}/`))) {
-        selectedPath.value = ""
-        fileContent.value = ""
+        closePreview()
       }
       closeDialog()
       await refreshTree(target.sessionId, target.generation)
@@ -468,14 +489,12 @@ function connectEvents(sessionId, token, after) {
   eventSource.addEventListener("context_status", (event) => {
     if (generation !== token) return
     contextStatus.value = JSON.parse(event.data)
-    contextVisible.value = true
   })
   eventSource.addEventListener("compact_result", (event) => {
     if (generation !== token) return
     const data = JSON.parse(event.data)
     if (data.after) contextStatus.value = data.after
     else if (data.before) contextStatus.value = data.before
-    contextVisible.value = true
     compactFeedback.value = compactFeedbackText(data)
   })
   eventSource.addEventListener("workspace_changed", () => {
@@ -547,11 +566,42 @@ async function saveProfile() {
 }
 
 async function refreshTree(sessionId = currentSession.value?.id, token = generation) {
-  if (!sessionId) return
+  if (!sessionId || generation !== token || currentSession.value?.id !== sessionId) return
+  const requestId = ++treeRequest
   try {
     const result = await request(scoped("/files/tree", sessionId))
-    if (generation === token) entries.value = result.entries
-  } catch (reason) { if (generation === token) showError(reason) }
+    if (generation !== token || currentSession.value?.id !== sessionId || requestId !== treeRequest) return
+    entries.value = result.entries
+    const directories = new Set()
+    const files = new Set()
+    const visit = (items) => items.forEach((entry) => {
+      if (entry.kind === "directory") {
+        directories.add(entry.path)
+        visit(entry.children || [])
+      } else if (entry.kind === "file") files.add(entry.path)
+    })
+    visit(result.entries)
+    for (const path of expandedDirectories) if (!directories.has(path)) expandedDirectories.delete(path)
+    if (selectedPath.value && !files.has(selectedPath.value)) closePreview()
+  } catch (reason) { if (generation === token && requestId === treeRequest) showError(reason) }
+}
+
+function toggleDirectory(path, open) {
+  if (open) expandedDirectories.add(path)
+  else expandedDirectories.delete(path)
+}
+
+function closePreview(restoreFocus = false) {
+  const path = selectedPath.value
+  previewRequest += 1
+  selectedPath.value = ""
+  fileContent.value = ""
+  if (resizeState?.kind === "workspaceTree") stopResize()
+  if (restoreFocus) nextTick(() => {
+    const button = [...sidebarElement.value?.querySelectorAll(".file-button") || []]
+      .find((element) => element.title === path)
+    button?.focus({ preventScroll: true })
+  })
 }
 
 async function upload(event, archive) {
@@ -568,16 +618,19 @@ async function upload(event, archive) {
 }
 
 async function openFile(path, sessionId = currentSession.value?.id, token = generation) {
+  if (generation !== token || currentSession.value?.id !== sessionId) return
+  const requestId = ++previewRequest
+  if (selectedPath.value !== path) fileContent.value = ""
+  selectedPath.value = path
+  const isCurrent = () => generation === token && currentSession.value?.id === sessionId &&
+    requestId === previewRequest && selectedPath.value === path
   try {
     const result = await request(`${scoped("/files/content", sessionId)}?path=${encodeURIComponent(path)}`)
-    if (generation === token) {
-      selectedPath.value = path
-      fileContent.value = result.content
-    }
+    if (isCurrent()) fileContent.value = result.content
   } catch (reason) {
-    if (reason.status === 404 && generation === token) {
-      selectedPath.value = ""
-      fileContent.value = ""
+    if (!isCurrent()) return
+    if (reason.status === 404) {
+      closePreview()
       return
     }
     showError(reason)
@@ -614,13 +667,70 @@ async function sendMessage() {
   }
 }
 
-async function inspectContext() {
+function openContext(event) {
+  contextOpener = event?.currentTarget || contextActions.value?.querySelector("button")
+  contextVisible.value = true
+  contextError.value = ""
+  nextTick(() => {
+    if (contextVisible.value) {
+      updateContextHeight()
+      contextCloseButton.value?.focus({ preventScroll: true })
+    }
+  })
+}
+
+function updateContextHeight() {
+  const historyBounds = outputElement.value?.getBoundingClientRect()
+  const headingBounds = contextHeading.value?.getBoundingClientRect()
+  if (historyBounds && headingBounds) {
+    contextMaxHeight.value = Math.max(0, Math.min(360, historyBounds.bottom - headingBounds.bottom - 8))
+  }
+}
+
+watch(outputElement, (element) => {
+  contextResizeObserver?.disconnect()
+  if (!element) return
+  contextResizeObserver = new ResizeObserver(updateContextHeight)
+  contextResizeObserver.observe(element.parentElement)
+  updateContextHeight()
+}, { flush: "post" })
+
+function closeContext(restoreFocus = true) {
+  contextVisible.value = false
+  if (restoreFocus) {
+    const target = contextOpener?.isConnected && !contextOpener.disabled ? contextOpener : contextHeading.value
+    target?.focus({ preventScroll: true })
+  }
+}
+
+function dismissContext(event) {
+  if (!contextVisible.value) return
+  if (event.type === "keydown") {
+    if (event.key === "Escape" && !dialogOpen.value) {
+      event.preventDefault()
+      closeContext()
+    }
+    return
+  }
+  if (!contextPanel.value?.contains(event.target) && !contextActions.value?.contains(event.target)) closeContext(false)
+}
+
+// Permission and trust prompts take priority over this informational overlay.
+watch([permission, pendingMcpTrust, dialogOpen], ([permissionRequest, trustRequest, modalOpen]) => {
+  if (contextVisible.value && (permissionRequest || trustRequest || modalOpen)) closeContext(false)
+}, { flush: "sync" })
+
+async function inspectContext(event) {
   if (contextControlDisabled.value) return
+  if (contextVisible.value) {
+    closeContext()
+    return
+  }
   const sessionId = currentSession.value?.id
   const token = generation
   if (!sessionId) return
   controlInFlight.value = "context_status"
-  contextVisible.value = true
+  openContext(event)
   compactFeedback.value = ""
   try {
     const result = await request(contextStatusApiPath(sessionId), { method: "POST" })
@@ -629,7 +739,10 @@ async function inspectContext() {
       currentSession.value.pending_control = null
     }
   } catch (reason) {
-    if (generation === token && currentSession.value?.id === sessionId) showError(reason)
+    if (generation === token && currentSession.value?.id === sessionId) {
+      contextError.value = reason.message
+      showError(reason)
+    }
   } finally {
     if (generation === token && currentSession.value?.id === sessionId) {
       controlInFlight.value = null
@@ -637,13 +750,13 @@ async function inspectContext() {
   }
 }
 
-async function compactContext() {
+async function compactContext(event) {
   if (contextControlDisabled.value) return
   const sessionId = currentSession.value?.id
   const token = generation
   if (!sessionId) return
   controlInFlight.value = "compact"
-  contextVisible.value = true
+  openContext(event)
   compactFeedback.value = "正在 Compact…"
   try {
     const result = await request(compactApiPath(sessionId), { method: "POST" })
@@ -654,7 +767,10 @@ async function compactContext() {
       currentSession.value.pending_control = null
     }
   } catch (reason) {
-    if (generation === token && currentSession.value?.id === sessionId) showError(reason)
+    if (generation === token && currentSession.value?.id === sessionId) {
+      contextError.value = reason.message
+      showError(reason)
+    }
   } finally {
     if (generation === token && currentSession.value?.id === sessionId) {
       controlInFlight.value = null
@@ -795,9 +911,16 @@ function clamp(value, minimum, maximum) {
 onMounted(() => {
   saveLayout()
   window.addEventListener("popstate", handleHistoryNavigation)
+  document.addEventListener("pointerdown", dismissContext)
+  document.addEventListener("keydown", dismissContext)
+  document.addEventListener("focusin", dismissContext)
   void initialize()
 })
 onBeforeUnmount(() => {
+  contextResizeObserver?.disconnect()
+  document.removeEventListener("pointerdown", dismissContext)
+  document.removeEventListener("keydown", dismissContext)
+  document.removeEventListener("focusin", dismissContext)
   window.removeEventListener("popstate", handleHistoryNavigation)
   window.removeEventListener("pointermove", resize)
   eventSource?.close()
@@ -992,10 +1115,10 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
               <label class="button-label secondary" title="Upload ZIP and extract into Workspace root (/)" aria-label="Upload ZIP and extract into Workspace root (/)">Extract ZIP<input type="file" accept=".zip" @change="upload($event, true)" /></label>
               <a v-if="currentSession" class="button-link" :href="API_BASE + scoped('/workspace/download')">Download</a>
             </div>
-            <div class="workspace-body">
-              <nav class="tree-pane"><FileTree :entries="entries" :selected="selectedPath" @open="openFile" @delete="openDeleteEntryDialog" /><p v-if="!entries.length" class="muted">Workspace 为空</p></nav>
-              <div class="splitter horizontal inner workspace-splitter" title="拖动调整 File Tree 高度" @pointerdown="startResize('workspaceTree', $event)" />
-              <article class="preview"><div class="preview-title"><span>{{ selectedPath || "选择一个文本文件" }}</span><a v-if="selectedPath" :href="`${API_BASE}${scoped('/files/download')}?path=${encodeURIComponent(selectedPath)}`">Download</a></div><pre>{{ fileContent }}</pre></article>
+            <div class="workspace-body" :class="{ 'has-preview': selectedPath }">
+              <nav class="tree-pane" aria-label="Workspace 文件树"><FileTree :entries="entries" :selected="selectedPath" :expanded="expandedDirectories" @toggle="toggleDirectory" @open="openFile" @delete="openDeleteEntryDialog" /><p v-if="!entries.length" class="muted">Workspace 为空</p></nav>
+              <div v-if="selectedPath" class="splitter horizontal inner workspace-splitter" title="拖动调整 File Tree 高度" role="separator" aria-label="File Tree 高度" aria-orientation="horizontal" @pointerdown="startResize('workspaceTree', $event)" />
+              <article v-if="selectedPath" class="preview"><div class="preview-title"><span :title="selectedPath">{{ selectedPath }}</span><div class="preview-actions"><a :href="`${API_BASE}${scoped('/files/download')}?path=${encodeURIComponent(selectedPath)}`">Download</a><button class="icon-button" title="关闭文件预览" aria-label="关闭文件预览" @click="closePreview(true)">×</button></div></div><pre>{{ fileContent }}</pre></article>
             </div>
           </template>
           <div v-else class="workspace-empty-state">
@@ -1029,9 +1152,10 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
           </section>
         </div>
         <section class="panel agent-panel">
-          <div class="panel-heading agent-heading"><div><h2>Agent</h2><small>{{ currentSession ? sessionLabel(currentSession) : "" }} · {{ currentSession?.runtime_status || "stopped" }}</small></div><div class="agent-heading-actions"><button class="secondary compact-button" :disabled="contextControlDisabled" @click="inspectContext">{{ controlInFlight === 'context_status' ? 'Loading…' : 'Context' }}</button><button class="compact-button" :disabled="contextControlDisabled" @click="compactContext">{{ controlInFlight === 'compact' ? 'Compacting…' : 'Compact' }}</button></div></div>
-          <section v-if="contextVisible" class="context-panel">
-            <div class="context-panel-heading"><strong>Context</strong><span>{{ contextUsageLabel(contextStatus) }} used</span></div>
+          <div ref="contextHeading" class="panel-heading agent-heading" tabindex="-1"><div><h2>Agent</h2><small>{{ currentSession ? sessionLabel(currentSession) : "" }} · {{ currentSession?.runtime_status || "stopped" }}</small></div><div ref="contextActions" class="agent-heading-actions"><button class="secondary compact-button" :disabled="contextControlDisabled" :aria-expanded="contextVisible" aria-controls="context-popover" aria-haspopup="dialog" @click="inspectContext">{{ controlInFlight === 'context_status' ? 'Loading…' : 'Context' }}</button><button class="compact-button" :disabled="contextControlDisabled" :aria-expanded="contextVisible" aria-controls="context-popover" aria-haspopup="dialog" @click="compactContext">{{ controlInFlight === 'compact' ? 'Compacting…' : 'Compact' }}</button></div>
+          <section v-if="contextVisible" id="context-popover" ref="contextPanel" class="context-panel" :style="{ '--context-max-height': `${contextMaxHeight}px` }" role="dialog" aria-label="Context" tabindex="-1">
+            <div class="context-panel-heading"><strong>Context</strong><span>{{ contextUsageLabel(contextStatus) }} used</span><button ref="contextCloseButton" class="icon-button" title="关闭 Context" aria-label="关闭 Context" @click="closeContext()">×</button></div>
+            <p v-if="contextError" class="context-error" role="alert">{{ contextError }}</p>
             <p v-if="compactFeedback" class="context-feedback">{{ compactFeedback }}</p>
             <dl v-if="contextStatus" class="context-grid">
               <div><dt>Estimated Input / Max Input</dt><dd>{{ formatContextTokens(contextStatus.estimated_input_tokens) }} / {{ formatContextTokens(contextStatus.max_input_tokens) }}</dd></div>
@@ -1048,6 +1172,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
             </dl>
             <p v-else class="muted">{{ controlInFlight ? '正在加载 Context…' : 'Context 已变化，请重新查询' }}</p>
           </section>
+          </div>
           <div v-if="currentSession" class="console-viewport">
           <div ref="outputElement" class="console-history" tabindex="0" aria-label="Agent 消息历史">
             <div ref="outputContent" class="console-history-content">
@@ -1063,8 +1188,7 @@ function buildExecutionGroups(events, live, pendingPermission, session, states, 
               <ChatMessage v-for="event in group.assistants" :key="`assistant-${event.id}`" role="assistant" :content="event.content" />
               <ChatMessage v-if="group.live && group.live.kind === 'assistant'" role="assistant" :content="group.live.content" streaming />
             </section>
-            <p v-if="sessionHydrating" class="muted">正在加载会话历史…</p>
-            <p v-else-if="!executionGroups.length" class="muted">等待 Agent 输出…</p>
+            <p v-if="sessionHydrating || !executionGroups.length" class="muted console-empty-state">{{ emptyConsoleText }}</p>
             </div>
           </div>
           <button v-if="showScrollJump" class="scroll-jump" type="button" aria-label="回到底部，继续跟随 Agent 输出" @click="consoleScroll.jump">
