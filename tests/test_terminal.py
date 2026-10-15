@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 
 from app.config import ServerSettings
-from app.services.runtime import RuntimeTerminalTarget
+from app.services.runtime import AGENT_USER, RuntimeTerminalTarget
 from app.services.terminal import (
     TERMINAL_HOME,
     TERMINAL_USER,
@@ -133,9 +133,24 @@ def test_terminal_command_uses_system_path_without_private_runtime_env(
     assert "PATH=/usr/local/bin:/usr/bin:/bin" in command
     assert "MYCODE_API_KEY=" in command
     assert "MYCODE_BASE_URL=" in command
-    assert f"--user {TERMINAL_USER}" in rendered
-    assert f"HOME={TERMINAL_HOME}" in rendered
-    assert "umask 0002" in rendered
+    assert TERMINAL_USER == AGENT_USER == "mycode-agent"
+    assert TERMINAL_HOME == "/home/mycode"
+    assert command[command.index("--user") + 1] == "mycode-agent"
+    assert command[command.index("--workdir") + 1] == "/workspace"
+    assert "--interactive" in command
+    assert "--tty" in command
+    assert command[command.index("mycode-web-session") + 1:] == [
+        "/usr/bin/env",
+        "-i",
+        "HOME=/home/mycode",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "TERM=xterm-256color",
+        "LANG=C.UTF-8",
+        "PWD=/workspace",
+        "/bin/bash",
+        "-c",
+        "umask 0002; exec /bin/bash --noprofile --norc -i",
+    ]
     assert "/opt/mycode-venv/bin" not in rendered
     assert not any(
         part.startswith(("UV_PROJECT_ENVIRONMENT=", "VIRTUAL_ENV=", "PYTHONPATH="))

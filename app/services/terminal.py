@@ -16,8 +16,8 @@ TERMINAL_BUFFER_LIMIT = 256 * 1024
 TERMINAL_QUEUE_LIMIT = 128
 MAX_TERMINAL_INPUT_BYTES = 64 * 1024
 TERMINAL_PATH = "/usr/local/bin:/usr/bin:/bin"
-TERMINAL_USER = "workspace-user"
-TERMINAL_HOME = "/home/workspace-user"
+TERMINAL_USER = "mycode-agent"
+TERMINAL_HOME = "/home/mycode"
 
 
 class TerminalUnavailableError(RuntimeError):

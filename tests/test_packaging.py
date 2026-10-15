@@ -70,13 +70,17 @@ def test_sandbox_keeps_mycode_venv_private_from_user_projects() -> None:
         assert extra_package not in dockerfile
     assert "ln -s /opt/mycode-venv/bin/mycode /usr/local/bin/mycode" in dockerfile
     assert "groupadd --gid 10001 workspace" in dockerfile
-    assert "--uid 10001 --gid workspace" in dockerfile
-    assert "--uid 10002 --gid workspace" in dockerfile
+    assert (
+        "useradd --create-home --uid 10001 --gid workspace \\\n"
+        "        --home-dir /home/mycode --shell /bin/bash mycode-agent"
+    ) in dockerfile
+    assert dockerfile.count("useradd ") == 1
+    assert "workspace-user" not in dockerfile
+    assert "10002" not in dockerfile
     assert "USER mycode-agent" in dockerfile
     assert "chmod 2775 /workspace" in dockerfile
-    assert "chmod 0700 /home/mycode /home/workspace-user /opt/mycode-venv" in dockerfile
+    assert "chmod 0700 /home/mycode /opt/mycode-venv" in dockerfile
     assert "chown -R mycode-agent:workspace /workspace /home/mycode" in dockerfile
-    assert "chown -R workspace-user:workspace /home/workspace-user" in dockerfile
     assert "COPY docker/entrypoint-sandbox.sh /usr/local/bin/sandbox-entrypoint" in dockerfile
     assert 'CMD ["mycode", "runtime", "--jsonl", "--continue"]' in dockerfile
 
