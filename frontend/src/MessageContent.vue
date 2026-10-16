@@ -1,33 +1,20 @@
 <script setup>
-import { onBeforeUnmount, ref, watch } from "vue"
+import { onBeforeUnmount } from "vue"
 import { renderMarkdown } from "./markdown"
+import { useStreamingMarkdown } from "./useStreamingMarkdown.js"
+import { finishStreamMeasure, startStreamMeasure } from "./streamingDebug.js"
 
 const props = defineProps({
   content: { type: String, default: "" },
   streaming: { type: Boolean, default: false },
 })
-const html = ref(renderMarkdown(props.content))
-let renderTimer = null
-const resetTimers = new Set()
-
-function cancelPendingRender() {
-  if (renderTimer !== null) window.clearTimeout(renderTimer)
-  renderTimer = null
-}
-
-watch([() => props.content, () => props.streaming], ([content, streaming]) => {
-  // Coalesce large live snapshots only. Render the latest complete source, and
-  // render stable answers immediately; no delta buffering or SSE changes.
-  if (!streaming || content.length < 16000) {
-    cancelPendingRender()
-    html.value = renderMarkdown(content)
-  } else if (renderTimer === null) {
-    renderTimer = window.setTimeout(() => {
-      renderTimer = null
-      html.value = renderMarkdown(props.content)
-    }, 120)
-  }
+const html = useStreamingMarkdown(props, (content) => {
+  const started = startStreamMeasure()
+  const result = renderMarkdown(content)
+  finishStreamMeasure("markdown", started)
+  return result
 })
+const resetTimers = new Set()
 
 function copyWithSelection(text) {
   const previousFocus = document.activeElement
@@ -80,7 +67,6 @@ async function copyCode(event) {
 }
 
 onBeforeUnmount(() => {
-  cancelPendingRender()
   resetTimers.forEach((timer) => window.clearTimeout(timer))
 })
 </script>

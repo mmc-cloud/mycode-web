@@ -7,7 +7,8 @@ import ChatMessage from "./ChatMessage.vue"
 import Composer from "./Composer.vue"
 import FileTree from "./FileTree.vue"
 import ExecutionTimeline from "./ExecutionTimeline.vue"
-import { buildExecutionGroups } from "./execution.js"
+import { useExecutionGroups } from "./execution.js"
+import { recordLiveArrival } from "./streamingDebug.js"
 import TerminalPanel from "./TerminalPanel.vue"
 import { LAYOUT_KEY, loadLayout } from "./layout"
 import { useConsoleScroll } from "./useConsoleScroll"
@@ -114,14 +115,10 @@ const contextControlDisabled = computed(() => {
   if (pendingMcpTrust.value) return true
   return false
 })
-const executionGroups = computed(() => buildExecutionGroups(
-  consoleEvents.value,
-  liveConsole.value,
-  permission.value,
-  currentSession.value,
-  turnStates.value,
-  expandedGroups.value,
-))
+const executionGroups = useExecutionGroups({
+  events: consoleEvents, live: liveConsole, pendingPermission: permission,
+  session: currentSession, states: turnStates, expanded: expandedGroups,
+})
 const dialogOpen = computed(() => Boolean(dialog.type))
 const dialogMode = computed(() => dialog.type === "rename" ? "input" : "confirm")
 const dialogConfirmDisabled = computed(() => (
@@ -458,6 +455,7 @@ function connectEvents(sessionId, token, after) {
   })
   eventSource.addEventListener("console_live", (event) => {
     if (generation !== token) return
+    recordLiveArrival()
     const data = JSON.parse(event.data)
     liveConsole.value = data.active ? data : null
     scrollConsole()
@@ -1065,7 +1063,7 @@ onBeforeUnmount(() => {
           <div v-if="currentSession" class="console-viewport">
           <div ref="outputElement" class="console-history" tabindex="0" aria-label="Agent 消息历史">
             <div ref="outputContent" class="console-history-content">
-            <section v-for="group in executionGroups" :key="group.key" class="execution-group">
+            <section v-for="group in executionGroups" :key="`${currentSession.id}:${group.key}`" class="execution-group">
               <template v-for="item in group.items" :key="item.id">
                 <ExecutionTimeline v-if="item.kind === 'execution'" :group="item.block" :permission-submission="permissionSubmissionStatus" @toggle="toggleGroup" @resolve="resolvePermission" />
                 <ChatMessage v-else :role="item.kind" :content="item.content" :streaming="Boolean(item.streaming)" :data-event-id="item.eventId" />

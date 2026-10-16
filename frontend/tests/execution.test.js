@@ -1,10 +1,12 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { buildExecutionGroups } from "../src/execution.js"
+import { nextTick, ref } from "vue"
+import { buildExecutionGroups, useExecutionGroups } from "../src/execution.js"
 
 const event = (id, type, payload = {}, turn = "a") => ({ id, kind: "tool", content: type, data: { turn_id: turn, event_type: type, event: { type, ...payload } } })
 const call = (id, toolId, name = "read_file", turn = "a") => event(id, "tool_call", { tool_call: { ...(toolId === undefined ? {} : { id: toolId }), name, arguments: { path: "README.md" } } }, turn)
 const result = (id, toolId, ok = true, turn = "a") => event(id, "tool_result", { tool_result: { ...(toolId === undefined ? {} : { tool_call_id: toolId }), ok, content: "output", error: ok === false ? "permission denied" : null } }, turn)
+const stop = (id, reason, turn = "a") => ({ ...event(id, "stop", { stop_reason: reason }, turn), content: `Stopped: ${reason ?? "unknown"}` })
 const permission = (id, data) => ({ id, kind: "permission", content: "真实请求说明", data: { turn_id: "a", request_id: "p", ...data } })
 const group = (events, { status = "idle", expanded = {}, pending = null } = {}) => buildExecutionGroups(events, null, pending,
   { active_turn_id: status === "idle" ? null : "a", runtime_status: status }, { a: { status } }, expanded)[0]
@@ -27,7 +29,6 @@ test("current id-less result format pairs only adjacent, unique, gap-free calls"
   assert.equal(group(events).stepCount, 4)
   for (const input of [
     [call(1), result(3)], // omitted Console event
-    [call(1), event(2, "progress"), result(3)],
     [call(1), call(2), result(3), result(4)],
     [result(1), call(2), result(3)],
     [call(1), result(2, "different")],
@@ -79,12 +80,12 @@ test("permission lifecycle retains resolution order and exposes exactly one acti
   assert.equal(value.expanded, false)
   assert.equal(value.timeline.filter((step) => step.actionable).length, 1)
   assert.equal(value.actionablePermission.id, "event-3")
-  assert.equal(value.stepCount, 2)
+  assert.equal(value.stepCount, 1) // the permission lifecycle; progress is hidden
   value = group([...events, permission(4, { decision: "task" })], { pending })
   assert.equal(value.actionablePermission, null)
   assert.equal(value.timeline[0].status, "allowed")
   assert.equal(value.timeline.at(-1).type, "permission_resolved")
-  assert.equal(value.stepCount, 2)
+  assert.equal(value.stepCount, 1)
   assert.equal(group([permission(1, {})]).timeline[0].status, "unknown")
   assert.equal(group([permission(1, { allowed: false, expired: true })]).timeline[0].status, "expired")
   const synthetic = group([], { status: "waiting_permission", pending })
@@ -113,6 +114,126 @@ test("replayed/upserted SSE and history have the same timeline without mutating 
 
 const message = (id, kind, content = `${kind}-${id}`) => ({ id, kind, content, data: { turn_id: "a" } })
 const blocks = (value) => value.items.filter((item) => item.kind === "execution").map((item) => item.block)
+
+test("normal completion bookkeeping after the final assistant creates no extra block", () => {
+  const events = [call(1, "read"), result(2, "read"), message(3, "assistant", "final answer"),
+    event(4, "progress"), stop(5, "final_answer")]
+  const original = JSON.stringify(events)
+  const value = group(events)
+  assert.deepEqual(value.items.map((item) => item.kind), ["execution", "assistant"])
+  assert.deepEqual(value.timeline.map((step) => step.id), ["event-1"])
+  assert.equal(value.stepCount, 2)
+  assert.equal(value.status, "completed")
+  assert.equal(blocks(value).length, 1)
+  assert.equal(blocks(value)[0].stepCount, 2)
+  assert.equal(blocks(value)[0].blockCount, 1)
+  assert.equal(value.items.at(-1).content, "final answer")
+  assert.deepEqual(value.events, events)
+  assert.equal(value.events[3], events[3])
+  assert.equal(JSON.stringify(events), original)
+})
+
+test("progress and final_answer stop add no visible steps or blocks even without tools", () => {
+  const progress = event(1, "progress")
+  delete progress.data.event_type // also accept the structured payload type
+  for (const events of [[progress], [stop(2, "final_answer")], [progress, stop(2, "final_answer")]]) {
+    const value = group(events)
+    assert.equal(value.stepCount, 0)
+    assert.deepEqual(value.timeline, [])
+    assert.deepEqual(value.items, [])
+    assert.deepEqual(value.events, events)
+    const answerOnly = group([message(0, "assistant"), ...events])
+    assert.deepEqual(answerOnly.items.map((item) => item.kind), ["assistant"])
+    assert.equal(answerOnly.stepCount, 0)
+  }
+})
+
+test("hidden events do not change conservative ID-less pairing or erase raw event gaps", () => {
+  for (const hidden of [event(2, "progress"), stop(2, "final_answer")]) {
+    const events = [call(1), hidden, result(3)]
+    const value = group(events)
+    assert.deepEqual(value.timeline.map((step) => step.id), ["event-1", "event-3"])
+    assert.deepEqual(value.timeline.map((step) => step.status), ["unknown", "success"])
+    assert.deepEqual(value.timeline.map((step) => step.sources.length), [1, 1])
+    assert.equal(value.timeline[0].association, null)
+    assert.equal(value.stepCount, 2)
+    assert.equal(value.events[1], hidden)
+  }
+  // An actual adjacent pair still associates with hidden events elsewhere.
+  const value = group([event(1, "progress"), call(2), result(3), stop(4, "final_answer")])
+  assert.equal(value.timeline.length, 1)
+  assert.equal(value.timeline[0].sources.length, 2)
+  assert.equal(value.stepCount, 2)
+})
+
+test("real multi-block execution keeps message boundaries, numbering and independent folds", () => {
+  const events = [message(1, "assistant"), call(2, "read"), result(3, "read"),
+    message(4, "assistant"), event(5, "progress"), call(6, "edit", "edit_file"), result(7, "edit"),
+    message(8, "assistant"), event(9, "progress"), stop(10, "final_answer")]
+  const value = group(events, { expanded: { a: true, "a:after-message-4": false } })
+  assert.deepEqual(value.items.map((item) => item.kind), ["assistant", "execution", "assistant", "execution", "assistant"])
+  assert.deepEqual(value.items.filter((item) => item.kind === "assistant").map((item) => item.eventId), [1, 4, 8])
+  assert.deepEqual(blocks(value).map((block) => block.timeline.map((step) => step.id)), [["event-2"], ["event-6"]])
+  assert.deepEqual(blocks(value).map((block) => [block.blockNumber, block.blockCount, block.stepCount, block.expanded]),
+    [[1, 2, 2, true], [2, 2, 2, false]])
+  assert.equal(value.stepCount, 4)
+})
+
+test("abnormal and unspecified stop reasons remain visible with their original details", () => {
+  for (const reason of ["max_turns", "model_error", "context_overflow", "cancelled", "unknown", undefined, null]) {
+    const source = stop(2, reason)
+    const value = group([message(1, "assistant"), source])
+    assert.deepEqual(value.items.map((item) => item.kind), ["assistant", "execution"])
+    assert.equal(value.timeline[0].type, "stop")
+    assert.equal(value.timeline[0].detail, source.content)
+    assert.equal(value.timeline[0].sources[0], source)
+    assert.equal(value.stepCount, 1)
+    assert.equal(blocks(value)[0].stepCount, 1)
+  }
+})
+
+test("permissions, failures, warnings, errors and reliable cross-message pairs survive filtering", () => {
+  const pending = { turn_id: "a", request_id: "p" }
+  const events = [call(1, "read"), event(2, "progress"), message(3, "assistant"), result(4, "read", false),
+    permission(5, {}), stop(6, "final_answer"), permission(7, { decision: "once" }),
+    event(8, "artifact_warning"), event(9, "model_retry"),
+    { id: 10, kind: "error", content: "Runtime error", data: { turn_id: "a" } },
+    message(11, "assistant"), event(12, "progress"), stop(13, "final_answer")]
+  const value = group(events, { pending })
+  assert.deepEqual(value.timeline.map((step) => step.id), ["event-1", "event-5", "event-7", "event-8", "event-9", "event-10"])
+  assert.deepEqual(value.timeline[0].sources, [events[0], events[3]])
+  assert.equal(value.timeline[0].status, "failed")
+  assert.equal(value.timeline[1].status, "allowed")
+  assert.equal(value.actionablePermission, null)
+  assert.equal(value.status, "error")
+  assert.equal(value.hasToolFailure, true)
+  assert.equal(value.stepCount, 5) // call + result + two warnings + one permission lifecycle
+  assert.deepEqual(blocks(value).map((block) => block.stepCount), [2, 3])
+  assert.equal(value.items.at(-1).eventId, 11)
+})
+
+test("SSE prefixes, redelivery and restored history agree after normal completion filtering", () => {
+  const events = [message(1, "user"), call(2, "read"), result(3, "read"), message(4, "assistant"),
+    event(5, "progress"), stop(6, "final_answer"), call(7, "other", "write_file", "b"),
+    stop(8, "max_turns", "b")]
+  const input = reactiveGroups([])
+  input.live.value = null
+  input.session.value = { id: "s", active_turn_id: null, runtime_status: "idle" }
+  const replay = []
+  for (const source of events) {
+    replay.push(source, source)
+    input.events.value.push(source, source)
+    const restored = buildExecutionGroups([...events.filter((event) => event.id <= source.id)].reverse(), null, null, null, {}, { a: false })
+    assert.deepEqual(input.groups.value, restored)
+    assert.deepEqual(buildExecutionGroups(replay, null, null, null, {}, { a: false }), restored)
+  }
+  const final = input.groups.value
+  assert.deepEqual(final.map((value) => value.key), ["a", "b"])
+  assert.deepEqual(final[0].items.map((item) => item.kind), ["user", "execution", "assistant"])
+  assert.equal(final[0].stepCount, 2)
+  assert.deepEqual(final[0].events, events.slice(0, 6))
+  assert.equal(final[1].timeline.at(-1).type, "stop")
+})
 
 test("user, assistant and execution alternate at durable event positions", () => {
   const value = group([message(1, "user"), message(2, "assistant"), call(3, "read"), result(4, "read"), message(5, "assistant")])
@@ -192,4 +313,93 @@ test("incremental/replayed events and restored history produce the same ordered 
   const revised = { ...events[2], content: "updated assistant" }
   assert.equal(group([...events, revised]).items.filter((item) => item.eventId === 3).length, 1)
   assert.equal(group([...events, revised]).items.find((item) => item.eventId === 3).content, revised.content)
+})
+
+function reactiveGroups(events = [message(1, "user"), call(2, "one"), result(3, "one")]) {
+  const input = {
+    events: ref(events), live: ref({ active: true, kind: "assistant", turn_id: "a", content: "start" }),
+    pendingPermission: ref(null), session: ref({ id: "session-1", active_turn_id: "a", runtime_status: "running" }),
+    states: ref({}), expanded: ref({ a: false }),
+  }
+  return { ...input, groups: useExecutionGroups(input) }
+}
+
+test("high-frequency assistant snapshots reuse historical projection and execution block props", async () => {
+  let sourceReads = 0
+  const source = call(2, "one")
+  Object.defineProperty(source, "id", { get() { sourceReads += 1; return 2 }, enumerable: true })
+  const input = reactiveGroups([message(1, "user"), source, result(3, "one")])
+  const initial = input.groups.value[0]
+  const reads = sourceReads
+  for (let i = 0; i < 100; i += 1) {
+    input.live.value = { ...input.live.value, content: `snapshot-${i}` }
+    await nextTick()
+    const updated = input.groups.value[0]
+    assert.equal(updated.items.at(-1).content, `snapshot-${i}`)
+    assert.equal(updated.timeline, initial.timeline)
+    assert.equal(updated.items[0], initial.items[0])
+    assert.equal(blocks(updated)[0], blocks(initial)[0])
+    assert.equal(blocks(updated)[0].expanded, false)
+  }
+  // Every full projection reads source IDs; the real composable must read none.
+  assert.equal(sourceReads, reads)
+})
+
+test("history, runtime, permission, folds and live boundaries still invalidate projection", () => {
+  const input = reactiveGroups()
+  const previous = input.groups.value[0].timeline
+  input.expanded.value.a = true
+  assert.notEqual(input.groups.value[0].timeline, previous)
+  assert.equal(blocks(input.groups.value[0])[0].expanded, true)
+  input.events.value.push(call(4, "two"))
+  assert.equal(input.groups.value[0].timeline.at(-1).status, "running")
+  input.states.value.a = { status: "stopped" }
+  assert.equal(input.groups.value[0].status, "stopped")
+  assert.equal(input.groups.value[0].timeline.at(-1).status, "unknown")
+  input.states.value.a.status = "waiting_permission"
+  input.pendingPermission.value = { turn_id: "a", request_id: "p", tool_name: "write_file" }
+  assert.equal(input.groups.value[0].actionablePermission.requestId, "p")
+  input.events.value.push(permission(5, { decision: "once" }))
+  assert.equal(input.groups.value[0].actionablePermission, null)
+  input.pendingPermission.value = null
+  input.live.value = { active: true, kind: "tool", turn_id: "a", content: "tool log" }
+  assert.equal(blocks(input.groups.value[0]).at(-1).live.content, "tool log")
+  input.live.value = { ...input.live.value, content: "updated tool log" }
+  assert.equal(blocks(input.groups.value[0]).at(-1).live.content, "updated tool log")
+  input.live.value = { active: true, kind: "assistant", turn_id: "b", content: "other turn" }
+  assert.equal(input.groups.value.at(-1).key, "b")
+  assert.equal(input.groups.value.at(-1).items.at(-1).content, "other turn")
+  input.live.value = null
+  assert.equal(input.groups.value.length, 1)
+  assert.equal(input.groups.value[0].items.some((item) => item.streaming), false)
+})
+
+test("reactive Assistant → Tool → Assistant order matches full projection and survives session reset", () => {
+  const input = reactiveGroups([message(1, "user")])
+  const expected = () => buildExecutionGroups(input.events.value, input.live.value, input.pendingPermission.value,
+    input.session.value, input.states.value, input.expanded.value)
+  assert.deepEqual(input.groups.value, expected())
+  input.live.value = null
+  input.events.value.push(message(2, "assistant", "before tool"), call(3, "one"))
+  input.live.value = { active: true, kind: "tool", turn_id: "a", content: "running" }
+  assert.deepEqual(input.groups.value, expected())
+  const blockKey = blocks(input.groups.value[0]).at(-1).key
+  input.expanded.value[blockKey] = false
+  input.live.value = null
+  input.events.value.push(result(4, "one"))
+  input.live.value = { active: true, kind: "assistant", turn_id: "a", content: "after tool" }
+  assert.deepEqual(input.groups.value, expected())
+  assert.deepEqual(input.groups.value[0].items.map((item) => item.kind), ["user", "assistant", "execution", "assistant"])
+  assert.equal(blocks(input.groups.value[0]).at(-1).expanded, false)
+  input.live.value = null
+  input.events.value.push(message(5, "assistant", "final content"))
+  input.session.value.runtime_status = "idle"
+  input.session.value.active_turn_id = null
+  assert.deepEqual(input.groups.value, expected())
+  assert.equal(input.groups.value[0].items.at(-1).content, "final content")
+  input.events.value = []
+  input.states.value = {}
+  input.expanded.value = {}
+  input.session.value = { id: "session-2", active_turn_id: null, runtime_status: "stopped" }
+  assert.deepEqual(input.groups.value, [])
 })

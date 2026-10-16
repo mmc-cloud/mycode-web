@@ -1,3 +1,6 @@
+import { computed } from "vue"
+import { finishStreamMeasure, startStreamMeasure } from "./streamingDebug.js"
+
 // Display projection only: never infer success, test outcomes or file diffs from logs.
 const ACTIVE = ["starting", "queued", "running", "waiting_permission", "waiting_mcp_trust"]
 const object = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {}
@@ -117,6 +120,39 @@ export function permissionStepFor(event) {
   }
 }
 
+export function useExecutionGroups({ events, live, pendingPermission, session, states, expanded }) {
+  // Vue keeps downstream projections cached when this computed returns the same
+  // object. Assistant text is display data, not a timeline boundary or tool event.
+  const timelineLive = computed((previous) => {
+    const value = live.value
+    if (!value?.active || value.kind !== "assistant") return value
+    if (previous?.active && previous.kind === value.kind && previous.turn_id === value.turn_id) return previous
+    return { active: true, kind: value.kind, turn_id: value.turn_id }
+  })
+  const projected = computed(() => {
+    const started = startStreamMeasure()
+    const groups = buildExecutionGroups(
+      events.value, timelineLive.value, pendingPermission.value,
+      session.value, states.value, expanded.value,
+    )
+    finishStreamMeasure("timeline", started)
+    return groups
+  })
+  return computed(() => {
+    const groups = projected.value
+    const value = live.value
+    if (!value?.active || value.kind !== "assistant") return groups
+    return groups.map((group) => {
+      if (group.live?.kind !== "assistant") return group
+      // buildExecutionGroups anchors the live assistant after durable events.
+      // Reuse all historical items, tool associations and execution block props.
+      const items = group.items.slice()
+      items[items.length - 1] = { ...items.at(-1), content: value.content }
+      return { ...group, live: value, items }
+    })
+  })
+}
+
 export function buildExecutionGroups(events, live, pendingPermission, session, states = {}, expanded = {}) {
   const groups = new Map()
   let fallbackTurn = null
@@ -151,6 +187,10 @@ export function buildExecutionGroups(events, live, pendingPermission, session, s
     let permissionCount = 0, toolCount = 0
     for (const [index, event] of group.events.entries()) {
       if (event.kind === "tool") {
+        // Hide routine bookkeeping only after pairing against the full event
+        // sequence, so hidden rows never make ID-less results look adjacent.
+        const type = typeFor(event)
+        if (type === "progress" || (type === "stop" && payloadFor(event).stop_reason === "final_answer")) continue
         toolCount += 1
         if (!consumed.has(index)) {
           const pair = pairs.get(index)
@@ -197,8 +237,8 @@ export function buildExecutionGroups(events, live, pendingPermission, session, s
       { running: "Running", queued: "Queued", waiting: "Waiting for permission", error: "Error", stopped: "Stopped", completed: "Completed" }[status]
     const explicitExpanded = expanded[group.key]
     const groupExpanded = explicitExpanded === undefined ? ACTIVE.includes(state) || hasRuntimeError || hasToolFailure || Boolean(actionablePermission) : explicitExpanded
-    // Preserve original semantics: raw tool/runtime events + permission lifecycles,
-    // not merged rows, assistant messages or a count of tool invocations.
+    // Count visible source tool/runtime events + permission lifecycles, not
+    // merged rows, hidden bookkeeping, assistant messages or tool invocations.
     const stepCount = toolCount + permissionCount
     const summary = `${stepCount} steps · ${statusLabel}${hasToolFailure ? " · 有工具失败" : ""}`
     // Messages are boundaries, not children of a folding execution container.

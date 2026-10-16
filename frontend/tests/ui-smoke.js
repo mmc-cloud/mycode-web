@@ -12,6 +12,7 @@ async (page) => {
   const errors = []
   const imageRequests = []
   let markdownPerformance
+  let shortStreamingPerformance
   const scrollSamples = []
   const composerHeights = {}
   let failMessage = false
@@ -146,6 +147,7 @@ async (page) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify(data) })
   })
   await page.addInitScript(() => {
+    window.__MYCODE_STREAM_DEBUG__ = {}
     window.__uiTest = { sources: [], sockets: [], sent: [], scrollObservers: [] }
     const NativeResizeObserver = window.ResizeObserver
     window.ResizeObserver = class extends NativeResizeObserver {
@@ -686,6 +688,39 @@ async (page) => {
   await page.getByRole('heading', { name: '历史记录' }).waitFor()
   await page.getByRole('button', { name: 'UI 重构演示 idle' }).click()
   await page.getByRole('heading', { name: '实现完成', exact: true }).waitFor()
+  // Ordinary replies must throttle too. Counters are opt-in dev diagnostics;
+  // reset after mounting the live boundary to isolate text-only updates.
+  await emit('runtime_status', { status: 'running', turn_id: 'short-performance-turn' })
+  await emit('console_event', { id: 38, kind: 'user', content: '普通流式性能测试', data: { turn_id: 'short-performance-turn' } })
+  await emit('console_live', { active: true, kind: 'assistant', turn_id: 'short-performance-turn', content: 'P1_SHORT_START' })
+  await page.getByText('P1_SHORT_START', { exact: true }).waitFor()
+  shortStreamingPerformance = await page.evaluate(async () => {
+    window.__MYCODE_STREAM_DEBUG__ = {}
+    let content = ''
+    for (let revision = 1; revision <= 40; revision += 1) {
+      content = `普通回复 **完整快照** P1_SHORT_REV_${revision}`
+      window.__uiTest.emit('console_live', { active: true, kind: 'assistant', turn_id: 'short-performance-turn', content })
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    const stats = structuredClone(window.__MYCODE_STREAM_DEBUG__)
+    const latestVisible = document.querySelector('[aria-busy="true"] .message-content')?.textContent.includes('P1_SHORT_REV_40')
+    // Ensure there is pending work when the durable final answer replaces live.
+    window.__uiTest.emit('console_live', { active: true, kind: 'assistant', turn_id: 'short-performance-turn', content: content + ' pending' })
+    await Promise.resolve()
+    const final = content + ' FINAL_TAIL'
+    window.__uiTest.emit('console_event', { id: 39, kind: 'assistant', content: final, data: { turn_id: 'short-performance-turn' } })
+    window.__uiTest.emit('runtime_status', { status: 'idle', turn_id: 'short-performance-turn' })
+    await Promise.resolve()
+    const finalImmediate = [...document.querySelectorAll('.message-content')].some((el) => el.textContent.includes('P1_SHORT_REV_40 FINAL_TAIL'))
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const noLateUpdate = !document.querySelector('[aria-busy="true"]') && ![...document.querySelectorAll('.message-content')].some((el) => el.textContent.includes('P1_SHORT_REV_40 pending'))
+    return { ...stats, latestVisible, finalImmediate, noLateUpdate }
+  })
+  check(shortStreamingPerformance.sse.count === 40 && !shortStreamingPerformance.timeline?.count, 'P1：40 次普通 Live 文本更新不重新投影历史 Timeline')
+  check(shortStreamingPerformance.markdown.count > 0 && shortStreamingPerformance.markdown.count <= 10 && shortStreamingPerformance.latestVisible, 'P1：普通回复受到节流且完整呈现最新快照')
+  check(shortStreamingPerformance.finalImmediate && shortStreamingPerformance.noLateUpdate, 'P1：最终尾部在下次 Vue 更新立即显示，待渲染快照不迟到覆盖')
+
   // Measure real Vue DOM updates while snapshots arrive on a 20ms timer.
   // The final answer combines prose, lists and a single ~700-line JS block.
   await emit('runtime_status', { status: 'running', turn_id: 'performance-turn' })
@@ -693,6 +728,7 @@ async (page) => {
   await showSidebar('Workspace')
   const performanceRun = page.evaluate(async () => {
     const { renderMarkdown } = await import('/web/src/markdown.js')
+    window.__MYCODE_STREAM_DEBUG__ = {}
     const latencies = [], timerLags = [], longTasks = [], seen = new Set(), sentAt = new Map()
     const longTaskObserver = new PerformanceObserver((list) => longTasks.push(...list.getEntries().map((entry) => entry.duration)))
     longTaskObserver.observe({ type: 'longtask', buffered: false })
@@ -740,6 +776,7 @@ async (page) => {
       const live = document.querySelector('[aria-busy="true"] .message-content')
       const expected = document.createElement('div'); expected.innerHTML = renderMarkdown(lastSnapshot)
       const liveComplete = live.innerHTML === expected.innerHTML
+      const streamStats = structuredClone(window.__MYCODE_STREAM_DEBUG__)
       window.__uiTest.emit('console_event', { id: 41, kind: 'assistant', content: lastSnapshot, data: { turn_id: 'performance-turn' } })
       window.__uiTest.emit('runtime_status', { status: 'idle', turn_id: 'performance-turn' })
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
@@ -748,6 +785,7 @@ async (page) => {
       const p95 = (values) => sorted(values)[Math.ceil(values.length * .95) - 1] || 0
       return {
         characters: lastSnapshot.length, utf8Bytes: new TextEncoder().encode(lastSnapshot).length,
+        streamStats,
         updates: revision, codeLines, requestedIntervalMs: 20, renderedSnapshots: seen.size,
         durationMs: performance.now() - started,
         updateToFrameMeanMs: latencies.reduce((a, b) => a + b, 0) / latencies.length,
@@ -776,6 +814,7 @@ async (page) => {
   markdownPerformance = { ...await performanceRun, interactionStages, interactionLatenciesMs: interactionLatencies, maxInteractionMs: Math.max(...interactionLatencies) }
   check(markdownPerformance.utf8Bytes >= 100000 && markdownPerformance.updates === 120, '大文本流式规模达到 100KB、120 次更新')
   check(markdownPerformance.liveComplete && markdownPerformance.finalComplete && markdownPerformance.finalCount === 1 && !markdownPerformance.stillStreaming, '大文本流式和最终回答完整且不重复')
+  check(markdownPerformance.streamStats.timeline.count === 1 && markdownPerformance.streamStats.markdown.count < 120, 'P1：大文本只在 Live 边界投影一次 Timeline，Markdown 渲染次数少于快照数')
   // Loose responsiveness guard for CI/desktop variance; report actual timings.
   if (markdownPerformance.maxInteractionMs >= 1000 || markdownPerformance.updateToFrameP95Ms >= 500) throw new Error('大文本响应超限: ' + JSON.stringify(markdownPerformance))
   check(true, '大文本期间输入与侧栏交互保持响应')
@@ -1057,7 +1096,7 @@ async (page) => {
   await thirdEmit(thirdResult(105, 'third-order', 'second', false, { error: 'actual command failure <script>plain</script>' }))
   await thirdEmit(thirdResult(106, 'third-order', 'first', true))
   const orderGroup = turnGroup('third-order')
-  check(JSON.stringify(await orderGroup.locator('.execution-content > [data-event-id]').evaluateAll((rows) => rows.map((row) => row.dataset.eventId))) === JSON.stringify(['event-102', 'event-103', 'event-104']), '第三批：明确 ID 的交错结果合并，记录按调用和运行事件的原始顺序展示')
+  check(JSON.stringify(await orderGroup.locator('.execution-content > [data-event-id]').evaluateAll((rows) => rows.map((row) => row.dataset.eventId))) === JSON.stringify(['event-102', 'event-104']), '第三批：明确 ID 的交错结果合并，隐藏 progress 后仍按原始调用顺序展示')
   check(await orderGroup.locator('[data-event-id="event-104"]').getAttribute('open') !== null && (await orderGroup.locator('.step-error').innerText()).includes('actual command failure'), '第三批：失败工具详情自动展开并显示实际原因')
   check(await orderGroup.locator('.execution-header').getAttribute('data-status') === 'running', '第三批：工具失败不将运行中的 Turn 标记成 Error')
   await orderGroup.locator('[data-event-id="event-104"] > summary').click()
@@ -1069,8 +1108,8 @@ async (page) => {
   await emit('runtime_status', { status: 'idle', turn_id: 'third-order' })
   check(await orderGroup.locator('.execution-header').getAttribute('aria-expanded') === 'false' && (await orderGroup.locator('.execution-header').innerText()).includes('Completed · 有工具失败'), '第三批：完成和工具失败独立显示，保留用户折叠偏好')
   await orderGroup.locator('.execution-header').click()
-  check((await orderGroup.locator('.runtime-preview').first().innerText()).includes('真实运行进度'), '第三批：运行提示默认显示简短实际信息，完整内容留在详情')
-  check(await orderGroup.locator('.runtime-step').count() === 3 && (await orderGroup.locator('.execution-header').innerText()).includes('7 steps'), '第三批：progress、model_retry、artifact_warning 保留为轻量事件且计数正确')
+  check((await orderGroup.locator('.runtime-preview').first().innerText()).includes('模型正在重试'), '第三批：可见运行提示默认显示简短实际信息，完整内容留在详情')
+  check(await orderGroup.locator('[data-event-id="event-103"]').count() === 0 && await orderGroup.locator('.runtime-step').count() === 2 && (await orderGroup.locator('.execution-header').innerText()).includes('6 steps'), 'P2：progress 隐藏且不计数，model_retry 和 artifact_warning 保留')
 
   await thirdEmit(thirdCall(109, 'third-adjacent', 'legacy-id'))
   await thirdEmit(thirdResult(110, 'third-adjacent', null, true))
@@ -1184,6 +1223,10 @@ async (page) => {
   const crossGroup = turnGroup('review-cross')
   check(JSON.stringify(await visualOrder(crossGroup)) === JSON.stringify(['assistant:210', 'execution', 'assistant:212', 'execution', 'assistant:216']) && await crossGroup.locator('.execution-step').count() === 2, '审查修复：跨 Assistant 的可靠 Result 仍锚定 Call，无 ID 的相邻关联保持')
   check(await crossGroup.locator('[data-event-id="event-211"]').getAttribute('data-status') === 'success' && await crossGroup.locator('[data-event-id="event-213"]').count() === 0, '审查修复：跨区块关联更新调用状态，不另行显示结果')
+  await reviewEmit(toolEvent(217, 'review-order', 'progress', { content: '最终回答已输出' }))
+  await reviewEmit(toolEvent(218, 'review-order', 'stop', { stop_reason: 'final_answer' }))
+  check((await visualOrder(reviewOrder)).at(-1) === 'assistant:208' && await reviewOrder.locator('.execution-header').count() === 2 && await reviewOrder.locator('.execution-header[aria-expanded="false"]').count() === 2, 'P2：正常结束内部事件不生成尾部执行区块，真实两段执行和手动折叠保留')
+  check((await reviewOrder.locator('.execution-header').first().innerText()).includes('4 steps') && await reviewOrder.locator('[data-event-id="event-217"], [data-event-id="event-218"]').count() === 0, 'P2：最终 progress 与 stop(final_answer) 均不显示或计数')
   await reviewEmit(thirdCall(220, 'review-unsafe', 'review-unmatched'))
   await reviewEmit(reviewMessage(221, 'review-unsafe', 'assistant', '中间真实文本'))
   await reviewEmit(thirdResult(222, 'review-unsafe', null, true))
@@ -1342,7 +1385,7 @@ async (page) => {
   await bottom()
   check((await position('无会话创建后长历史')).top > 1000 && !await jump.isVisible() && await page.evaluate(() => window.__uiTest.scrollObservers.filter((observer) => observer.__active).length === 1), '从无 Session 创建后重建唯一 Observer，长历史默认实际定位底部')
   check(errors.length === 0, '浏览器无运行时异常')
-  return { count: checks.length, checks, browserErrors: errors, apiRequests: requests.length, imageRequests, composerHeights, scrollSamples, markdownPerformance, expandedGeometry, collapsedGeometry, expandedWorkbench, collapsedWorkbench, narrowWorkbench }
+  return { count: checks.length, checks, browserErrors: errors, apiRequests: requests.length, imageRequests, composerHeights, scrollSamples, shortStreamingPerformance, markdownPerformance, expandedGeometry, collapsedGeometry, expandedWorkbench, collapsedWorkbench, narrowWorkbench }
   } catch (error) {
     throw new Error(`UI regression failed after "${checks.at(-1) || 'bootstrap'}": ${error.stack || error.message}`)
   }
