@@ -218,7 +218,10 @@ def test_execution_group_completed_turns_keep_user_toggle_state() -> None:
     projection = (
         Path(__file__).resolve().parents[1] / "frontend/src/execution.js"
     ).read_text(encoding="utf-8")
-    assert 'import { buildExecutionGroups } from "./execution.js"' in source
+    assert 'import { useExecutionGroups } from "./execution.js"' in source
+    assert "const executionGroups = useExecutionGroups({" in source
+    assert "export function useExecutionGroups(" in projection
+    assert "buildExecutionGroups(" in projection
     assert "const explicitExpanded = expanded[group.key]" in projection
     assert "expandedGroups.value[group.key] = !group.expanded" in source
     assert "expandedGroups.value[turnId] = false" not in source
