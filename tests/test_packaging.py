@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,12 +30,27 @@ def test_gitignore_excludes_private_and_runtime_web_files() -> None:
         "data/",
         "frontend/node_modules/",
         "frontend/dist/",
-        "/.pnpm-store/",
+        ".pnpm-store/",
         "**/__pycache__/",
         "**/*.pyc",
         "**/.pytest_cache/",
         "*.zip",
     } <= patterns
+
+
+def test_gitignore_ignores_pnpm_store_at_any_depth() -> None:
+    for path in (
+        ".pnpm-store/v10/example",
+        "docs-site/.pnpm-store/v10/example",
+    ):
+        result = subprocess.run(
+            ["git", "check-ignore", "--no-index", "-q", path],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"{path} is not ignored: {result.stderr}"
 
 
 def test_dockerfile_uses_named_mycode_context_and_root_lock() -> None:
