@@ -423,6 +423,8 @@ function clearPendingInteractions() {
 
 function applyRuntimeStatus(data) {
   if (!currentSession.value) return
+  const activeTurn = currentSession.value.active_turn_id
+  if (data.turn_id && activeTurn && data.turn_id !== activeTurn) return
   currentSession.value.runtime_status = data.status
   if (data.status !== "idle") {
     contextStatus.value = null
@@ -1066,6 +1068,7 @@ onBeforeUnmount(() => {
             <section v-for="group in executionGroups" :key="`${currentSession.id}:${group.key}`" class="execution-group">
               <template v-for="item in group.items" :key="item.id">
                 <ExecutionTimeline v-if="item.kind === 'execution'" :group="item.block" :permission-submission="permissionSubmissionStatus" @toggle="toggleGroup" @resolve="resolvePermission" />
+                <p v-else-if="item.kind === 'notice'" class="runtime-notice" :data-status="item.status" :data-event-id="item.eventId" role="status"><strong>Runtime 提示</strong> {{ item.content }}</p>
                 <ChatMessage v-else :role="item.kind" :content="item.content" :streaming="Boolean(item.streaming)" :data-event-id="item.eventId" />
               </template>
             </section>

@@ -37,10 +37,19 @@ def jsonl(*messages: dict[str, object]) -> bytes:
 
 
 READY_WIRE = jsonl({"type": "runtime_ready", "session_id": "session"})
-FINISH_WIRE = jsonl(
-    {"type": "agent_event", "event": {"type": "text_delta", "content": "done"}},
-    {"type": "turn_finished", "status": "completed", "stop_reason": "final_answer"},
-)
+
+
+async def finish_turn(process) -> None:
+    turn = next(
+        json.loads(payload) for payload in reversed(process.stdin.raw_writes)
+        if json.loads(payload).get("type") == "turn"
+    )
+    await process.stdout.feed(jsonl(
+        {"type": "agent_event", "turn_id": turn["turn_id"],
+         "event": {"type": "text_delta", "content": "done"}},
+        {"type": "turn_finished", "turn_id": turn["turn_id"],
+         "status": "completed", "stop_reason": "final_answer"},
+    ))
 
 
 def permission_wire(summary: str = "run_command", reason: str = "risky") -> bytes:
@@ -102,6 +111,7 @@ class FakeStdin:
     def __init__(self) -> None:
         self.raw_writes: list[bytes] = []
         self.writes: list[bytes] = []
+        self.on_close = None
 
     def write(self, data: bytes) -> None:
         self.raw_writes.append(data)
@@ -119,6 +129,8 @@ class FakeStdin:
             )
         else:
             self.writes.append(data)
+        if message.get("type") == "close" and self.on_close is not None:
+            asyncio.get_running_loop().call_soon(self.on_close)
 
     async def drain(self) -> None:
         return None
@@ -131,16 +143,24 @@ class FakeProcess:
         self.stderr = FakeStdout()
         self.returncode = None
         self.done = asyncio.Event()
+        self.stdin.on_close = self.close
+
+    def close(self) -> None:
+        self.stdout.queue.put_nowait(jsonl({"type": "runtime_closed"}))
+        self.exit()
+
+    def exit(self) -> None:
+        self.returncode = 0
+        self.done.set()
+        self.stdout.queue.put_nowait(b"")
+        self.stderr.queue.put_nowait(b"")
 
     async def wait(self) -> int:
         await self.done.wait()
         return self.returncode or 0
 
     def terminate(self) -> None:
-        self.returncode = 0
-        self.done.set()
-        self.stdout.queue.put_nowait(b"")
-        self.stderr.queue.put_nowait(b"")
+        self.exit()
 
     def kill(self) -> None:
         self.terminate()
@@ -391,7 +411,7 @@ def test_reserved_turn_runtime_is_not_handed_to_queue_until_turn_finishes(
             }
         ]
 
-        await launcher.by_session["a"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["a"][0])
         await wait_for_status(manager, "a", "idle")
         for _ in range(100):
             if launcher.calls == 2:
@@ -522,7 +542,7 @@ def test_activate_handoffs_same_user_idle_victim_immediately(
 
         await manager.send_message("a1", "one")
         await manager.send_message("a2", "two")
-        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["a1"][0])
         await wait_for_status(manager, "a1", "idle")
 
         assert await manager.activate("a3") == "starting"
@@ -558,11 +578,11 @@ def test_activate_selects_oldest_eligible_idle_victim_for_target_user(
         )
 
         await manager.send_message("b1", "one")
-        await launcher.by_session["b1"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["b1"][0])
         await wait_for_status(manager, "b1", "idle")
         clock.advance(1)
         await manager.send_message("a1", "one")
-        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["a1"][0])
         await wait_for_status(manager, "a1", "idle")
         await manager.send_message("a2", "two")
 
@@ -596,7 +616,7 @@ def test_activate_does_not_evict_idle_victim_with_terminal_lease(
 
         await manager.send_message("a1", "one")
         await manager.send_message("a2", "two")
-        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["a1"][0])
         await wait_for_status(manager, "a1", "idle")
         await manager.acquire_terminal_lease("a1", "client-a1")
 
@@ -634,7 +654,7 @@ def test_wait_until_ready_survives_capacity_queue_until_handoff(
         await asyncio.sleep(0.05)
         assert not waiter.done()
 
-        await launcher.by_session["blocker"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["blocker"][0])
         await wait_for_status(manager, "waiting", "running")
         assert await asyncio.wait_for(waiter, timeout=1) == "running"
         await manager.release_terminal_lease("waiting", "client-waiting")
@@ -719,7 +739,7 @@ def test_runtime_reuses_process_and_maps_permission_to_stdin(tmp_path: Path) -> 
         assert launcher.process.stdin.writes == [b"first task\n"]
         with pytest.raises(RuntimeConflictError):
             await manager.send_message("session", "overlapping task")
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await asyncio.sleep(0)
         await manager.send_message("session", "second task")
         assert launcher.calls == 1
@@ -847,7 +867,7 @@ def test_permission_resolution_does_not_publish_stale_running_after_turn_finish(
 
         async def write_and_finish(state, payload) -> None:
             await original_write(state, payload)
-            await launcher.process.stdout.feed(FINISH_WIRE)
+            await finish_turn(launcher.process)
             await wait_for_status(manager, "session", "idle")
 
         manager._write_bytes = write_and_finish
@@ -1027,7 +1047,7 @@ def test_two_running_sessions_admit_and_third_queues_fifo(tmp_path: Path) -> Non
         assert manager.active_count == 2
         assert manager.queued_count == 2
 
-        await launcher.by_session["one"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["one"][0])
         await wait_for_status(manager, "three", "running")
         assert manager.status("four") == "queued"
         assert launcher.by_session["three"][0].stdin.writes == [b"third\nline\n"]
@@ -1038,7 +1058,7 @@ def test_two_running_sessions_admit_and_third_queues_fifo(tmp_path: Path) -> Non
         ]
         assert three_statuses == ["queued", "starting", "running"]
 
-        await launcher.by_session["two"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["two"][0])
         await wait_for_status(manager, "four", "running")
         assert launcher.by_session["four"][0].stdin.writes == [b"fourth\n"]
         assert manager.active_count <= config.sandbox_max_active
@@ -1095,11 +1115,11 @@ def test_send_message_selects_oldest_eligible_idle_victim_for_target_user(
         )
 
         await manager.send_message("b1", "one")
-        await launcher.by_session["b1"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["b1"][0])
         await wait_for_status(manager, "b1", "idle")
         clock.advance(1)
         await manager.send_message("a1", "one")
-        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["a1"][0])
         await wait_for_status(manager, "a1", "idle")
         await manager.send_message("a2", "two")
 
@@ -1136,7 +1156,7 @@ def test_cross_user_idle_victim_cannot_bypass_target_user_quota(
         await manager.send_message("a1", "one")
         await manager.send_message("a2", "two")
         await manager.send_message("b1", "one")
-        await launcher.by_session["b1"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["b1"][0])
         await wait_for_status(manager, "b1", "idle")
 
         assert await manager.activate("a3") == "stopped"
@@ -1198,7 +1218,7 @@ def test_idle_handoff_releases_victim_user_slot_before_eligibility_check(
         await manager.send_message("a2", "two")
         assert await manager.send_message("a3", "three") == "queued"
 
-        await launcher.by_session["a1"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["a1"][0])
         await wait_for_status(manager, "a3", "running")
         assert manager.status("a1") == "stopped"
         assert manager.status("a2") == "running"
@@ -1348,7 +1368,7 @@ def test_idle_runtime_is_replaced_before_ttl_for_queued_session(tmp_path: Path) 
         )
 
         await manager.send_message("a1", "one")
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await wait_for_status(manager, "a1", "idle")
         assert await manager.send_message("a2", "two") == "running"
         assert manager.status("a1") == "stopped"
@@ -1382,7 +1402,7 @@ def test_oldest_idle_is_evicted_instead_of_queueing(tmp_path: Path) -> None:
         )
         (marker_workspace / "keep.txt").write_text("workspace", encoding="utf-8")
         (marker_state / "keep.txt").write_text("state", encoding="utf-8")
-        await launcher.by_session["old-idle"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["old-idle"][0])
         await wait_for_status(manager, "old-idle", "idle")
         clock.advance(10)
         await manager.send_message("busy", "second")
@@ -1450,7 +1470,7 @@ def test_idle_ttl_only_reclaims_expired_runtime_and_preserves_data(
         root, state_root = workspace.ensure_session_directories("session")
         (root / "keep.txt").write_text("keep", encoding="utf-8")
         (state_root / "keep.txt").write_text("keep", encoding="utf-8")
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await wait_for_status(manager, "session", "idle")
 
         clock.advance(7199)
@@ -1489,7 +1509,7 @@ def test_connected_terminal_lease_protects_idle_runtime_from_ttl(
             clock=clock,
         )
         await manager.send_message("session", "task")
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await wait_for_status(manager, "session", "idle")
 
         await manager.acquire_terminal_lease("session", "client-session")
@@ -1520,8 +1540,8 @@ def test_connected_terminal_runtime_is_not_an_idle_eviction_victim(
         )
         await manager.send_message("protected", "one")
         await manager.send_message("other", "two")
-        await launcher.by_session["protected"][0].stdout.feed(FINISH_WIRE)
-        await launcher.by_session["other"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["protected"][0])
+        await finish_turn(launcher.by_session["other"][0])
         await wait_for_status(manager, "protected", "idle")
         await wait_for_status(manager, "other", "idle")
         await manager.acquire_terminal_lease("protected", "client-protected")
@@ -1549,7 +1569,7 @@ def test_reserved_idle_runtime_is_not_eviction_or_idle_ttl_victim(
             config, WorkspaceService(config), EventHub(), launcher=launcher, clock=clock
         )
         await manager.send_message("reserved", "initial")
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await wait_for_status(manager, "reserved", "idle")
 
         state = manager._sessions["reserved"]
@@ -1587,7 +1607,7 @@ def test_terminal_lease_blocks_queue_handoff_until_disconnect(
             config, WorkspaceService(config), EventHub(), launcher=launcher
         )
         await manager.send_message("a", "first")
-        await launcher.by_session["a"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["a"][0])
         await wait_for_status(manager, "a", "idle")
         await manager.acquire_terminal_lease("a", "client-a")
 
@@ -1616,7 +1636,7 @@ def test_last_terminal_disconnect_releases_multi_client_protection(
             config, WorkspaceService(config), EventHub(), launcher=launcher
         )
         await manager.send_message("a", "first")
-        await launcher.by_session["a"][0].stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.by_session["a"][0])
         await wait_for_status(manager, "a", "idle")
         await manager.acquire_terminal_lease("a", "client-a1")
         await manager.acquire_terminal_lease("a", "client-a2")
@@ -1666,7 +1686,7 @@ def test_runtime_events_carry_web_turn_id_to_completion(tmp_path: Path) -> None:
             config, WorkspaceService(config), events, launcher=launcher
         )
         await manager.send_message("session", "task", turn_id="turn-1")
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await wait_for_status(manager, "session", "idle")
 
         relevant = [
@@ -1880,7 +1900,7 @@ def test_process_exit_cleanup_serializes_next_runtime_generation(
             runtime_stop_hook=runtime_stop_hook,
         )
         await runtime.send_message("session", "first")
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await wait_for_status(runtime, "session", "idle")
         await asyncio.sleep(0.05)
         process = launcher.process
@@ -2143,6 +2163,7 @@ def test_finalizer_converges_when_process_cleanup_raises(tmp_path: Path) -> None
         process.wait = failing_wait  # type: ignore[method-assign]
         process.terminate = failing_terminate  # type: ignore[method-assign]
         process.kill = failing_kill  # type: ignore[method-assign]
+        process.stdin.on_close = None
 
         await manager.stop_session("session")
 
@@ -2150,10 +2171,12 @@ def test_finalizer_converges_when_process_cleanup_raises(tmp_path: Path) -> None
         assert manager.status("session") == "error"
         assert state.finalizing_generation is None
         assert state.finalizer_task is None
-        assert state.process is None
+        assert state.process is process
+        assert state.cleanup_pending
         assert state.active_turn_id is None
         assert manager.runtime_token("session") is None
         assert manager.relay_tokens.active_count == 0
+        process.exit()
         await manager.shutdown()
 
     asyncio.run(scenario())
@@ -2460,7 +2483,7 @@ def test_agent_projection_bounds_tool_result_and_stderr_is_not_protocol(
                 }
             )
         )
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await wait_for_status(manager, "session", "idle")
 
         live_event = await asyncio.wait_for(pending_agent_event, timeout=1)
@@ -2606,7 +2629,7 @@ def test_context_snapshot_invalidates_when_agent_turn_is_accepted(
 
         assert await manager.send_message("session", "new turn") == "running"
         assert manager.context_status("session") is None
-        await launcher.process.stdout.feed(FINISH_WIRE)
+        await finish_turn(launcher.process)
         await wait_for_status(manager, "session", "idle")
         await manager.shutdown()
 

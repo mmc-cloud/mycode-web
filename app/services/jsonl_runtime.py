@@ -126,6 +126,9 @@ class JsonlRuntimeAdapter:
         """Request one manual Context Compact operation from Core."""
         return self._encode({"type": "compact"})
 
+    def encode_close(self) -> bytes:
+        return self._encode({"type": "close"})
+
     @staticmethod
     def _decode_line(line: bytes) -> dict[str, object]:
         if not line.strip():

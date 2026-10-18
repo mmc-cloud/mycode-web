@@ -115,6 +115,44 @@ test("replayed/upserted SSE and history have the same timeline without mutating 
 const message = (id, kind, content = `${kind}-${id}`) => ({ id, kind, content, data: { turn_id: "a" } })
 const blocks = (value) => value.items.filter((item) => item.kind === "execution").map((item) => item.block)
 
+test("session warnings remain independent of the previous completed execution, including legacy history", () => {
+  const base = [message(1, "user"), call(2, "read"), result(3, "read"), message(4, "assistant", "final answer")]
+  const warnings = [
+    { code: "runtime_cleanup_failed", message: "cleanup warning" },
+    { event_type: "runtime_warning", scope: "session", message: "new warning" },
+    { code: "runtime_cleanup_failed", turn_id: "a" }, // Old cleanup rows could carry a Turn ID.
+    { event_type: "runtime_warning", scope: "session", turn_id: "a" },
+  ]
+  for (const data of warnings) {
+    const warning = { id: 5, kind: "tool", content: "session warning", data }
+    const events = [...base, warning]
+    const groups = buildExecutionGroups(events, null, null, { active_turn_id: null, runtime_status: "idle" })
+    assert.equal(groups.length, 2)
+    assert.deepEqual(groups[0], group(base))
+    assert.equal(blocks(groups[0])[0].blockCount, 1)
+    assert.equal(groups[1].items[0].kind, "notice")
+    assert.equal(groups[1].items[0].content, warning.content)
+    assert.deepEqual(groups[1].items[0].sources, [warning])
+    assert.equal(blocks(groups[1]).length, 0)
+    assert.deepEqual(buildExecutionGroups([...events].reverse().concat(warning), null, null,
+      { active_turn_id: null, runtime_status: "idle" }), groups)
+  }
+})
+
+test("turn-scoped warnings remain in the matching execution and session notices do not absorb later turns", () => {
+  const events = [message(1, "user"), call(2, "one"), result(3, "one"), message(4, "assistant"),
+    { id: 5, kind: "tool", content: "session warning", data: { scope: "session" } },
+    { ...message(6, "user"), data: { turn_id: "b" } },
+    call(7, "two", "read_file", "b"), result(8, "two", true, "b"),
+    { id: 9, kind: "tool", content: "turn warning", data: { turn_id: "b", scope: "turn", event_type: "runtime_warning" } }]
+  const groups = buildExecutionGroups(events, null, null, null)
+  assert.deepEqual(groups.map((value) => value.key), ["a", "runtime:5", "b"])
+  assert.equal(blocks(groups[0])[0].blockCount, 1)
+  assert.equal(groups[1].items[0].kind, "notice")
+  assert.equal(groups[2].timeline.at(-1).detail, "turn warning")
+  assert.equal(groups[2].stepCount, 3)
+})
+
 test("normal completion bookkeeping after the final assistant creates no extra block", () => {
   const events = [call(1, "read"), result(2, "read"), message(3, "assistant", "final answer"),
     event(4, "progress"), stop(5, "final_answer")]

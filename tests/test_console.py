@@ -16,6 +16,20 @@ def make_database(tmp_path: Path) -> tuple[WebDatabase, str, str]:
     return database, database.create_session(user.id).id, user.id
 
 
+def test_runtime_warning_persists_explicit_session_or_turn_scope(tmp_path: Path) -> None:
+    database, session_id, _ = make_database(tmp_path)
+    recorder = ConsoleRecorder(database)
+    for data, scope in [
+        ({"message": "session warning"}, "session"),
+        ({"message": "turn warning", "turn_id": "turn-1"}, "turn"),
+        ({"message": "cleanup", "scope": "session", "turn_id": "turn-1"}, "session"),
+    ]:
+        event, = recorder.record_event(session_id, "runtime_warning", data)
+        assert event.data["event_type"] == "runtime_warning"
+        assert event.data["scope"] == scope
+        assert event.content == data["message"]
+
+
 def test_console_history_is_bounded_structured_and_session_isolated(
     tmp_path: Path,
 ) -> None:

@@ -54,9 +54,15 @@ Runtime Pool、FIFO Queue 和调度锁都位于单个 FastAPI 进程内。最大
 2. 全局 capacity 已满但存在 idle Runtime，且用户配额允许时，驱逐最久未活动的 idle Runtime；
 3. 没有可立即启动的 Runtime 时，新请求进入有界 FIFO Queue；队列 handoff 会跳过当前用户配额已满的候选，避免队首阻塞。
 
-`starting`、`running`、`waiting_permission` 和 `waiting_mcp_trust` 都可能占用 active capacity。`idle`、等待 Permission 和等待 MCP Trust 都受 inactivity TTL 约束；等待交互超时会清除 pending request、停止 Runtime 并释放 slot。Runtime 也可因 capacity eviction、explicit stop、process exit 或 lifecycle cleanup 停止，但这些操作不会删除 Workspace、`mycode_state` 或 SQLite Session metadata。再次 activate 时会启动新 Sandbox，并通过 `mycode runtime --jsonl --continue` 恢复 Session。
+`starting`、`idle`、`running`、`waiting_permission`、`waiting_mcp_trust` 和 `stopping` 都占用 Sandbox capacity。关闭期间即使本地进程已经退出，只要容器回收或 generation teardown 尚未完成，slot 仍被保留。`idle`、等待 Permission 和等待 MCP Trust 都受 inactivity TTL 约束；等待交互超时会清除 pending request、停止 Runtime，确认回收后才释放 slot。Runtime 也可因 capacity eviction、explicit stop、process exit 或 lifecycle cleanup 停止，但这些操作不会删除 Workspace、`mycode_state` 或 SQLite Session metadata。再次 activate 时会启动新 Sandbox，并通过 `mycode runtime --jsonl --continue` 恢复 Session。
+
+Queue Handoff 和 idle eviction 的目标预留绑定来源 Session 及其 Runtime generation：来源尚未释放时，全局名额只计一次，目标必须等待来源回收成功后才能启动。跨用户交接同时保留旧用户占用和新用户预留，避免绕过任一用户的配额。异步启动任务也绑定目标 generation，取消后的旧交接不能启动同一 Session 后来提交的新任务或发送旧内容。
 
 Runtime resource ownership contract：Web Session 持有 Session metadata、Workspace、Console/EventHub、turn reservation，以及 Browser Terminal connection/terminal demand；这些不属于某个 Runtime generation。每个 generation 独占 Sandbox process/container、JSONL reader、relay token、watcher ownership 和 Terminal PTY shell，并且 generation teardown 完成前同一 Session 禁止启动下一 generation。Agent turn 的 `active_turn_id`、busy 和 pending Permission 属于 turn；MCP Trust 是可发生在 `runtime_ready` 之前的 startup interaction。Generation final status 只在 process/reader/token/watcher/terminal cleanup 完成后发布。
+
+Runtime 正常关闭先发送 JSONL `close`，在 5 秒内等待 `runtime_closed` 和进程退出；关闭不可用或超时后使用 terminate/kill 兜底，每次进程退出等待最多 5 秒。Docker 命令最多等待 10 秒；Web 按 managed label、Session label 和精确容器名查询并回收对应容器，再次查询确认容器消失。中间步骤失败但最终回收成功不会产生 `runtime_cleanup_failed`。若进程仍存活或容器回收无法确认，则保留清理目标和 capacity 占用，禁止同一 Session 重启；后续 activate、发送消息、stop 或 delete 会先重试回收，确认成功后才继续原操作。回收仍失败时 delete 返回 503 并保留 Session 数据，定时清理跳过该 Session、下轮再试。
+
+`turn_finished` 只有携带非空且与当前执行 Turn 完全一致的 `turn_id` 才能完成该 Turn、刷新 Console buffer 和发布 idle；缺失、错配、重复以及 finalizing 期间的完成事件都被忽略。每个 generation 保留最近 128 个已完成 Turn ID 用于重复识别，已知重复与关闭期间的迟到事件只记 debug；缺失/非法 ID、未知 ID 错配、无活动 Turn 和尚未执行的 Turn 则记录带原因、Session、generation、收到及当前 Turn ID 的协议 warning。异常不会被当作成功，也不会终止当前任务；这些诊断仅写服务端日志。Session 级 Runtime 警告使用独立提示展示，不归入最近一轮的执行区块；历史 `runtime_cleanup_failed` 记录也按 Session 提示恢复。
 
 Workspace watcher 跟随 active Runtime 生命周期，而不是永久附着在保留的 Session 上。Runtime starting/active 时 watcher 启动；Runtime 被回收或停止时 watcher 停止；Session 再次 activate 时 watcher 重启；Session delete 和 application shutdown 会清理 watcher。
 

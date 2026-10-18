@@ -9,6 +9,8 @@ npm --prefix frontend run build
 
 The unit tests cover execution ordering, tool associations, permissions, folding,
 layout persistence, and streaming Markdown scheduling using a fake clock.
+Runtime regressions also check stale Turn status isolation and independent Session
+warnings, including legacy history, without adding execution blocks to a completed Turn.
 Normal streaming renders have a 60ms minimum interval. Expensive renders use
 `max(60ms, 2 × last parse duration)` between the end of parsing and the next
 render, leaving time for DOM commits and input. An existing trailing deadline is

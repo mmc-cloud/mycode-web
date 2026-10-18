@@ -124,9 +124,12 @@ async def delete_session(
     request: Request,
     context: WebContext = Depends(current_context),
 ) -> None:
-    deleted = await services(request).lifecycle.delete_session(
-        context.session.id, user_id=context.user.id
-    )
+    try:
+        deleted = await services(request).lifecycle.delete_session(
+            context.session.id, user_id=context.user.id
+        )
+    except RuntimeUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found.")
 

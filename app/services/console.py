@@ -63,11 +63,14 @@ class ConsoleRecorder:
                 data=_metadata(data, turn_id),
             )
         if event_type == "runtime_warning":
+            metadata = _metadata(data, turn_id)
+            metadata["event_type"] = "runtime_warning"
+            metadata["scope"] = data.get("scope") or ("turn" if turn_id else "session")
             return self._append(
                 session_id,
                 "tool",
                 str(data.get("message", "Runtime warning")),
-                data=_metadata(data, turn_id),
+                data=metadata,
             )
         if event_type == "mcp_status":
             return self._append(

@@ -1,12 +1,16 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+import logging
 
 from app.config import ServerSettings
 from app.db.database import WebDatabase
-from app.services.runtime import RuntimeManager
+from app.services.runtime import RuntimeManager, RuntimeUnavailableError
 from app.services.events import EventHub
 from app.services.watcher import WorkspaceWatchManager
 from app.services.workspace import WorkspaceService
+
+
+logger = logging.getLogger(__name__)
 
 
 class SessionLifecycleService:
@@ -32,6 +36,8 @@ class SessionLifecycleService:
         if user_id is not None and self.database.get_session(session_id, user_id) is None:
             return False
         await self.runtime.stop_session(session_id)
+        if self.runtime.has_pending_cleanup(session_id):
+            raise RuntimeUnavailableError("Runtime cleanup is incomplete; Session data was preserved. Retry deletion later.")
         await self.watcher.stop(session_id)
         await asyncio.to_thread(self.workspace.delete_session_data, session_id)
         deleted = self.database.delete_session(session_id, user_id=user_id)
@@ -47,8 +53,11 @@ class SessionLifecycleService:
         session_ids = self.database.inactive_session_ids(cutoff.isoformat())
         removed: list[str] = []
         for session_id in session_ids:
-            if await self.delete_session(session_id):
-                removed.append(session_id)
+            try:
+                if await self.delete_session(session_id):
+                    removed.append(session_id)
+            except RuntimeUnavailableError:
+                logger.warning("Postponed Session deletion until Runtime cleanup succeeds session=%s", session_id)
         for user_id in self.database.inactive_user_ids(cutoff.isoformat()):
             if self.database.delete_user_if_inactive_without_sessions(
                 user_id, cutoff.isoformat()

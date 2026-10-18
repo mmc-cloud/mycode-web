@@ -13,6 +13,9 @@ const preview = (value) => {
 const identifier = (value) => typeof value === "string" && value && value.length < 16000 &&
   !value.endsWith("...") && !value.startsWith("[nested value") ? value : null
 const payloadFor = (event) => object(event.data?.event)
+const sessionNotice = (event) => event.data?.scope === "session" ||
+  event.data?.code === "runtime_cleanup_failed" ||
+  (!identifier(event.data?.turn_id) && ["tool", "error"].includes(event.kind) && !event.data?.event)
 const typeFor = (event) => event.data?.event_type || payloadFor(event).type || "runtime_event"
 const callId = (event) => {
   const call = object(payloadFor(event).tool_call)
@@ -165,7 +168,7 @@ export function buildExecutionGroups(events, live, pendingPermission, session, s
     return groups.get(key)
   }
   for (const event of ordered) {
-    const key = identifier(event.data?.turn_id) || fallbackTurn || "runtime"
+    const key = sessionNotice(event) ? `runtime:${event.id}` : identifier(event.data?.turn_id) || fallbackTurn || "runtime"
     if (event.kind === "user") fallbackTurn = key
     const group = ensure(key)
     group.events.push(event)
@@ -179,6 +182,14 @@ export function buildExecutionGroups(events, live, pendingPermission, session, s
   if (pendingPermission && pendingTurn) ensure(pendingTurn)
 
   return [...groups.values()].map((group) => {
+    if (group.events.length === 1 && sessionNotice(group.events[0])) {
+      const event = group.events[0]
+      return {
+        ...group, live: null, timeline: [], assistants: [], stepCount: 0,
+        items: [{ id: `notice-${event.id}`, kind: "notice", eventId: event.id,
+          content: event.content, status: event.kind === "error" ? "error" : "info", sources: [event] }],
+      }
+    }
     const groupLive = live?.active && liveTurn === group.key ? live : null
     const state = states[group.key]?.status || (group.key === activeTurn ? session?.runtime_status : null)
     const active = ACTIVE.includes(state)

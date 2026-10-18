@@ -24,6 +24,11 @@ from app.services.workspace import WorkspaceService
 logger = logging.getLogger(__name__)
 MANAGED_SANDBOX_LABEL = "mycode-web.managed=true"
 AGENT_USER = "mycode-agent"
+RUNTIME_CLOSE_TIMEOUT_SECONDS = 5.0
+PROCESS_EXIT_TIMEOUT_SECONDS = 5.0
+DOCKER_COMMAND_TIMEOUT_SECONDS = 10.0
+
+
 class RuntimeConflictError(RuntimeError):
     pass
 
@@ -204,6 +209,34 @@ class DockerSandboxLauncher:
             logger.warning("Managed Sandbox cleanup could not remove containers: %s", error)
         return container_ids
 
+    async def cleanup_session(self, session_id: str) -> None:
+        """Remove this Session's managed container and verify the final state."""
+        query = (
+            "ps", "-aq", "--filter", f"label={MANAGED_SANDBOX_LABEL}",
+            "--filter", f"label=mycode-web.session={session_id}",
+            "--filter", f"name=^/{self.container_ref(session_id)}$",
+        )
+
+        async def remaining() -> tuple[str, ...]:
+            code, stdout, stderr = await self._run_docker(*query)
+            if code != 0:
+                raise RuntimeUnavailableError(
+                    "Could not verify Sandbox container removal: "
+                    + _redact_diagnostic(stderr.strip() or f"docker exited with code {code}")
+                )
+            return tuple(stdout.split())
+
+        containers = await remaining()
+        if not containers:
+            return
+        # --rm may win the race with rm -f. Only the final query determines success.
+        try:
+            await self._run_docker("rm", "-f", *containers)
+        except (OSError, TimeoutError):
+            logger.warning("Sandbox removal command failed; checking final state", exc_info=True)
+        if await remaining():
+            raise RuntimeUnavailableError("Sandbox container still exists after cleanup.")
+
     async def _run_docker(self, *arguments: str) -> tuple[int, str, str]:
         process = await asyncio.create_subprocess_exec(
             self.settings.docker_command,
@@ -211,7 +244,17 @@ class DockerSandboxLauncher:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=DOCKER_COMMAND_TIMEOUT_SECONDS
+            )
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await asyncio.wait_for(process.wait(), timeout=PROCESS_EXIT_TIMEOUT_SECONDS)
         return (
             process.returncode or 0,
             stdout.decode("utf-8", errors="replace"),
@@ -250,10 +293,13 @@ class _RuntimeSession:
     busy: bool = False
     stopping: bool = False
     ready: asyncio.Event = field(default_factory=asyncio.Event)
+    closed: asyncio.Event = field(default_factory=asyncio.Event)
     status_changed: asyncio.Event = field(default_factory=asyncio.Event)
     last_activity: float = 0.0
     container_ref: str | None = None
     active_turn_id: str | None = None
+    completed_turn_ids: deque[str] = field(default_factory=lambda: deque(maxlen=128))
+    capacity_source: tuple[str, int] | None = None
     startup_error: str | None = None
     terminal_lease_ids: set[str] = field(default_factory=set)
     runtime_generation: int = 0
@@ -267,6 +313,7 @@ class _RuntimeSession:
     readiness_pause_total: float = 0.0
     finalizing_generation: int | None = None
     finalizer_task: asyncio.Task[None] | None = None
+    cleanup_pending: bool = False
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -316,6 +363,10 @@ class RuntimeManager:
     def active_turn_id(self, session_id: str) -> str | None:
         state = self._sessions.get(session_id)
         return None if state is None else state.active_turn_id
+
+    def has_pending_cleanup(self, session_id: str) -> bool:
+        state = self._sessions.get(session_id)
+        return state is not None and state.cleanup_pending
 
     def container_ref(self, session_id: str) -> str | None:
         state = self._sessions.get(session_id)
@@ -534,7 +585,11 @@ class RuntimeManager:
 
     @property
     def active_count(self) -> int:
-        return sum(self._is_live(state) for state in self._sessions.values())
+        return sum(
+            self._is_live(state) or state.cleanup_pending
+            or (self._is_finalizing(state) and state.container_ref is not None)
+            for state in self._sessions.values()
+        )
 
     @property
     def queued_count(self) -> int:
@@ -551,6 +606,10 @@ class RuntimeManager:
             state = self._sessions.setdefault(session_id, _RuntimeSession())
             if self._is_finalizing(state):
                 return "stopped"
+            if state.cleanup_pending:
+                dead_finalizer_task = self._begin_finalization_locked(
+                    session_id, state, state.runtime_generation, reason="cleanup_retry"
+                )
             if state.status == "stopped":
                 state.startup_error = None
             if state.status in {
@@ -594,20 +653,26 @@ class RuntimeManager:
                         reason="capacity_eviction",
                     )
                     victim = (victim_id, victim_state, victim_generation)
-                    self._prepare_start_locked(session_id, state)
+                    self._prepare_start_locked(
+                        session_id, state, capacity_source=(victim_id, victim_generation)
+                    )
                     start_state = state
                 else:
                     return "stopped"
         if dead_finalizer_task is not None:
             await asyncio.shield(dead_finalizer_task)
+            if self.has_pending_cleanup(session_id):
+                raise RuntimeUnavailableError("Runtime cleanup is incomplete; retry activation later.")
             return await self.activate(session_id)
         if start_state is None:
             return self.status(session_id)
         if victim is None:
-            self._spawn(self._warm_runtime(session_id, start_state))
+            self._spawn(self._warm_runtime(session_id, start_state, start_state.runtime_generation))
         else:
             self._spawn(
-                self._start_after_eviction(victim, session_id, start_state, None)
+                self._start_after_eviction(
+                    victim, session_id, start_state, None, start_state.runtime_generation
+                )
             )
         return "starting"
 
@@ -630,6 +695,10 @@ class RuntimeManager:
             if self._is_finalizing(state):
                 raise RuntimeConflictError(
                     "This Session runtime is finalizing and cannot accept a new turn."
+                )
+            if state.cleanup_pending:
+                dead_finalizer_task = self._begin_finalization_locked(
+                    session_id, state, state.runtime_generation, reason="cleanup_retry"
                 )
             if state.pending_control is not None:
                 raise RuntimeConflictError(
@@ -700,7 +769,9 @@ class RuntimeManager:
                         reason="capacity_eviction",
                     )
                     victim = (victim_id, victim_state, victim_generation)
-                    self._prepare_start_locked(session_id, state)
+                    self._prepare_start_locked(
+                        session_id, state, capacity_source=(victim_id, victim_generation)
+                    )
                     state.active_turn_id = turn_id
                     self._invalidate_context_snapshot_locked(state)
                     start_state = state
@@ -721,8 +792,11 @@ class RuntimeManager:
                     )
                     queue_position = len(self._queue)
 
+        start_generation = start_state.runtime_generation if start_state is not None else 0
         if dead_finalizer_task is not None:
             await asyncio.shield(dead_finalizer_task)
+            if self.has_pending_cleanup(session_id):
+                raise RuntimeUnavailableError("Runtime cleanup is incomplete; retry sending later.")
             return await self.send_message(session_id, content, turn_id=turn_id)
         if queue_position:
             message_data = {"content": content}
@@ -773,7 +847,9 @@ class RuntimeManager:
         if turn_id is not None:
             message_data["turn_id"] = turn_id
         await self.events.publish(session_id, "user_message", **message_data)
-        await self._start_runtime(session_id, start_state, turn_content)
+        await self._start_runtime(
+            session_id, start_state, turn_content, generation=start_generation
+        )
         return "running"
 
     async def resolve_permission(
@@ -901,6 +977,7 @@ class RuntimeManager:
                 asyncio.Task[None] | None,
             ]
         ] = []
+        reclaimed: list[str] = []
         async with self._lock:
             for session_id, state in self._sessions.items():
                 if (
@@ -989,16 +1066,16 @@ class RuntimeManager:
                 )
             if finalizer_task is not None:
                 await asyncio.shield(finalizer_task)
+            if self.status(session_id) != "stopped":
+                continue
+            reclaimed.append(session_id)
             await self.events.publish(
                 session_id, "runtime_expired",
                 message="Sandbox stopped after inactivity; session data was preserved.",
             )
         if expired:
             await self._schedule_waiting()
-        return tuple(
-            session_id
-            for session_id, _state, _previous, _permission, _mcp, _generation, _task in expired
-        )
+        return tuple(reclaimed)
 
     async def run_sweeper(self) -> None:
         while True:
@@ -1025,6 +1102,7 @@ class RuntimeManager:
                 self._is_live(state)
                 or state.status == "starting"
                 or state.finalizing_generation is not None
+                or state.cleanup_pending
             ):
                 state_to_finalize = state
                 finalizer_task = self._begin_finalization_locked(
@@ -1055,6 +1133,7 @@ class RuntimeManager:
                     self._is_live(state)
                     or state.status == "starting"
                     or state.finalizing_generation is not None
+                    or state.cleanup_pending
                 ):
                     task = self._begin_finalization_locked(
                         _session_id,
@@ -1078,10 +1157,11 @@ class RuntimeManager:
         self.relay_tokens.clear()
 
     async def _start_runtime(
-        self, session_id: str, state: _RuntimeSession, turn_content: str | None
+        self, session_id: str, state: _RuntimeSession, turn_content: str | None,
+        *, generation: int,
     ) -> None:
         process: SandboxProcess | None = None
-        launch_generation = state.runtime_generation
+        launch_generation = generation
         final_status: str | None = None
         failure: Exception | None = None
         failure_message: str | None = None
@@ -1095,6 +1175,17 @@ class RuntimeManager:
                         or state.status != "starting"
                     ):
                         return
+                    if (
+                        self._capacity_source_occupied_locked(state)
+                        or self._occupied_slots_locked() > self.settings.sandbox_max_active
+                        or not self._user_has_capacity_locked(
+                            session_id, releasing_session_id=session_id
+                        )
+                    ):
+                        raise RuntimeUnavailableError(
+                            "Sandbox capacity is reserved by unreclaimed Runtime resources."
+                        )
+                    state.capacity_source = None
                 owner_id = (
                     self._session_owner_resolver(session_id)
                     if self._session_owner_resolver is not None
@@ -1127,9 +1218,9 @@ class RuntimeManager:
                         or state.runtime_generation != launch_generation
                         or state.status != "starting"
                     )
+                    state.process = process
+                    state.container_ref = container_ref
                     if not should_stop:
-                        state.process = process
-                        state.container_ref = container_ref
                         state.reader_task = asyncio.create_task(
                             self._read_output(
                                 session_id, state, process, launch_generation
@@ -1144,7 +1235,6 @@ class RuntimeManager:
                             )
                         self._touch(session_id, state)
                 if should_stop:
-                    await self._terminate_process(process)
                     final_status = "stopped"
                 else:
                     try:
@@ -1472,47 +1562,58 @@ class RuntimeManager:
             return
         if message_type == "turn_finished":
             turn_id = message.get("turn_id")
-            completed_turn_id = turn_id if isinstance(turn_id, str) else None
-            finalizing = False
-            should_dispatch = False
             async with self._lock:
-                finalizing = self._is_finalizing(state)
-                if completed_turn_id is None:
-                    completed_turn_id = state.active_turn_id
-                if not finalizing and (
-                    state.active_turn_id == completed_turn_id
-                    or completed_turn_id is None
-                ):
-                    state.busy = False
-                    state.pending_permission = None
-                    self._set_status_locked(state, "idle")
-                    self._touch(session_id, state)
-                    state.active_turn_id = None
-                    should_dispatch = True
-            await self.events.publish(
-                session_id,
-                "turn_finished",
-                status=message.get("status"),
-                stop_reason=message.get("stop_reason"),
-                **_turn_payload(completed_turn_id),
-            )
-            if finalizing:
-                return
-            await self.events.publish(
-                session_id,
-                "runtime_status",
-                status="idle",
-                **_turn_payload(completed_turn_id),
-            )
-            if should_dispatch:
-                self._spawn(self._dispatch_from_idle(session_id, state))
+                reason = self._turn_finished_rejection_reason(state, turn_id)
+                if reason is not None:
+                    received_id = (
+                        _redact_diagnostic(turn_id) if isinstance(turn_id, str)
+                        else None if turn_id is None else f"<{type(turn_id).__name__}>"
+                    )
+                    logger.log(
+                        logging.DEBUG if reason in {"duplicate_turn_finished", "runtime_finalizing"}
+                        else logging.WARNING,
+                        "Ignored Runtime turn_finished reason=%s session=%s generation=%s "
+                        "received_turn_id=%r active_turn_id=%r status=%s",
+                        reason, session_id, state.runtime_generation,
+                        received_id, state.active_turn_id, state.status,
+                        extra={
+                            "protocol_code": "unexpected_turn_finished",
+                            "reason": reason,
+                            "session_id": session_id,
+                            "runtime_generation": state.runtime_generation,
+                            "received_turn_id": received_id,
+                            "active_turn_id": state.active_turn_id,
+                        },
+                    )
+                    return
+                assert isinstance(turn_id, str)
+                state.completed_turn_ids.append(turn_id)
+                state.busy = False
+                state.pending_permission = None
+                self._set_status_locked(state, "idle")
+                self._touch(session_id, state)
+                state.active_turn_id = None
+                # Publish before admitting another Turn, so idle cannot overtake
+                # the next Turn's running event or flush its assistant buffer.
+                await self.events.publish(
+                    session_id, "turn_finished", turn_id=turn_id,
+                    status=message.get("status"), stop_reason=message.get("stop_reason"),
+                )
+                await self.events.publish(
+                    session_id, "runtime_status", status="idle", turn_id=turn_id,
+                )
+            self._spawn(self._dispatch_from_idle(session_id, state))
             return
         if message_type == "runtime_warning":
+            data = _without_protocol_fields(message)
+            turn_id = data.get("turn_id")
+            if data.get("scope") == "session" or not isinstance(turn_id, str) or not turn_id.strip():
+                data["scope"] = "session"
+                data.pop("turn_id", None)
+            else:
+                data["scope"] = "turn"
             await self.events.publish(
-                session_id,
-                "runtime_warning",
-                **_without_protocol_fields(message),
-                **_turn_payload(state.active_turn_id),
+                session_id, "runtime_warning", **data,
             )
             return
         if message_type == "runtime_error":
@@ -1541,14 +1642,35 @@ class RuntimeManager:
             )
             return
         if message_type == "runtime_closed":
+            state.closed.set()
             return
         await self.events.publish(
             session_id,
             "runtime_warning",
             code="unexpected_output",
             message=f"Ignored unknown runtime message type: {message_type}",
-            **_turn_payload(state.active_turn_id),
+            scope="session",
         )
+
+    @classmethod
+    def _turn_finished_rejection_reason(
+        cls, state: _RuntimeSession, turn_id: object
+    ) -> str | None:
+        if isinstance(turn_id, str) and turn_id in state.completed_turn_ids:
+            return "duplicate_turn_finished"
+        if cls._is_finalizing(state):
+            return "runtime_finalizing"
+        if turn_id is None:
+            return "missing_turn_id"
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            return "invalid_turn_id"
+        if state.active_turn_id is None:
+            return "no_active_turn"
+        if turn_id != state.active_turn_id:
+            return "turn_id_mismatch"
+        if not state.busy:
+            return "turn_not_running"
+        return None
 
     async def _complete_control(
         self,
@@ -1616,7 +1738,10 @@ class RuntimeManager:
                 generation,
                 reason="queue_handoff",
             )
-            self._prepare_start_locked(item.session_id, target)
+            self._prepare_start_locked(
+                item.session_id, target, capacity_source=(session_id, generation)
+            )
+            target_generation = target.runtime_generation
             target.active_turn_id = item.turn_id
         if generation is not None:
             await self._finalize_generation(
@@ -1626,12 +1751,14 @@ class RuntimeManager:
                 reason="queue_handoff",
             )
         try:
-            await self._start_runtime(item.session_id, target, item.content)
+            await self._start_runtime(
+                item.session_id, target, item.content, generation=target_generation
+            )
         except RuntimeUnavailableError:
             pass
 
     async def _schedule_waiting(self) -> None:
-        starts: list[tuple[_QueuedTurn, _RuntimeSession]] = []
+        starts: list[tuple[_QueuedTurn, _RuntimeSession, int]] = []
         async with self._lock:
             if self._closed:
                 return
@@ -1645,23 +1772,23 @@ class RuntimeManager:
                 state = self._sessions[item.session_id]
                 self._prepare_start_locked(item.session_id, state)
                 state.active_turn_id = item.turn_id
-                starts.append((item, state))
-        for item, state in starts:
-            self._spawn(self._start_queued_turn(item, state))
+                starts.append((item, state, state.runtime_generation))
+        for item, state, generation in starts:
+            self._spawn(self._start_queued_turn(item, state, generation))
 
     async def _start_queued_turn(
-        self, item: _QueuedTurn, state: _RuntimeSession
+        self, item: _QueuedTurn, state: _RuntimeSession, generation: int
     ) -> None:
         try:
-            await self._start_runtime(item.session_id, state, item.content)
+            await self._start_runtime(item.session_id, state, item.content, generation=generation)
         except RuntimeUnavailableError:
             pass
 
     async def _warm_runtime(
-        self, session_id: str, state: _RuntimeSession
+        self, session_id: str, state: _RuntimeSession, generation: int
     ) -> None:
         try:
-            await self._start_runtime(session_id, state, None)
+            await self._start_runtime(session_id, state, None, generation=generation)
         except RuntimeUnavailableError:
             pass
 
@@ -1671,6 +1798,7 @@ class RuntimeManager:
         session_id: str,
         state: _RuntimeSession,
         turn_content: str | None,
+        generation: int,
     ) -> None:
         await self._finalize_generation(
             victim[0],
@@ -1679,7 +1807,7 @@ class RuntimeManager:
             reason="capacity_eviction",
         )
         try:
-            await self._start_runtime(session_id, state, turn_content)
+            await self._start_runtime(session_id, state, turn_content, generation=generation)
         except RuntimeUnavailableError:
             pass
 
@@ -1839,6 +1967,7 @@ class RuntimeManager:
             state.status in {"stopped", "error"}
             and state.process is None
             and state.finalizer_task is None
+            and not state.cleanup_pending
         ):
             return False
         state.finalizing_generation = expected_generation
@@ -1886,6 +2015,8 @@ class RuntimeManager:
         completed_turn_id: str | None = None
         terminal_lease_ids: tuple[str, ...] = ()
         cleanup_errors: list[Exception] = []
+        process_errors: list[Exception] = []
+        container_cleanup_failed = False
         process: SandboxProcess | None = None
         converged = False
         async with state.lifecycle_lock:
@@ -1901,14 +2032,31 @@ class RuntimeManager:
                 completed_turn_id = state.active_turn_id
                 terminal_lease_ids = tuple(state.terminal_lease_ids)
             try:
-                cleanup_errors.extend(await self._terminate_process(process))
+                if process is not None and process.returncode is None:
+                    await self._close_runtime(
+                        state, process,
+                        can_read=reader_task is not None and not reader_task.done()
+                        and reader_task not in exclude_tasks,
+                    )
             except Exception as error:
-                cleanup_errors.append(error)
+                process_errors.append(error)
                 logger.exception(
                     "Runtime process termination failed session=%s generation=%s",
                     session_id,
                     cleanup_generation,
                 )
+
+            cleanup_container = getattr(self.launcher, "cleanup_session", None)
+            if cleanup_container is not None and state.container_ref is not None:
+                try:
+                    await cleanup_container(session_id)
+                except Exception as error:
+                    container_cleanup_failed = True
+                    cleanup_errors.append(error)
+                    logger.exception("Sandbox container cleanup could not be verified session=%s", session_id)
+            # Removing a container can also finish its attached docker client.
+            if process is not None and process.returncode is None:
+                process_errors.extend(await self._terminate_process(process))
 
             for task in (reader_task, stderr_task):
                 if task is None or task in exclude_tasks or task.done():
@@ -1930,7 +2078,6 @@ class RuntimeManager:
                     or state.runtime_generation != cleanup_generation
                 ):
                     return
-                state.process = None
                 state.reader_task = None
                 state.stderr_task = None
                 state.ready.clear()
@@ -1973,7 +2120,14 @@ class RuntimeManager:
                     or state.runtime_generation != cleanup_generation
                 ):
                     return
-                state.process = None
+                process_pending = process is not None and process.returncode is None
+                if process_pending:
+                    cleanup_errors.extend(process_errors or [
+                        RuntimeUnavailableError("Sandbox process is still running after cleanup.")
+                    ])
+                state.cleanup_pending = process_pending or container_cleanup_failed
+                state.capacity_source = None
+                state.process = process if process_pending else None
                 state.reader_task = None
                 state.stderr_task = None
                 state.busy = False
@@ -1992,7 +2146,8 @@ class RuntimeManager:
                 state.readiness_pause_started = None
                 state.readiness_pause_total = 0.0
                 state.active_turn_id = None
-                state.container_ref = None
+                if not container_cleanup_failed:
+                    state.container_ref = None
                 state.last_context_status = None
                 state.terminal_lease_ids.clear()
                 effective_status = (
@@ -2012,7 +2167,7 @@ class RuntimeManager:
                         "Runtime cleanup encountered one or more errors; "
                         "the generation was converged best-effort."
                     ),
-                    **_turn_payload(completed_turn_id),
+                    scope="session",
                 )
             if converged:
                 await self.events.publish(
@@ -2023,6 +2178,22 @@ class RuntimeManager:
                     **_turn_payload(completed_turn_id),
                 )
         await self._schedule_waiting()
+
+    async def _close_runtime(
+        self, state: _RuntimeSession, process: SandboxProcess, *, can_read: bool
+    ) -> None:
+        if can_read and process.stdin is not None:
+            async def handshake() -> None:
+                await self._write_bytes(state, state.adapter.encode_close())
+                await state.closed.wait()
+                await process.wait()
+
+            try:
+                await asyncio.wait_for(handshake(), timeout=RUNTIME_CLOSE_TIMEOUT_SECONDS)
+                return
+            except Exception:
+                logger.warning("Runtime close handshake failed; forcing cleanup", exc_info=True)
+        await self._terminate_process(process)
 
     async def _terminate_process(
         self, process: SandboxProcess | None
@@ -2041,8 +2212,9 @@ class RuntimeManager:
             errors.append(error)
             logger.exception("Sandbox process terminate() failed")
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-            return errors
+            await asyncio.wait_for(process.wait(), timeout=PROCESS_EXIT_TIMEOUT_SECONDS)
+            if process.returncode is not None:
+                return []
         except TimeoutError as error:
             errors.append(error)
             logger.warning("Sandbox process did not exit after terminate(); killing it")
@@ -2055,11 +2227,13 @@ class RuntimeManager:
             errors.append(error)
             logger.exception("Sandbox process kill() failed")
         try:
-            await process.wait()
+            await asyncio.wait_for(process.wait(), timeout=PROCESS_EXIT_TIMEOUT_SECONDS)
         except Exception as error:
             errors.append(error)
             logger.exception("Sandbox process wait() failed after kill()")
-        return errors
+        if process.returncode is not None:
+            return []
+        return errors or [RuntimeUnavailableError("Sandbox process is still running after cleanup.")]
 
     @staticmethod
     def _invalidate_context_snapshot_locked(state: _RuntimeSession) -> None:
@@ -2067,16 +2241,22 @@ class RuntimeManager:
         state.last_context_status = None
 
     def _prepare_start_locked(
-        self, session_id: str, state: _RuntimeSession
+        self, session_id: str, state: _RuntimeSession,
+        *, capacity_source: tuple[str, int] | None = None,
     ) -> None:
+        if state.cleanup_pending:
+            raise RuntimeUnavailableError("Previous Runtime cleanup is incomplete; stop it again before restarting.")
         self._revoke_runtime_token_locked(session_id, state)
         state.adapter = JsonlRuntimeAdapter()
         state.ready.clear()
+        state.closed.clear()
         state.stopping = False
         self._set_status_locked(state, "starting")
         state.busy = False
         state.container_ref = None
         state.active_turn_id = None
+        state.completed_turn_ids.clear()
+        state.capacity_source = capacity_source
         state.startup_error = None
         state.runtime_generation += 1
         state.relay_token = self.relay_tokens.issue(
@@ -2124,7 +2304,7 @@ class RuntimeManager:
         if owner_id is None:
             return True
         active_for_user = sum(
-            self._occupies_slot(state)
+            self._counts_slot_locked(candidate_id, state, per_user=True)
             and candidate_id != releasing_session_id
             and self._session_owner_resolver(candidate_id) == owner_id
             for candidate_id, state in self._sessions.items()
@@ -2150,12 +2330,48 @@ class RuntimeManager:
         return None
 
     def _occupied_slots_locked(self) -> int:
-        return sum(self._occupies_slot(state) for state in self._sessions.values())
+        return sum(
+            self._counts_slot_locked(session_id, state)
+            for session_id, state in self._sessions.items()
+        )
+
+    def _capacity_source_occupied_locked(self, state: _RuntimeSession) -> bool:
+        if state.capacity_source is None:
+            return False
+        source_id, generation = state.capacity_source
+        source = self._sessions.get(source_id)
+        return (
+            source is not None and source.runtime_generation == generation
+            and self._occupies_slot(source)
+        )
+
+    def _counts_slot_locked(
+        self, session_id: str, state: _RuntimeSession, *, per_user: bool = False
+    ) -> bool:
+        if not self._occupies_slot(state):
+            return False
+        # A handoff target has not launched yet: its global slot is still held
+        # by the source generation. Across users it must also reserve the new
+        # owner's quota, while the old owner's quota remains held until cleanup.
+        if state.process is None and self._capacity_source_occupied_locked(state):
+            if not per_user:
+                return False
+            assert state.capacity_source is not None
+            source_owner = (
+                self._session_owner_resolver(state.capacity_source[0])
+                if self._session_owner_resolver is not None else None
+            )
+            return (
+                self._session_owner_resolver is not None
+                and source_owner != self._session_owner_resolver(session_id)
+            )
+        return True
 
     @classmethod
     def _occupies_slot(cls, state: _RuntimeSession) -> bool:
-        return state.status == "starting" or (
-            cls._is_live(state) and state.status != "stopping"
+        return (
+            state.cleanup_pending or state.status == "starting"
+            or cls._is_finalizing(state) or cls._is_live(state)
         )
 
     def _oldest_evictable_idle_locked(

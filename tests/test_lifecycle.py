@@ -11,7 +11,7 @@ from app.db.database import WebDatabase
 from app.main import create_app
 from app.services.events import EventHub
 from app.services.lifecycle import SessionLifecycleService
-from app.services.runtime import RuntimeManager
+from app.services.runtime import RuntimeManager, RuntimeUnavailableError, _RuntimeSession
 from app.services.watcher import WorkspaceWatchManager
 from app.services.workspace import WorkspaceError, WorkspaceService
 
@@ -50,6 +50,63 @@ def make_services(tmp_path: Path):
         settings, database, workspace, runtime, watcher, events
     )
     return settings, database, workspace, runtime, lifecycle
+
+
+def test_incomplete_runtime_cleanup_preserves_session_data_until_retry(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        _settings, database, workspace, runtime, lifecycle = make_services(tmp_path)
+        user, _ = database.get_or_create_user(None)
+        session = database.create_session(user.id)
+        _, state_root = workspace.ensure_session_directories(session.id, user_id=user.id)
+        marker = state_root / "keep.txt"
+        marker.write_text("preserve", encoding="utf-8")
+        runtime.stop_session = AsyncMock()
+        runtime._sessions[session.id] = _RuntimeSession(status="error", cleanup_pending=True)
+        with pytest.raises(RuntimeUnavailableError, match="Session data was preserved"):
+            await lifecycle.delete_session(session.id, user_id=user.id)
+        assert marker.read_text(encoding="utf-8") == "preserve"
+        assert database.get_session(session.id, user.id) is not None
+        runtime._sessions[session.id].cleanup_pending = False
+        assert await lifecycle.delete_session(session.id, user_id=user.id)
+        assert not state_root.exists()
+        assert database.get_session(session.id, user.id) is None
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_expired_cleanup_skips_unreclaimed_runtime_and_continues_other_sessions(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        _settings, database, workspace, runtime, lifecycle = make_services(tmp_path)
+        user, _ = database.get_or_create_user(None)
+        pending = database.create_session(user.id)
+        removable = database.create_session(user.id)
+        now = datetime(2026, 10, 18, tzinfo=timezone.utc)
+        for session in (pending, removable):
+            workspace.ensure_session_directories(session.id, user_id=user.id)
+            database.touch_session(session.id, at=(now - timedelta(days=15)).isoformat())
+        runtime.stop_session = AsyncMock()
+        runtime._sessions[pending.id] = _RuntimeSession(status="error", cleanup_pending=True)
+        assert await lifecycle.cleanup_expired_once(now=now) == (removable.id,)
+        assert workspace.session_dir(pending.id).exists()
+        assert database.get_session(pending.id, user.id) is not None
+        assert database.get_session(removable.id, user.id) is None
+        runtime._sessions[pending.id].cleanup_pending = False
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_delete_api_reports_retryable_cleanup_failure(tmp_path: Path) -> None:
+    app = create_app(ServerSettings(data_dir=tmp_path / "data"), launcher=StartupLauncher())
+    with TestClient(app) as client:
+        session_id = client.post("/web/api/sessions").json()["id"]
+        app.state.services.lifecycle.delete_session = AsyncMock(
+            side_effect=RuntimeUnavailableError("Runtime cleanup is incomplete; Session data was preserved.")
+        )
+        response = client.delete(f"/web/api/sessions/{session_id}")
+        assert response.status_code == 503
+        assert "data was preserved" in response.json()["detail"]
 
 
 def test_expired_session_data_and_metadata_are_removed(tmp_path: Path) -> None:

@@ -109,6 +109,12 @@ def test_adapter_encodes_turn_without_collapsing_newlines() -> None:
     }
 
 
+def test_adapter_encodes_close() -> None:
+    encoded = JsonlRuntimeAdapter().encode_close()
+    assert encoded.endswith(b"\n")
+    assert json.loads(encoded) == {"version": 1, "type": "close"}
+
+
 @pytest.mark.parametrize(
     ("decision", "wire_decision"),
     [("deny", "reject"), ("once", "once"), ("task", "task"), ("session", "session")],
