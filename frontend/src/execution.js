@@ -48,10 +48,12 @@ export function structuredToolStep(event, active, resultEvent = null, associatio
     isCall && !resultEvent && active ? "running" : isTool ? "unknown" : "info"
   const name = isCall ? call.name : object(payload.tool_result).name
   const detail = result ? [text(result.error), text(result.content)].filter(Boolean).join("\n\n") : text(payload.error || payload.content || event.content)
+  const label = isTool ? titles[name] || name || "工具结果（未关联调用）" : type === "runtime_event" ? "运行事件" : type
+  const detailPreview = !isTool ? preview(detail) : ""
   return {
     id: `event-${event.id}`, kind: isTool ? "tool" : "runtime", type, status,
-    label: isTool ? titles[name] || name || "工具结果（未关联调用）" : type === "runtime_event" ? "运行事件" : type,
-    toolName: name || "", target: isCall ? targetFor(call) : "", preview: !isTool ? preview(detail) : "",
+    label,
+    toolName: name || "", target: isCall ? targetFor(call) : "", preview: detailPreview === label ? "" : detailPreview,
     statusLabel: labels[status], error: result?.ok === false ? text(result.error || result.content || event.content) : "",
     arguments: isCall ? text(call.arguments ?? {}) : null,
     result: result ? text(result) : null, detail, association,

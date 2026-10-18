@@ -308,7 +308,7 @@ h2 { margin-bottom: 0; font-size: 1rem; }
 .mcp-trust-card small { color: var(--color-muted); }
 .chat-message { width: 100%; min-width: 0; margin: var(--space-4) 0; }
 .chat-message-body { min-width: 0; max-width: 100%; }
-.chat-message-assistant .chat-message-body { max-width: var(--message-width); }
+.chat-message-assistant .chat-message-body { width: 100%; }
 .chat-message-user { display: flex; justify-content: flex-end; margin-top: var(--space-2); }
 .chat-message-user .chat-message-body { width: fit-content; max-width: min(75%, var(--message-width)); padding: 0.65rem 0.9rem; border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg); background: var(--color-user); }
 .message-author { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); color: var(--color-brand); font-size: 0.74rem; font-weight: 650; }

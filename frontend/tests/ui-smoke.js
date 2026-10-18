@@ -874,7 +874,7 @@ async (page) => {
   check(await page.evaluate(() => JSON.parse(localStorage.getItem('mycode.layout.v2')).sidebarWidth === 390) && await page.locator('.workspace-panel').isVisible() && await page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().width === 390), '刷新后恢复 Sidebar 视图与拖动宽度')
   check(await page.locator('.preview, .workspace-splitter').count() === 0 && await page.evaluate(() => JSON.parse(localStorage.getItem('mycode.layout.v2')).workspaceTreeHeight) === 205, '页面刷新清空文件选择，仍保留预览分割高度配置')
   check(await page.locator('.eyebrow').count() === 0, '移除重复面板标题')
-  const preview = '## 工作台布局完成\n\nSessions 与 Workspace 共用一个 Sidebar，Terminal 仅位于右侧。\n\n| 区域 | 布局 |\n| --- | --- |\n| Activity Bar | 始终可见，图标切换 Sidebar |\n| Agent | 主工作区，正文独立限宽 |\n\n```javascript\nconst sidebarView = "workspace";\n```'
+  const preview = '## 工作台布局完成\n\nSessions 与 Workspace 共用一个 Sidebar，Terminal 仅位于右侧。\n\n| 区域 | 布局 |\n| --- | --- |\n| Activity Bar | 始终可见，图标切换 Sidebar |\n| Agent | 正文使用聊天工作区可用宽度 |\n\n```javascript\nconst sidebarView = "workspace";\n```'
   await emit('console_event', { id: 3, kind: 'assistant', content: preview, data: { turn_id: 'turn-a' } })
   await page.getByRole('heading', { name: '工作台布局完成' }).waitFor()
   const trackGeometry = () => page.evaluate(() => {
@@ -890,9 +890,9 @@ async (page) => {
       contentLeftGap: getComputedStyle(group.querySelector('.execution-content')).display === 'none' ? null : group.querySelector('.execution-content').getBoundingClientRect().left - header.getBoundingClientRect().left,
     }
   })
-  const assertTrack = (geometry, label) => check(Math.abs(geometry.groupWidth - geometry.trackWidth) < 1 && Math.abs(geometry.headerWidth - geometry.trackWidth) < 1 && Math.abs(geometry.headerLeftGap) < 1 && Math.abs(geometry.assistantLeftGap) < 1 && Math.abs(geometry.bubbleRightGap) < 1 && geometry.assistantWidth <= 760 && geometry.bubbleWidth <= Math.min(geometry.trackWidth * .75, 760) + 1, label)
+  const assertTrack = (geometry, label) => check(Math.abs(geometry.groupWidth - geometry.trackWidth) < 1 && Math.abs(geometry.headerWidth - geometry.trackWidth) < 1 && Math.abs(geometry.headerLeftGap) < 1 && Math.abs(geometry.assistantLeftGap) < 1 && Math.abs(geometry.bubbleRightGap) < 1 && Math.abs(geometry.assistantWidth - geometry.trackWidth) < 1 && geometry.bubbleWidth <= Math.min(geometry.trackWidth * .75, 760) + 1, label)
   const expandedGeometry = await trackGeometry()
-  assertTrack(expandedGeometry, '1440px Sidebar 展开时消息轨道与正文限宽正常')
+  assertTrack(expandedGeometry, '1440px Sidebar 展开时 Agent 正文填满轨道，用户气泡保持限宽与右对齐')
   await page.locator('.execution-header').first().click()
   check(Math.abs((await trackGeometry()).contentLeftGap) < 1, '展开后的工具详情与执行条左边界对齐')
   await page.locator('.execution-header').first().click()
@@ -914,7 +914,8 @@ async (page) => {
   await activity('Workspace').click()
   await page.getByTitle('折叠 Terminal', { exact: true }).click()
   const collapsedGeometry = await trackGeometry()
-  assertTrack(collapsedGeometry, '1440px Sidebar 收起时正文限宽与气泡位置正确')
+  assertTrack(collapsedGeometry, '1440px Sidebar 收起时 Agent 正文填满轨道，用户气泡位置与限宽不变')
+  check(collapsedGeometry.assistantWidth > 760, '宽屏 Agent 正文超过原来的 760px 限制')
   check(collapsedGeometry.trackWidth > 1000 && collapsedGeometry.headerWidth > 1000, '执行过程利用宽轨道而非居中 760px 容器')
   const collapsedWorkbench = await workbenchGeometry()
   assertWorkbench(collapsedWorkbench, 'Sidebar 与 Terminal 收起后活动栏未被遮挡')
@@ -927,7 +928,7 @@ async (page) => {
   check(await page.locator('.terminal-drawer').evaluate((el) => el.getBoundingClientRect().height === 270), '点击工具栏恢复保存的 Terminal 高度')
   await showSidebar('Workspace')
   const longCode = 'const path = "' + 'long_path/'.repeat(100) + '";\n'
-  const wideTable = '| ' + Array.from({ length: 12 }, (_, i) => 'Column_' + i).join(' | ') + ' |\n| ' + Array(12).fill('---').join(' | ') + ' |\n| ' + Array(12).fill('Long table content').join(' | ') + ' |'
+  const wideTable = '| ' + Array.from({ length: 20 }, (_, i) => 'Column_' + i).join(' | ') + ' |\n| ' + Array(20).fill('---').join(' | ') + ' |\n| ' + Array(20).fill('Long table content for horizontal scrolling').join(' | ') + ' |'
   await emit('console_event', { id: 6, kind: 'user', content: 'D:\\' + 'long-directory\\'.repeat(80), data: { turn_id: 'long-turn' } })
   await emit('console_event', { id: 7, kind: 'assistant', content: '## 长内容检查\n\n```javascript\n' + longCode + '```\n\n' + wideTable, data: { turn_id: 'long-turn' } })
   await page.getByRole('heading', { name: '长内容检查' }).waitFor()
@@ -937,9 +938,13 @@ async (page) => {
     const pre = group.querySelector('.markdown-code-block pre')
     const table = group.querySelector('.markdown-table-scroll')
     const bubble = group.querySelector('.chat-message-user .chat-message-body')
-    return { history: history.scrollWidth <= history.clientWidth + 1, code: pre.scrollWidth > pre.clientWidth, table: table.scrollWidth > table.clientWidth, bubble: bubble.scrollWidth <= bubble.clientWidth + 1, assistant: group.querySelector('.chat-message-assistant .chat-message-body').getBoundingClientRect().width <= 760 }
+    const assistant = group.querySelector('.chat-message-assistant .chat-message-body')
+    const groupBox = group.getBoundingClientRect(), bubbleBox = bubble.getBoundingClientRect()
+    pre.scrollLeft = 50
+    table.scrollLeft = 50
+    return { page: document.documentElement.scrollWidth <= innerWidth, history: history.scrollWidth <= history.clientWidth + 1, code: pre.scrollWidth > pre.clientWidth && pre.scrollLeft > 0, table: table.scrollWidth > table.clientWidth && table.scrollLeft > 0, bubble: bubble.scrollWidth <= bubble.clientWidth + 1 && bubbleBox.width <= Math.min(groupBox.width * .75, 760) + 1 && Math.abs(bubbleBox.right - groupBox.right) < 1, assistant: Math.abs(assistant.getBoundingClientRect().width - groupBox.width) < 1 }
   })
-  check(Object.values(await containment()).every(Boolean), '桌面长路径、代码、宽表格内部滚动与阅读宽度')
+  check(Object.values(await containment()).every(Boolean), '桌面 Agent 正文填满轨道，长代码与宽表格在自身容器内滚动')
   await page.setViewportSize({ width: 900, height: 1000 })
   check(Object.values(await containment()).every(Boolean), '900px 窄屏内容不撑破 Agent')
   const narrowWorkbench = await workbenchGeometry()
@@ -953,7 +958,7 @@ async (page) => {
   check(Object.values(await containment()).every(Boolean), '900px 折叠侧栏后布局与内容宽度')
   await page.screenshot({ path: 'output/playwright/mycode-ui-narrow.png' })
   await page.setViewportSize({ width: 1920, height: 1080 })
-  check(Object.values(await containment()).every(Boolean), '宽 Agent 的正文宽度限制')
+  check(Object.values(await containment()).every(Boolean), '1920px Agent 正文填满轨道，用户气泡限宽，代码与表格内部滚动')
   await showSidebar('Workspace')
   assertWorkbench(await workbenchGeometry(), '1920px 工作台布局与 Terminal 范围正确')
   check(await page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().width === 390), '返回桌面宽度后恢复 Sidebar 偏好')
@@ -1071,6 +1076,22 @@ async (page) => {
   const turnGroup = (turn) => page.locator('.execution-group').filter({ has: page.locator('#execution-' + turn) })
   const thirdCall = (id, turn, callId, name = 'read_file', args = { path: 'README.md' }) => toolEvent(id, turn, 'tool_call', { tool_call: { ...(callId ? { id: callId } : {}), name, arguments: args } })
   const thirdResult = (id, turn, callId, ok, extra = {}) => toolEvent(id, turn, 'tool_result', { tool_result: { ...(callId ? { tool_call_id: callId } : {}), ok, content: 'available output', ...extra } })
+  const previewEvents = [toolEvent(90, 'preview-check', 'turn', {}), toolEvent(91, 'preview-check', 'model_start', {}),
+    toolEvent(92, 'preview-check', 'context', { content: 'Input tokens: 1200 / 8000' }),
+    toolEvent(93, 'preview-check', 'model_start', { content: 'model_start: provider/model' })]
+  for (const event of previewEvents) await emit('console_event', event)
+  const previewGroup = turnGroup('preview-check')
+  await previewGroup.locator('.execution-header').click()
+  check(await previewGroup.locator('.runtime-step').count() === 4 && (await previewGroup.locator('.execution-header').innerText()).includes('4 steps'), 'Runtime 预览去重保留所有事件和原始步骤数量')
+  for (const id of [90, 91]) {
+    const step = previewGroup.locator('[data-event-id="event-' + id + '"]')
+    check(await step.locator('.runtime-preview').count() === 0 && await step.locator('.step-heading').innerText() === previewEvents[id - 90].content, 'Runtime ' + previewEvents[id - 90].content + ' 摘要仅显示一次事件名称')
+    await step.locator(':scope > summary').click()
+    check(await step.locator('.step-details > pre').innerText() === previewEvents[id - 90].content, 'Runtime 去重后展开详情仍保留 ' + previewEvents[id - 90].content)
+    await step.locator('.step-source > summary').click()
+    check(JSON.stringify(JSON.parse(await step.locator('.step-data').innerText())) === JSON.stringify([previewEvents[id - 90]]), 'Runtime 去重后原始事件信息完整保留')
+  }
+  check(JSON.stringify(await previewGroup.locator('.runtime-preview').allTextContents()) === JSON.stringify(['Input tokens: 1200 / 8000', 'model_start: provider/model']), 'context 与同名事件的实际附加信息继续显示预览')
   await emit('runtime_status', { status: 'running', turn_id: 'third-success' })
   await emit('runtime_status', { status: 'idle', turn_id: 'stale-turn' })
   check((await page.locator('.agent-heading small').innerText()).includes('running'), 'Runtime 修复：旧 Turn 的 idle 不覆盖当前执行状态')

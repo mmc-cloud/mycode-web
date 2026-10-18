@@ -11,6 +11,33 @@ const permission = (id, data) => ({ id, kind: "permission", content: "真实请�
 const group = (events, { status = "idle", expanded = {}, pending = null } = {}) => buildExecutionGroups(events, null, pending,
   { active_turn_id: status === "idle" ? null : "a", runtime_status: status }, { a: { status } }, expanded)[0]
 
+test("runtime labels suppress only identical previews while retaining events, details and counts", () => {
+  const events = [event(1, "turn"), event(2, "model_start"), event(3, "context"),
+    event(4, "model_start", { content: "  model_start\n " })]
+  const before = JSON.stringify(events)
+  const value = group(events)
+  assert.deepEqual(value.timeline.map((step) => step.label), ["turn", "model_start", "context", "model_start"])
+  assert.deepEqual(value.timeline.map((step) => step.preview), ["", "", "", ""])
+  assert.deepEqual(value.timeline.map((step) => step.detail), ["turn", "model_start", "context", "  model_start\n "])
+  assert.deepEqual(value.timeline.map((step) => step.sources), events.map((source) => [source]))
+  assert.equal(value.stepCount, events.length)
+  assert.equal(JSON.stringify(events), before)
+})
+
+test("runtime previews retain extra context, errors, differing case and truncated content", () => {
+  const longContext = "context " + "budget ".repeat(30)
+  const events = [event(1, "context", { content: "Input tokens: 1200 / 8000" }),
+    event(2, "model_start", { content: "model_start: provider/model" }),
+    event(3, "turn", { content: "Turn" }),
+    event(4, "model_retry", { error: "Retry after timeout", content: "model_retry" }),
+    event(5, "context", { content: longContext })]
+  const value = group(events)
+  assert.deepEqual(value.timeline.map((step) => step.preview), ["Input tokens: 1200 / 8000", "model_start: provider/model", "Turn", "Retry after timeout", longContext.slice(0, 119) + "…"])
+  assert.equal(value.timeline.at(-1).detail, longContext)
+  assert.deepEqual(value.timeline.map((step) => step.sources), events.map((source) => [source]))
+  assert.equal(value.stepCount, events.length)
+})
+
 test("explicit IDs pair interleaved results at call positions and preserve all available source data", () => {
   const events = [call(1, "one"), event(2, "context", { content: "budget" }), call(3, "two", "run_command"), result(4, "two", false), result(5, "one")]
   const value = group(events)
