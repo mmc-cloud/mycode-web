@@ -24,6 +24,9 @@ from app.services.workspace import WorkspaceService
 logger = logging.getLogger(__name__)
 MANAGED_SANDBOX_LABEL = "mycode-web.managed=true"
 AGENT_USER = "mycode-agent"
+WEB_ENVIRONMENT_PROMPT = (
+    Path(__file__).resolve().parents[2] / "config" / "web-environment.md"
+)
 RUNTIME_CLOSE_TIMEOUT_SECONDS = 5.0
 PROCESS_EXIT_TIMEOUT_SECONDS = 5.0
 DOCKER_COMMAND_TIMEOUT_SECONDS = 10.0
@@ -149,6 +152,8 @@ class DockerSandboxLauncher:
             f"type=bind,source={workspace},target=/workspace",
             "--mount",
             f"type=bind,source={mycode_state},target=/home/mycode/.mycode",
+            "--mount",
+            f"type=bind,source={WEB_ENVIRONMENT_PROMPT},target=/home/mycode/.mycode/MYCODE.md,readonly",
             "-e",
             "HOME=/home/mycode",
             "-e",
